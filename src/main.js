@@ -17,7 +17,11 @@ const state = {
   completed: 0,
   failed: 0,
   quality: "smart",
-  editor: null
+  editor: null,
+  dragSelectMode: false,
+  dragSelecting: false,
+  dragStartX: 0,
+  dragStartY: 0
 };
 
 const app = document.querySelector("#app");
@@ -52,7 +56,10 @@ app.innerHTML = `
           <option value="fast">Fast</option>
         </select>
       </div>
-      <button id="removeAllBtn" class="primary">Remove all backgrounds</button>
+      <div class="remove-button-stack">
+        <button id="removeSelectedBtn" class="primary">Remove selected backgrounds</button>
+        <button id="removeAllBtn" class="ghost remove-all-btn">Remove all backgrounds</button>
+      </div>
       <div id="progressWrap" class="progress-wrap hidden">
         <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
         <div id="progressText" class="small"></div>
@@ -82,9 +89,13 @@ app.innerHTML = `
       <div class="divider"></div>
       <div class="selection-head">
         <div><div class="section-title no-margin">3. Selected photos</div><span id="selectedCount">0 selected</span></div>
-        <div class="selection-actions"><button id="selectAll" class="text-btn">All</button><button id="selectNone" class="text-btn">None</button></div>
+        <div class="selection-actions">
+          <button id="dragSelectBtn" class="text-btn" type="button">Drag select</button>
+          <button id="selectAll" class="text-btn" type="button">All</button>
+          <button id="selectNone" class="text-btn" type="button">None</button>
+        </div>
       </div>
-      <p class="selection-help">Tap photos below. Changes only apply to selected photos.</p>
+      <p class="selection-help">Tap photos, or turn on Drag select and sweep across several. Edits and “Remove selected” only affect those photos.</p>
       <fieldset id="selectedControls" disabled>
         <label class="control-row"><span>Scale</span><input id="scaleRange" type="range" min="0.55" max="1.35" step="0.01" value="1" /></label>
         <label class="control-row"><span>Horizontal</span><input id="xRange" type="range" min="-30" max="30" step="1" value="0" /></label>
@@ -115,6 +126,7 @@ app.innerHTML = `
         <button id="addMoreBtn" class="ghost">+ Add more</button>
       </div>
       <div id="gallery" class="gallery"></div>
+      <div id="dragSelectBox" class="drag-select-box hidden"></div>
     </section>
   </section>
 </main>
@@ -198,7 +210,7 @@ function renderGallery() {
           <div class="reveal-scan-line"></div>
         ` : `<canvas class="preview-canvas" data-index="${index}"></canvas>`}
         <button class="select-chip" data-select="${item.id}" type="button">${state.selected.has(item.id) ? "✓" : ""}</button>
-        <div class="status ${item.status}">${statusText(item)}</div>
+        <div class="status ${item.status}" title="${item.error ? escapeHtml(item.error) : ""}">${statusText(item)}</div>
       </div>
       <div class="photo-actions">
         <button class="edit-cutout ${item.cutoutURL ? "" : "disabled"}" data-edit="${item.id}" ${item.cutoutURL ? "" : "disabled"}>Edit cutout</button>
@@ -235,29 +247,30 @@ function applyToSelected(key,value){
   renderAllPreviews();
 }
 
-function removalConfig(mode, progress, forceCPU = false) {
-  const hasGPU = !!navigator.gpu && !forceCPU;
+function removalConfig(mode, progress, useWorker = true) {
   const model = mode === "best" ? "isnet" : mode === "fast" ? "isnet_quint8" : "isnet_fp16";
   return {
     model,
-    device: hasGPU ? "gpu" : "cpu",
-    proxyToWorker: true,
+    device: "cpu",
+    proxyToWorker: useWorker,
     output: { format: "image/png", quality: 1 },
     progress
   };
 }
 async function removeStable(file, mode, progress) {
-  try { return await removeBackground(file, removalConfig(mode, progress, false)); }
-  catch (gpuError) {
-    if (!navigator.gpu) throw gpuError;
-    console.warn("GPU removal failed; retrying on CPU", gpuError);
+  // Reliability-first: keep inference off the UI thread when possible.
+  // If worker execution is unsupported on a browser, retry directly on CPU.
+  try {
     return await removeBackground(file, removalConfig(mode, progress, true));
+  } catch (workerError) {
+    console.warn("Worker removal failed; retrying directly on CPU", workerError);
+    return await removeBackground(file, removalConfig(mode, progress, false));
   }
 }
 function preloadRemovalModel() {
   const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 250));
   idle(async () => {
-    try { await preload(removalConfig("smart", () => {}, false)); document.documentElement.dataset.removerReady = "true"; }
+    try { await preload(removalConfig("smart", () => {}, true)); document.documentElement.dataset.removerReady = "true"; }
     catch (error) { console.warn("Background model preload skipped", error); }
   });
 }
@@ -323,14 +336,36 @@ async function removeOne(item, queueTotal) {
   }
   updateProgress(queueTotal);renderGallery();
 }
+async function processRemovalQueue(queue, label) {
+  if(state.processing)return;
+  queue = queue.filter(i=>!i.cutoutBlob);
+  if(!queue.length){toast(`${label} already have backgrounds removed.`);return;}
+
+  state.processing=true;state.completed=0;state.failed=0;
+  $("#removeSelectedBtn").disabled=true;
+  $("#removeAllBtn").disabled=true;
+  $("#progressWrap").classList.remove("hidden");
+
+  // One removal at a time is much more reliable on phones and also avoids
+  // multiple ONNX sessions fighting for memory.
+  for (const item of queue) {
+    await removeOne(item, queue.length);
+  }
+
+  state.processing=false;
+  $("#removeSelectedBtn").disabled=false;
+  $("#removeAllBtn").disabled=false;
+  updateProgress(queue.length);
+  toast(state.failed?`${state.completed} finished, ${state.failed} failed.`:`Finished ${state.completed} cutouts.`);
+}
+async function removeSelectedBackgrounds() {
+  const picked=selectedItems();
+  if(!picked.length){toast("Select one or more photos first.");return;}
+  await processRemovalQueue(picked, "Selected photos");
+}
 async function removeAllBackgrounds() {
-  if(state.processing||!state.items.length)return;
-  const queue=state.items.filter(i=>!i.cutoutBlob);if(!queue.length){toast("All backgrounds are already removed.");return;}
-  state.processing=true;state.completed=0;state.failed=0;$("#removeAllBtn").disabled=true;$("#progressWrap").classList.remove("hidden");
-  const isIOS=/iPad|iPhone|iPod/.test(navigator.userAgent),concurrency=isIOS?1:(navigator.gpu?2:1);let cursor=0;
-  async function worker(){while(cursor<queue.length){const item=queue[cursor++];await removeOne(item,queue.length);}}
-  await Promise.all(Array.from({length:Math.min(concurrency,queue.length)},worker));
-  state.processing=false;$("#removeAllBtn").disabled=false;updateProgress(queue.length);toast(state.failed?`${state.completed} finished, ${state.failed} failed.`:`Finished ${state.completed} cutouts.`);
+  if(!state.items.length)return;
+  await processRemovalQueue(state.items, "All photos");
 }
 function updateProgress(total=state.items.length){const finished=state.completed+state.failed,pct=total?Math.round(finished/total*100):0;$("#progressBar").style.width=`${pct}%`;$("#progressText").textContent=state.processing?`${finished}/${total} processed`:`${finished}/${total} finished${state.failed?` • ${state.failed} failed`:""}`;}
 
@@ -399,7 +434,12 @@ async function downloadAll(){if(!state.items.length)return;$("#downloadAllBtn").
 function downloadBlob(blob,name){const a=document.createElement("a"),url=URL.createObjectURL(blob);a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),5000);}
 
 /* ---------- controls ---------- */
-photoInput.onchange=e=>addFiles(e.target.files);$("#addMoreBtn").onclick=()=>photoInput.click();$("#removeAllBtn").onclick=removeAllBackgrounds;$("#downloadAllBtn").onclick=downloadAll;$("#qualitySelect").onchange=e=>state.quality=e.target.value;
+photoInput.onchange=e=>addFiles(e.target.files);
+$("#addMoreBtn").onclick=()=>photoInput.click();
+$("#removeSelectedBtn").onclick=removeSelectedBackgrounds;
+$("#removeAllBtn").onclick=removeAllBackgrounds;
+$("#downloadAllBtn").onclick=downloadAll;
+$("#qualitySelect").onchange=e=>state.quality=e.target.value;
 $("#clearBtn").onclick=()=>{for(const i of state.items)cleanupItem(i);state.items=[];state.selected.clear();workspace.classList.add("hidden");gallery.innerHTML="";updateSelectionUI();};
 document.querySelectorAll(".seg").forEach(btn=>btn.onclick=()=>{state.bgMode=btn.dataset.bg;document.querySelectorAll(".seg").forEach(b=>b.classList.toggle("active",b===btn));$("#solidControls").classList.toggle("hidden",state.bgMode!=="solid");$("#backgroundPicker").classList.toggle("hidden",state.bgMode!=="image");renderAllPreviews();});
 $("#solidColor").oninput=e=>{state.solidColor=e.target.value;renderAllPreviews();};
@@ -407,7 +447,68 @@ backgroundInput.onchange=e=>{const f=e.target.files?.[0];if(!f)return;if(state.b
 $("#clearBackground").onclick=()=>{if(state.backgroundURL)URL.revokeObjectURL(state.backgroundURL);state.backgroundURL=null;state.backgroundName="";backgroundInput.value="";$("#backgroundPreview").classList.add("hidden");state.bgMode="transparent";document.querySelectorAll(".seg").forEach(b=>b.classList.toggle("active",b.dataset.bg==="transparent"));renderAllPreviews();};
 $("#selectAll").onclick=()=>{state.selected=new Set(state.items.map(i=>i.id));renderGallery();updateSelectionUI();};$("#selectNone").onclick=()=>{state.selected.clear();renderGallery();updateSelectionUI();};
 $("#scaleRange").oninput=e=>applyToSelected("scale",Number(e.target.value));$("#xRange").oninput=e=>applyToSelected("offsetX",Number(e.target.value));$("#yRange").oninput=e=>applyToSelected("offsetY",Number(e.target.value));$("#brightnessRange").oninput=e=>applyToSelected("brightness",Number(e.target.value));$("#contrastRange").oninput=e=>applyToSelected("contrast",Number(e.target.value));$("#saturationRange").oninput=e=>applyToSelected("saturation",Number(e.target.value));
+
 $("#resetSelected").onclick=()=>{for(const i of selectedItems())i.adj=DEFAULT_ADJ();updateSelectionUI();renderAllPreviews();};
+
+const dragSelectBtn=$("#dragSelectBtn");
+const dragSelectBox=$("#dragSelectBox");
+
+function setDragSelectMode(on){
+  state.dragSelectMode=on;
+  dragSelectBtn.classList.toggle("active",on);
+  gallery.classList.toggle("drag-select-active",on);
+  dragSelectBtn.textContent=on?"Drag select: ON":"Drag select";
+}
+dragSelectBtn.onclick=()=>setDragSelectMode(!state.dragSelectMode);
+
+function pagePoint(e){
+  return {x:e.clientX,y:e.clientY};
+}
+function updateDragBox(x1,y1,x2,y2){
+  const left=Math.min(x1,x2),top=Math.min(y1,y2),right=Math.max(x1,x2),bottom=Math.max(y1,y2);
+  dragSelectBox.style.left=`${left}px`;
+  dragSelectBox.style.top=`${top}px`;
+  dragSelectBox.style.width=`${right-left}px`;
+  dragSelectBox.style.height=`${bottom-top}px`;
+  return {left,top,right,bottom};
+}
+function applyDragSelection(rect){
+  for(const card of gallery.querySelectorAll(".photo-card")){
+    const r=card.getBoundingClientRect();
+    const hit=!(r.right<rect.left||r.left>rect.right||r.bottom<rect.top||r.top>rect.bottom);
+    if(hit){
+      const id=card.dataset.card;
+      if(id)state.selected.add(id);
+    }
+  }
+  renderGallery();updateSelectionUI();
+}
+gallery.addEventListener("pointerdown",e=>{
+  if(!state.dragSelectMode)return;
+  if(e.button!==undefined&&e.button!==0)return;
+  e.preventDefault();
+  const p=pagePoint(e);
+  state.dragSelecting=true;state.dragStartX=p.x;state.dragStartY=p.y;
+  dragSelectBox.classList.remove("hidden");
+  updateDragBox(p.x,p.y,p.x,p.y);
+  try{gallery.setPointerCapture(e.pointerId);}catch{}
+});
+gallery.addEventListener("pointermove",e=>{
+  if(!state.dragSelectMode||!state.dragSelecting)return;
+  e.preventDefault();
+  const p=pagePoint(e);
+  updateDragBox(state.dragStartX,state.dragStartY,p.x,p.y);
+});
+function finishDragSelection(e){
+  if(!state.dragSelecting)return;
+  const p=pagePoint(e);
+  const rect=updateDragBox(state.dragStartX,state.dragStartY,p.x,p.y);
+  state.dragSelecting=false;dragSelectBox.classList.add("hidden");
+  if(Math.abs(rect.right-rect.left)>8||Math.abs(rect.bottom-rect.top)>8)applyDragSelection(rect);
+}
+gallery.addEventListener("pointerup",finishDragSelection);
+gallery.addEventListener("pointercancel",()=>{state.dragSelecting=false;dragSelectBox.classList.add("hidden");});
+
 $("#shadowEnabled").onchange=e=>{state.shadow.enabled=e.target.checked;renderAllPreviews();};$("#shadowOpacity").oninput=e=>{state.shadow.opacity=Number(e.target.value);renderAllPreviews();};$("#shadowBlur").oninput=e=>{state.shadow.blur=Number(e.target.value);renderAllPreviews();};$("#shadowY").oninput=e=>{state.shadow.offsetY=Number(e.target.value);renderAllPreviews();};
 $("#eraseTool").onclick=()=>{state.editor.mode="erase";updateEditorUI();};$("#restoreTool").onclick=()=>{state.editor.mode="restore";updateEditorUI();};$("#assistToggle").onchange=updateEditorUI;$("#undoEdit").onclick=undo;$("#redoEdit").onclick=redo;$("#smartRecover").onclick=smartRecover;$("#applyEdit").onclick=applyEditor;$("#closeEditor").onclick=closeEditor;$("#cutoutModal").onclick=e=>{if(e.target.id==="cutoutModal")closeEditor();};
 let installPrompt=null;window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();installPrompt=e;$("#installBtn").classList.remove("hidden");});$("#installBtn").onclick=async()=>{if(!installPrompt){toast("On iPhone: Safari → Share → Add to Home Screen");return;}installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;$("#installBtn").classList.add("hidden");};

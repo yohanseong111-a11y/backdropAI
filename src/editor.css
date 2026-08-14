@@ -148,3 +148,18 @@ fieldset{border:0;padding:0;margin:0;min-width:0}fieldset:disabled{opacity:.42}.
   .select-chip{width:25px;height:25px;right:8px;top:8px}
   .background-preview{grid-template-columns:54px 1fr 30px}.background-preview img{width:54px;height:44px}
 }
+
+
+/* Selected-background removal + drag selection */
+.remove-button-stack{display:grid;gap:8px}
+.remove-all-btn{width:100%;border:1px solid rgba(255,255,255,.08)}
+#dragSelectBtn.active{background:rgba(118,95,255,.16);color:#c9c0ff;border-radius:8px}
+.gallery.drag-select-active{cursor:crosshair;user-select:none;touch-action:none}
+.drag-select-box{
+  position:fixed;z-index:90;pointer-events:none;
+  border:1px solid rgba(164,149,255,.95);
+  background:rgba(118,95,255,.14);
+  box-shadow:0 0 0 1px rgba(118,95,255,.12),0 8px 30px rgba(0,0,0,.2);
+  border-radius:6px
+}
+.status.failed{cursor:help}
