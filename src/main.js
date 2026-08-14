@@ -169,7 +169,7 @@ app.innerHTML = `
 <div id="helpModal" class="help-modal hidden" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
   <div class="help-card">
     <div class="help-head">
-      <div><span class="help-kicker">HOW TO USE BACKDROPAI</span><strong id="helpTitle">Quick tutorial</strong></div>
+      <div><span class="help-kicker">HOW TO USE BACKSHOTAI</span><strong id="helpTitle">Quick tutorial</strong></div>
       <button id="closeHelp" class="icon-btn" type="button">×</button>
     </div>
     <div class="help-body">
@@ -734,40 +734,153 @@ async function protectSubjectWithBackgroundMask(file,cutout,maskInfo){
 let removalWorker=null;
 let removalSeq=0;
 const removalPending=new Map();
+let engineWarmStarted=false;
+
+function rejectAllWorkerJobs(reason){
+  for(const [id,job] of removalPending){
+    clearTimeout(job.timeout);
+    job.reject(new Error(reason));
+    removalPending.delete(id);
+  }
+}
+
+function destroyRemovalWorker(reason="Background-removal worker stopped."){
+  if(removalWorker){
+    try{removalWorker.terminate();}catch{}
+    removalWorker=null;
+  }
+  engineWarmStarted=false;
+  rejectAllWorkerJobs(reason);
+}
 
 function getRemovalWorker(){
   if(removalWorker)return removalWorker;
-  removalWorker=new Worker(new URL("./removal-worker.js",import.meta.url),{type:"module"});
-  removalWorker.onmessage=e=>{
+  try{
+    removalWorker=new Worker(new URL("./removal-worker.js",import.meta.url),{type:"module"});
+  }catch(error){
+    throw new Error(`This browser could not start the AI worker: ${error?.message||error}`);
+  }
+
+  removalWorker.onmessage=async e=>{
     const msg=e.data||{};
     const job=removalPending.get(msg.id);
+
     if(msg.type==="progress"){
+      if(msg.message)$("#progressText").textContent=msg.message;
       if(job?.onProgress)job.onProgress(msg);
       return;
     }
     if(!job)return;
+
+    if(msg.type==="mask"){
+      try{
+        const blob=await applyMaskBufferToFile(job.file,msg.maskBuffer,msg.width,msg.height);
+        clearTimeout(job.timeout);
+        removalPending.delete(msg.id);
+        job.resolve(blob);
+      }catch(error){
+        clearTimeout(job.timeout);
+        removalPending.delete(msg.id);
+        job.reject(error);
+      }
+      return;
+    }
+
     if(msg.type==="done"){
+      clearTimeout(job.timeout);
       removalPending.delete(msg.id);
-      job.resolve(msg.blob);
-    }else if(msg.type==="error"){
+      msg.blob instanceof Blob && msg.blob.size
+        ? job.resolve(msg.blob)
+        : job.reject(new Error("The remover returned an empty image."));
+      return;
+    }
+
+    if(msg.type==="error"){
+      clearTimeout(job.timeout);
       removalPending.delete(msg.id);
-      job.reject(new Error(msg.error||"Removal failed"));
+      job.reject(new Error(msg.error||"Background removal failed."));
     }
   };
-  removalWorker.onerror=e=>console.error("Backshot Engine worker error",e);
+
+  removalWorker.onerror=e=>{
+    console.error("Backshot Engine worker crashed",e);
+    destroyRemovalWorker(e?.message?`AI worker crashed: ${e.message}`:"AI worker crashed unexpectedly.");
+  };
+  removalWorker.onmessageerror=()=>{
+    destroyRemovalWorker("The browser could not read the AI worker result.");
+  };
   return removalWorker;
 }
 
+async function applyMaskBufferToFile(file,maskBuffer,maskWidth,maskHeight){
+  if(!maskBuffer||!maskWidth||!maskHeight)throw new Error("The AI returned an invalid mask.");
 
+  const bitmap=await createImageBitmap(file);
+  const ow=bitmap.width,oh=bitmap.height;
+  const raw=new Uint8Array(maskBuffer);
+  if(raw.length!==maskWidth*maskHeight){
+    bitmap.close?.();
+    throw new Error("The AI mask size did not match the image.");
+  }
 
-let engineWarmStarted=false;
+  const maskCanvas=document.createElement("canvas");
+  maskCanvas.width=maskWidth;maskCanvas.height=maskHeight;
+  const mctx=maskCanvas.getContext("2d",{willReadFrequently:true});
+  if(!mctx){
+    bitmap.close?.();
+    throw new Error("Canvas is unavailable in this browser.");
+  }
+
+  const rgba=new Uint8ClampedArray(maskWidth*maskHeight*4);
+  for(let i=0;i<raw.length;i++){
+    const a=raw[i],o=i*4;
+    rgba[o]=a;rgba[o+1]=a;rgba[o+2]=a;rgba[o+3]=255;
+  }
+  mctx.putImageData(new ImageData(rgba,maskWidth,maskHeight),0,0);
+
+  const scaled=document.createElement("canvas");
+  scaled.width=ow;scaled.height=oh;
+  const sctx=scaled.getContext("2d",{willReadFrequently:true});
+  sctx.imageSmoothingEnabled=true;
+  sctx.imageSmoothingQuality="high";
+  sctx.drawImage(maskCanvas,0,0,ow,oh);
+  const scaledMask=sctx.getImageData(0,0,ow,oh).data;
+
+  const out=document.createElement("canvas");
+  out.width=ow;out.height=oh;
+  const ctx=out.getContext("2d",{willReadFrequently:true});
+  ctx.drawImage(bitmap,0,0);
+  bitmap.close?.();
+
+  const image=ctx.getImageData(0,0,ow,oh);
+  for(let i=0;i<ow*oh;i++)image.data[i*4+3]=scaledMask[i*4];
+  ctx.putImageData(image,0,0);
+
+  return new Promise((resolve,reject)=>{
+    out.toBlob(
+      b=>b&&b.size?resolve(b):reject(new Error("The browser could not create the cutout PNG.")),
+      "image/png",
+      1
+    );
+  });
+}
+
 function warmBackshotEngine(){
   if(engineWarmStarted)return;
   engineWarmStarted=true;
+
+  let worker;
+  try{worker=getRemovalWorker();}
+  catch{
+    engineWarmStarted=false;
+    const status=$("#engineStatus");if(status)status.textContent="Loads on Remove";
+    return;
+  }
+
   const id=`warm-${Date.now()}`;
-  const worker=getRemovalWorker();
   const status=$("#engineStatus");
   if(status)status.textContent="Downloading AI…";
+
   const handler=e=>{
     const msg=e.data||{};
     if(msg.id!==id)return;
@@ -775,105 +888,69 @@ function warmBackshotEngine(){
       status.textContent=`Loading ${Math.round(msg.progress||0)}%`;
     }else if(msg.type==="ready"){
       worker.removeEventListener("message",handler);
-      if(status)status.textContent=msg.acceleration==="webgpu"?"AI Ready ✓ GPU":"AI Ready ✓";
-    }else if(msg.type==="error"){
-      worker.removeEventListener("message",handler);
-      engineWarmStarted=false;
-      if(status)status.textContent="Loads on Remove";
+      if(status)status.textContent=msg.acceleration==="fallback"?"AI Ready ✓ compatibility":"AI Ready ✓";
     }
   };
   worker.addEventListener("message",handler);
-  worker.postMessage({type:"warm",id});
+  try{worker.postMessage({type:"warm",id});}
+  catch{
+    worker.removeEventListener("message",handler);
+    engineWarmStarted=false;
+    if(status)status.textContent="Loads on Remove";
+  }
 }
 
-function removeWithBackshotEngine(file,onProgress){
+function removeWithBackshotEngine(file,onProgress,attempt=0){
   return new Promise((resolve,reject)=>{
+    let worker;
+    try{worker=getRemovalWorker();}catch(error){reject(error);return;}
     const id=++removalSeq;
-    removalPending.set(id,{resolve,reject,onProgress});
-    getRemovalWorker().postMessage({type:"remove",id,file});
+
+    const timeout=setTimeout(()=>{
+      removalPending.delete(id);
+      destroyRemovalWorker("The AI remover timed out and was restarted.");
+      if(attempt<1){
+        removeWithBackshotEngine(file,onProgress,attempt+1).then(resolve,reject);
+      }else{
+        reject(new Error("Background removal timed out twice. Try a smaller image or reload BackshotAI."));
+      }
+    },120000);
+
+    removalPending.set(id,{resolve,reject,onProgress,timeout,file});
+    try{worker.postMessage({type:"remove",id,file});}
+    catch(error){
+      clearTimeout(timeout);
+      removalPending.delete(id);
+      destroyRemovalWorker("The browser could not send the image to the AI worker.");
+      if(attempt<1)removeWithBackshotEngine(file,onProgress,attempt+1).then(resolve,reject);
+      else reject(error);
+    }
   });
 }
 
 async function chooseSafeCutout(file){
-  $("#progressText").textContent="Backshot Engine: starting removal…";
-  return removeWithBackshotEngine(file,msg=>{
+  $("#progressText").textContent="Backshot Engine: preparing…";
+  if(!(file instanceof Blob)||!file.type?.startsWith("image/")){
+    throw new Error("This file is not a supported image.");
+  }
+  if(file.size>80*1024*1024){
+    throw new Error("This image is larger than 80 MB. Please use a smaller photo.");
+  }
+
+  const blob=await removeWithBackshotEngine(file,msg=>{
     if(msg.stage==="load"&&Number.isFinite(msg.progress)){
       $("#progressText").textContent=`Backshot Engine: loading ${Math.round(msg.progress)}%`;
     }else if(msg.stage==="remove"){
       $("#progressText").textContent="Backshot Engine: removing background…";
+    }else if(msg.stage==="fallback"){
+      $("#progressText").textContent=msg.message||"Switching removal engine…";
     }
   });
+
+  if(!(blob instanceof Blob)||!blob.size)throw new Error("The remover returned an empty result.");
+  return blob;
 }
 
-function nextFrame(){return new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));}
-async function removeOne(item, queueTotal) {
-  item.status="processing";renderGallery();
-  // Yield a couple frames first so scrolling/zooming remains responsive before work begins.
-  await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
-  try {
-    const progress=(key,current,total)=>{
-      if(total>0&&/fetch|model/i.test(key))$("#progressText").textContent=`Loading removal model… ${Math.round(current/total*100)}%`;
-    };
-
-    const blob=await chooseSafeCutout(item.file);
-    item.cutoutBlob=blob;
-    if(item.cutoutURL)URL.revokeObjectURL(item.cutoutURL);
-    item.cutoutURL=URL.createObjectURL(blob);
-    item.status="revealing";item.error=null;renderGallery();
-    await new Promise(resolve=>setTimeout(resolve,900));
-    item.status="done";state.completed++;
-  } catch(error) {
-    console.error(error);
-    item.status="failed";
-    if(error?.message==="PHOTOROOM_KEY_MISSING"){
-      item.error="Add your BackshotAI API key or switch to Fast mode.";
-    }else if(error?.status===402){
-      item.error="BackshotAI API credits are empty.";
-    }else if(error?.status===401||error?.status===403){
-      item.error="BackshotAI API key was rejected.";
-    }else if(error?.name==="AbortError"){
-      item.error="BackshotAI request timed out.";
-    }else{
-      item.error=error?.message||"Background removal failed";
-    }
-    state.failed++;
-  }
-  updateProgress(queueTotal);renderGallery();
-}
-async function processRemovalQueue(queue,label){
-  if(state.processing)return;
-  queue=queue.filter(i=>!i.cutoutBlob);
-  if(!queue.length){toast(`${label} already have backgrounds removed.`);return;}
-  state.processing=true;state.completed=0;state.failed=0;
-  $("#removeSelectedBtn").disabled=true;$("#removeAllBtn").disabled=true;$("#progressWrap").classList.remove("hidden");
-
-  // Real bulk mode: run several photos at once, but cap concurrency to avoid crashing phones.
-  const concurrency=1;
-
-  let cursor=0;
-  async function worker(){
-    while(cursor<queue.length){
-      const item=queue[cursor++];
-      await removeOne(item,queue.length);
-      // Yield between jobs so page scrolling/pinch-zoom and scanner animation get paint time.
-      await new Promise(r=>setTimeout(r,0));
-    }
-  }
-  await Promise.all(Array.from({length:Math.min(concurrency,queue.length)},()=>worker()));
-
-  state.processing=false;$("#removeSelectedBtn").disabled=false;$("#removeAllBtn").disabled=false;
-  updateProgress(queue.length);
-  toast(state.failed?`${state.completed} finished, ${state.failed} failed.`:`Finished ${state.completed} cutouts.`);
-}
-async function removeSelectedBackgrounds() {
-  const picked=selectedItems();
-  if(!picked.length){toast("Select one or more photos first.");return;}
-  await processRemovalQueue(picked, "Selected photos");
-}
-async function removeAllBackgrounds() {
-  if(!state.items.length)return;
-  await processRemovalQueue(state.items, "All photos");
-}
 function updateProgress(total=state.items.length){const finished=state.completed+state.failed,pct=total?Math.round(finished/total*100):0;$("#progressBar").style.width=`${pct}%`;$("#progressText").textContent=state.processing?`${finished}/${total} processed`:`${finished}/${total} finished${state.failed?` • ${state.failed} failed`:""}`;}
 
 async function imageFromURL(url){return new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>resolve(img);img.onerror=reject;img.src=url;});}

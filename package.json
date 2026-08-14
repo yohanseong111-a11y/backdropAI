@@ -10,9 +10,9 @@
   },
   "dependencies": {
     "@imgly/background-removal": "1.7.0",
-    "jszip": "^3.10.1",
+    "jszip": "3.10.1",
     "onnxruntime-web": "1.21.0",
-    "@huggingface/transformers": "^4.2.0"
+    "@huggingface/transformers": "3.7.1"
   },
   "devDependencies": {
     "vite": "^7.1.0"
