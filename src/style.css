@@ -267,3 +267,44 @@ input[type="checkbox"] { accent-color: #846fff; transform: scale(1.15); }
 .single-mode-badge{font-weight:700;color:#c8b9ff;background:rgba(126,91,255,.10);border:1px solid rgba(126,91,255,.25);padding:8px 10px;border-radius:10px}
 
 #engineStatus{margin-left:6px;font-size:.78em;opacity:.82;font-weight:650;white-space:nowrap}
+
+
+/* BackshotAI v9 scroll behavior */
+html,body{
+  overflow-x:hidden;
+  overflow-y:auto;
+  overscroll-behavior-y:auto;
+  touch-action:pan-x pan-y pinch-zoom;
+}
+
+.workspace{
+  overflow:visible;
+}
+
+.controls,
+.gallery-shell{
+  overflow-y:auto !important;
+  overflow-x:hidden;
+  -webkit-overflow-scrolling:touch;
+  overscroll-behavior-y:auto;
+  touch-action:pan-y pinch-zoom;
+  scrollbar-gutter:stable;
+}
+
+/* Keep each editing column independently scrollable while the page itself can still
+   continue scrolling once either inner area reaches its top/bottom. */
+.controls{
+  max-height:calc(100vh - 24px);
+}
+
+.gallery-shell{
+  max-height:calc(100vh - 24px);
+}
+
+/* Never block browser pinch zoom on cards or previews. */
+.gallery,
+.photo-card,
+.preview-wrap,
+.page{
+  touch-action:pan-x pan-y pinch-zoom;
+}

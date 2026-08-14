@@ -53,7 +53,7 @@ app.innerHTML = `
       <div class="section-title">1. Background removal</div>
       <div class="quality-row">
         <span>Removal mode</span>
-        <div class="single-mode-badge">Backshot Engine <span id="engineStatus">Preparing…</span></div>
+        <div class="single-mode-badge">Backshot Engine <span id="engineStatus">Starting…</span></div>
       </div>
       <div class="remove-button-stack">
         <button id="removeSelectedBtn" class="primary">Remove selected backgrounds</button>
@@ -951,6 +951,106 @@ async function chooseSafeCutout(file){
   return blob;
 }
 
+
+function nextFrame(){
+  return new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+}
+
+async function removeOne(item,queueTotal){
+  item.status="processing";
+  item.error=null;
+  renderGallery();
+  await nextFrame();
+
+  try{
+    const blob=await chooseSafeCutout(item.file);
+
+    if(!(blob instanceof Blob)||blob.size===0){
+      throw new Error("The remover returned an empty image.");
+    }
+
+    item.cutoutBlob=blob;
+    if(item.cutoutURL)URL.revokeObjectURL(item.cutoutURL);
+    item.cutoutURL=URL.createObjectURL(blob);
+
+    item.status="revealing";
+    renderGallery();
+
+    // Keep the reveal short; don't block the next batch item for a full second.
+    await new Promise(resolve=>setTimeout(resolve,420));
+
+    item.status="done";
+    item.error=null;
+    state.completed++;
+  }catch(error){
+    console.error("Removal failed",error);
+    item.status="failed";
+    item.error=error?.message||"Background removal failed.";
+    state.failed++;
+    toast(`Removal failed: ${item.error}`);
+  }
+
+  updateProgress(queueTotal);
+  renderGallery();
+}
+
+async function processRemovalQueue(queue,label){
+  if(state.processing){
+    toast("A removal batch is already running.");
+    return;
+  }
+
+  queue=Array.from(queue||[]).filter(item=>item&&!item.cutoutBlob);
+  if(!queue.length){
+    toast(`${label} already have backgrounds removed.`);
+    return;
+  }
+
+  state.processing=true;
+  state.completed=0;
+  state.failed=0;
+
+  $("#removeSelectedBtn").disabled=true;
+  $("#removeAllBtn").disabled=true;
+  $("#progressWrap").classList.remove("hidden");
+  updateProgress(queue.length);
+
+  // One model instance processes the batch sequentially.
+  // This is intentionally memory-safe for iPhone and avoids browser lockups.
+  for(const item of queue){
+    await removeOne(item,queue.length);
+    await new Promise(resolve=>setTimeout(resolve,0));
+  }
+
+  state.processing=false;
+  $("#removeSelectedBtn").disabled=false;
+  $("#removeAllBtn").disabled=false;
+  updateProgress(queue.length);
+
+  toast(
+    state.failed
+      ? `${state.completed} finished • ${state.failed} failed`
+      : `Finished ${state.completed} cutout${state.completed===1?"":"s"}.`
+  );
+}
+
+async function removeSelectedBackgrounds(){
+  const picked=selectedItems();
+  if(!picked.length){
+    toast("Select one or more photos first.");
+    return;
+  }
+  await processRemovalQueue(picked,"Selected photos");
+}
+
+async function removeAllBackgrounds(){
+  if(!state.items.length){
+    toast("Add some photos first.");
+    return;
+  }
+  await processRemovalQueue(state.items,"All photos");
+}
+
 function updateProgress(total=state.items.length){const finished=state.completed+state.failed,pct=total?Math.round(finished/total*100):0;$("#progressBar").style.width=`${pct}%`;$("#progressText").textContent=state.processing?`${finished}/${total} processed`:`${finished}/${total} finished${state.failed?` • ${state.failed} failed`:""}`;}
 
 async function imageFromURL(url){return new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>resolve(img);img.onerror=reject;img.src=url;});}
@@ -1073,6 +1173,60 @@ async function downloadItems(items, button, filenamePrefix){
 }
 async function downloadSelected(){await downloadItems(selectedItems(),$("#downloadSelectedBtn"),"BackshotAI-selected");}
 async function downloadAll(){await downloadItems(state.items,$("#downloadAllBtn"),"BackshotAI");}
+
+const tutorialSteps=[
+  {
+    title:"Add your photos",
+    text:"Choose one image or a whole batch from Photos or Files.",
+    visual:"＋"
+  },
+  {
+    title:"Select exactly what you want",
+    text:"Tap individual photos, or click and drag across cards to select several without selecting the whole batch.",
+    visual:"✓"
+  },
+  {
+    title:"Remove backgrounds",
+    text:"Press Remove selected backgrounds for your selection, or Remove all backgrounds for the entire batch.",
+    visual:"✦"
+  },
+  {
+    title:"Choose a new background",
+    text:"Keep transparency, use a solid colour, or choose one image to use as the new background.",
+    visual:"▧"
+  },
+  {
+    title:"Adjust selected photos",
+    text:"Scale, move, brighten, change contrast or saturation. These changes only affect the selected photos.",
+    visual:"↔"
+  },
+  {
+    title:"Refine a cutout",
+    text:"Press Edit cutout on one photo to erase or restore areas using Assisted mode or the manual brush.",
+    visual:"⌁"
+  },
+  {
+    title:"Download",
+    text:"Download only your selected photos or export the complete batch as a ZIP.",
+    visual:"↓"
+  }
+];
+let tutorialIndex=0;
+
+function renderTutorial(){
+  const step=tutorialSteps[tutorialIndex]||tutorialSteps[0];
+  $("#tutorialCount").textContent=`${tutorialIndex+1} / ${tutorialSteps.length}`;
+  $("#tutorialTitle").textContent=step.title;
+  $("#tutorialText").textContent=step.text;
+  $("#tutorialVisual").textContent=step.visual;
+  $("#tutorialDots").innerHTML=tutorialSteps
+    .map((_,i)=>`<span class="${i===tutorialIndex?"active":""}"></span>`)
+    .join("");
+  $("#tutorialBack").disabled=tutorialIndex===0;
+  $("#tutorialNext").textContent=
+    tutorialIndex===tutorialSteps.length-1?"Done":"Next";
+}
+
 function openHelp(){tutorialIndex=0;renderTutorial();$("#helpModal").classList.remove("hidden");}
 function closeHelp(){$("#helpModal").classList.add("hidden");}
 photoInput.addEventListener("change", e => {
@@ -1086,8 +1240,16 @@ $("#helpBtn").onclick=openHelp;$("#closeHelp").onclick=closeHelp;$("#helpModal")
 $("#tutorialBack").onclick=()=>{if(tutorialIndex>0){tutorialIndex--;renderTutorial();}};
 $("#tutorialNext").onclick=()=>{if(tutorialIndex<tutorialSteps.length-1){tutorialIndex++;renderTutorial();}else closeHelp();};
 const dragGuide=$("#dragGuide");
-if(localStorage.getItem("backshotaiDragGuideDismissed")==="1")dragGuide.classList.add("hidden");
-$("#dragGuideGotIt").onclick=()=>{dragGuide.classList.add("guide-dismiss");localStorage.setItem("backshotaiDragGuideDismissed","1");setTimeout(()=>dragGuide.classList.add("hidden"),180);};
+try{
+  if(localStorage.getItem("backshotaiDragGuideDismissed")==="1"){
+    dragGuide.classList.add("hidden");
+  }
+}catch{}
+$("#dragGuideGotIt").onclick=()=>{
+  dragGuide.classList.add("guide-dismiss");
+  try{localStorage.setItem("backshotaiDragGuideDismissed","1");}catch{}
+  setTimeout(()=>dragGuide.classList.add("hidden"),180);
+};
 
 $("#removeSelectedBtn").onclick=removeSelectedBackgrounds;
 $("#removeAllBtn").onclick=removeAllBackgrounds;
@@ -1158,22 +1320,62 @@ $("#shadowY").oninput=e=>applyShadowToSelected("offsetY",Number(e.target.value))
 $("#eraseTool").onclick=()=>{state.editor.mode="erase";updateEditorUI();};$("#restoreTool").onclick=()=>{state.editor.mode="restore";updateEditorUI();};$("#assistToggle").onchange=updateEditorUI;$("#undoEdit").onclick=undo;$("#redoEdit").onclick=redo;$("#smartRecover").onclick=smartRecover;$("#applyEdit").onclick=applyEditor;$("#closeEditor").onclick=closeEditor;$("#cutoutModal").onclick=e=>{if(e.target.id==="cutoutModal")closeEditor();};
 let installPrompt=null;window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();installPrompt=e;$("#installBtn").classList.remove("hidden");});$("#installBtn").onclick=async()=>{if(!installPrompt){toast("On iPhone: Safari → Share → Add to Home Screen");return;}installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;$("#installBtn").classList.add("hidden");};
 window.addEventListener("resize",()=>{if(state.editor)requestAnimationFrame(fitEditorCanvasToStage);});
-// Local model loads only when Fast mode is used.if("serviceWorker" in navigator)window.addEventListener("load",()=>navigator.serviceWorker.register("./sw.js").catch(console.warn));
+if("serviceWorker" in navigator)window.addEventListener("load",()=>navigator.serviceWorker.register("./sw.js").catch(console.warn));
 
 
 function enableScrollChaining(el){
   if(!el)return;
+
+  // Desktop / trackpad scrolling:
+  // - scroll the panel while it has more content
+  // - once the panel reaches top/bottom, continue scrolling the whole page
+  // - never hijack Ctrl/Cmd + wheel because that is browser pinch zoom
   el.addEventListener("wheel",e=>{
     if(e.ctrlKey||e.metaKey)return;
-    const up=e.deltaY<0,down=e.deltaY>0;
-    const atTop=el.scrollTop<=0;
-    const atBottom=Math.ceil(el.scrollTop+el.clientHeight)>=el.scrollHeight;
+
+    const up=e.deltaY<0;
+    const down=e.deltaY>0;
+    const atTop=el.scrollTop<=1;
+    const atBottom=Math.ceil(el.scrollTop+el.clientHeight)>=el.scrollHeight-1;
+
     if((up&&atTop)||(down&&atBottom)){
       e.preventDefault();
-      window.scrollBy({top:e.deltaY,behavior:"auto"});
+      window.scrollBy({top:e.deltaY,left:0,behavior:"auto"});
     }
   },{passive:false});
+
+  // Mobile touch scrolling:
+  // keep normal scrolling inside the panel, then hand movement back to the page
+  // when the panel reaches either end. Two-finger pinch is left untouched.
+  let lastY=null;
+
+  el.addEventListener("touchstart",e=>{
+    if(e.touches.length===1)lastY=e.touches[0].clientY;
+    else lastY=null;
+  },{passive:true});
+
+  el.addEventListener("touchmove",e=>{
+    if(e.touches.length!==1||lastY===null)return;
+
+    const y=e.touches[0].clientY;
+    const fingerDelta=y-lastY;
+    lastY=y;
+
+    const movingDown=fingerDelta>0; // user finger down => content/page goes toward top
+    const movingUp=fingerDelta<0;   // user finger up => content/page goes toward bottom
+    const atTop=el.scrollTop<=1;
+    const atBottom=Math.ceil(el.scrollTop+el.clientHeight)>=el.scrollHeight-1;
+
+    if((movingDown&&atTop)||(movingUp&&atBottom)){
+      e.preventDefault();
+      window.scrollBy({top:-fingerDelta,left:0,behavior:"auto"});
+    }
+  },{passive:false});
+
+  el.addEventListener("touchend",()=>{lastY=null;},{passive:true});
+  el.addEventListener("touchcancel",()=>{lastY=null;},{passive:true});
 }
+
 enableScrollChaining(document.querySelector(".controls"));
 enableScrollChaining(document.querySelector(".gallery-shell"));
 
@@ -1184,3 +1386,15 @@ if("requestIdleCallback" in window){
 }else{
   setTimeout(()=>warmBackshotEngine(),1200);
 }
+
+
+window.addEventListener("error",event=>{
+  console.error("BackshotAI runtime error",event.error||event.message);
+  const status=document.querySelector("#engineStatus");
+  if(status&&status.textContent.includes("Starting")){
+    status.textContent="Loads on Remove";
+  }
+});
+window.addEventListener("unhandledrejection",event=>{
+  console.error("BackshotAI async error",event.reason);
+});

@@ -205,3 +205,9 @@ fieldset{border:0;padding:0;margin:0;min-width:0}fieldset:disabled{opacity:.42}.
 /* Processing must never lock the page. */
 body.processing,.page.processing,.workspace.processing{pointer-events:auto!important;overflow:visible!important}
 .preview-wrap.scanning{pointer-events:auto}
+
+.editor-overlay,
+.editor-stage,
+.editor-canvas-wrap{
+  touch-action:pan-x pan-y pinch-zoom;
+}
