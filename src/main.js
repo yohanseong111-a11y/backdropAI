@@ -19,7 +19,7 @@ const state = {
   processing: false,
   completed: 0,
   failed: 0,
-  quality: "smart",
+  quality: "auto",
   editor: null,
   dragSelecting: false,
   dragMoved: false,
@@ -53,17 +53,13 @@ app.innerHTML = `
       <div class="section-title">1. Background removal</div>
       <div class="quality-row">
         <span>Removal mode</span>
-        <select id="qualitySelect">
-          <option value="smart" selected>Smart — PhotoRoom precision</option>
-          <option value="best">Best quality — PhotoRoom full resolution</option>
-          <option value="fast">Fast — local browser model</option>
-        </select>
+        <div class="single-mode-badge">Best automatic</div>
       </div>
       <div class="api-key-row">
         <input id="photoroomKey" type="password" autocomplete="off" placeholder="PhotoRoom API key" />
-        <button id="savePhotoRoomKey" class="ghost small-btn" type="button">Use key</button>
+        <button id="savePhotoRoomKey" class="ghost small-btn" type="button">Test & use key</button>
       </div>
-      <p id="apiKeyStatus" class="small api-key-status">Smart/Best use PhotoRoom's background-removal engine. Your key is kept only for this browser session.</p>
+      <p id="apiKeyStatus" class="small api-key-status">Best automatic uses PhotoRoom precision when connected. Your key is kept only for this browser session.</p>
       <div class="remove-button-stack">
         <button id="removeSelectedBtn" class="primary">Remove selected backgrounds</button>
         <button id="removeAllBtn" class="ghost remove-all-btn">Remove all backgrounds</button>
@@ -72,7 +68,7 @@ app.innerHTML = `
         <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
         <div id="progressText" class="small"></div>
       </div>
-      <p class="privacy-note">Smart/Best are processed by PhotoRoom’s API for cleaner product-safe cutouts. Fast stays local on your device.</p>
+      <p class="privacy-note">Best automatic uses PhotoRoom precision for clean product-safe cutouts.</p>
 
       <div class="divider"></div>
       <div class="section-title">2. New background</div>
@@ -747,8 +743,21 @@ function updatePhotoRoomKeyStatus(){
   if(!status)return;
   status.textContent=getPhotoRoomKey()
     ?"PhotoRoom precision is ready for this session."
-    :"Smart/Best need your PhotoRoom API key. Fast mode works without one.";
+    :"Best automatic needs your PhotoRoom API key.";
 }
+
+async function verifyPhotoRoomKey(key){
+  const response=await fetch("https://image-api.photoroom.com/v2/account",{
+    headers:{"X-Api-Key":key}
+  });
+  if(!response.ok){
+    const err=new Error(`PhotoRoom account check failed (${response.status})`);
+    err.status=response.status;
+    throw err;
+  }
+  return await response.json();
+}
+
 
 async function removeWithPhotoRoom(file,mode){
   const apiKey=getPhotoRoomKey();
@@ -786,20 +795,17 @@ async function removeWithPhotoRoom(file,mode){
   }
 }
 
-async function chooseSafeCutout(file,mode,progress){
-  if(mode==="fast"){
-    $("#progressText").textContent="Removing background locally…";
-    const quick=await removeStable(file,"fast",progress);
-    return cleanCutoutEdges(quick);
+async function chooseSafeCutout(file){
+  $("#progressText").textContent="Removing background…";
+  let result=await removeWithPhotoRoom(file,"smart");
+
+  // If the returned subject looks implausibly tiny or fragmented,
+  // retry once at full resolution automatically.
+  const shape=await cutoutShapeStats(result);
+  if(shape.visible<0.22 || shape.largestShare<0.78){
+    $("#progressText").textContent="Refining cutout…";
+    result=await removeWithPhotoRoom(file,"best");
   }
-
-  $("#progressText").textContent=mode==="best"
-    ?"PhotoRoom: full-resolution cutout…"
-    :"PhotoRoom: removing background…";
-
-  const result=await removeWithPhotoRoom(file,mode);
-  // PhotoRoom already applies matting to RGBA cutouts. Do not run our previous
-  // erosion/colour-mask algorithms over the result; that was causing product holes.
   return result;
 }
 
@@ -813,7 +819,7 @@ async function removeOne(item, queueTotal) {
       if(total>0&&/fetch|model/i.test(key))$("#progressText").textContent=`Loading removal model… ${Math.round(current/total*100)}%`;
     };
 
-    const blob=await chooseSafeCutout(item.file,state.quality,progress);
+    const blob=await chooseSafeCutout(item.file);
     item.cutoutBlob=blob;
     if(item.cutoutURL)URL.revokeObjectURL(item.cutoutURL);
     item.cutoutURL=URL.createObjectURL(blob);
@@ -840,6 +846,11 @@ async function removeOne(item, queueTotal) {
 }
 async function processRemovalQueue(queue,label){
   if(state.processing)return;
+  if(!getPhotoRoomKey()){
+    toast("Add and verify your PhotoRoom API key first.");
+    $("#photoroomKey")?.focus();
+    return;
+  }
   queue=queue.filter(i=>!i.cutoutBlob);
   if(!queue.length){toast(`${label} already have backgrounds removed.`);return;}
   state.processing=true;state.completed=0;state.failed=0;
@@ -847,9 +858,7 @@ async function processRemovalQueue(queue,label){
 
   // Real bulk mode: run several photos at once, but cap concurrency to avoid crashing phones.
   const mobile=/iPad|iPhone|iPod|Android/i.test(navigator.userAgent);
-  // Smart/Best are network/API work, so several can run at once without locking the UI.
-  // Fast is local inference, so keep its concurrency conservative.
-  let concurrency=state.quality==="fast" ? (mobile?1:2) : (mobile?3:5);
+  let concurrency=mobile?3:5;
 
   let cursor=0;
   async function worker(){
@@ -971,7 +980,7 @@ function pushHistory(){const e=state.editor;e.history.push(e.ctx.getImageData(0,
 function undo(){const e=state.editor;if(e.history.length<=1)return;const cur=e.history.pop();e.redo.push(cur);e.ctx.putImageData(e.history[e.history.length-1],0,0);updateEditorUI();}
 function redo(){const e=state.editor;if(!e.redo.length)return;const img=e.redo.pop();e.history.push(img);e.ctx.putImageData(img,0,0);updateEditorUI();}
 function moveBrushCursor(ev){const stage=$(".editor-stage").getBoundingClientRect(),size=$("#assistToggle").checked?28:Number($("#brushSize").value),el=$("#brushCursor");el.classList.add("show");el.style.width=`${size}px`;el.style.height=`${size}px`;el.style.left=`${ev.clientX-stage.left-size/2}px`;el.style.top=`${ev.clientY-stage.top-size/2}px`;}
-async function smartRecover(){const e=state.editor;if(!e)return;$("#smartRecover").disabled=true;$("#smartRecover").textContent="Checking…";try{const clean=await chooseSafeCutout(e.item.file,"best",()=>{}),img=await imageFromURL(URL.createObjectURL(clean));e.ctx.save();e.ctx.globalCompositeOperation="source-over";e.ctx.drawImage(img,0,0,e.canvas.width,e.canvas.height);e.ctx.restore();pushHistory();toast("Safer high-quality subject pass merged.");}catch(err){toast("Re-check failed on this device.");}$("#smartRecover").disabled=false;$("#smartRecover").textContent="Re-check subject";}
+async function smartRecover(){const e=state.editor;if(!e)return;$("#smartRecover").disabled=true;$("#smartRecover").textContent="Checking…";try{const clean=await chooseSafeCutout(e.item.file),img=await imageFromURL(URL.createObjectURL(clean));e.ctx.save();e.ctx.globalCompositeOperation="source-over";e.ctx.drawImage(img,0,0,e.canvas.width,e.canvas.height);e.ctx.restore();pushHistory();toast("Safer high-quality subject pass merged.");}catch(err){toast("Re-check failed on this device.");}$("#smartRecover").disabled=false;$("#smartRecover").textContent="Re-check subject";}
 async function applyEditor(){const e=state.editor;if(!e)return;let blob=await new Promise(res=>e.canvas.toBlob(res,"image/png",1));blob=await cleanCutoutEdges(blob);e.item.cutoutBlob=blob;if(e.item.cutoutURL)URL.revokeObjectURL(e.item.cutoutURL);e.item.cutoutURL=URL.createObjectURL(blob);e.item.status="done";closeEditor();renderGallery();toast("Cutout updated.");}
 function closeEditor(){$("#cutoutModal").classList.add("hidden");state.editor=null;}
 
@@ -1016,12 +1025,35 @@ $("#dragGuideGotIt").onclick=()=>{dragGuide.classList.add("guide-dismiss");local
 $("#removeSelectedBtn").onclick=removeSelectedBackgrounds;
 $("#removeAllBtn").onclick=removeAllBackgrounds;
 $("#downloadSelectedBtn").onclick=downloadSelected;$("#downloadAllBtn").onclick=downloadAll;
-$("#qualitySelect").onchange=e=>state.quality=e.target.value;
-$("#savePhotoRoomKey").onclick=()=>{
+$("#savePhotoRoomKey").onclick=async()=>{
+  const btn=$("#savePhotoRoomKey");
   const key=$("#photoroomKey").value.trim();
-  if(!key){sessionStorage.removeItem("backshotai-photoroom-key");toast("PhotoRoom key cleared.");}
-  else{sessionStorage.setItem("backshotai-photoroom-key",key);$("#photoroomKey").value="";toast("PhotoRoom precision enabled.");}
-  updatePhotoRoomKeyStatus();
+  if(!key){
+    sessionStorage.removeItem("backshotai-photoroom-key");
+    updatePhotoRoomKeyStatus();
+    toast("Enter a PhotoRoom API key first.");
+    $("#photoroomKey").focus();
+    return;
+  }
+  btn.disabled=true;btn.textContent="Checking…";
+  try{
+    const account=await verifyPhotoRoomKey(key);
+    sessionStorage.setItem("backshotai-photoroom-key",key);
+    $("#photoroomKey").value="";
+    const available=account?.images?.available;
+    $("#apiKeyStatus").textContent=Number.isFinite(available)
+      ? `PhotoRoom connected • ${available} edits available.`
+      : "PhotoRoom connected and ready.";
+    toast("PhotoRoom precision enabled.");
+  }catch(err){
+    sessionStorage.removeItem("backshotai-photoroom-key");
+    if(err?.status===401||err?.status===403)toast("That PhotoRoom API key was rejected.");
+    else if(err?.status===402)toast("PhotoRoom credits are empty.");
+    else toast("Could not verify the PhotoRoom key.");
+    updatePhotoRoomKeyStatus();
+  }finally{
+    btn.disabled=false;btn.textContent="Test & use key";
+  }
 };
 updatePhotoRoomKeyStatus();
 $("#clearBtn").onclick=()=>{for(const i of state.items)cleanupItem(i);state.items=[];state.selected.clear();workspace.classList.add("hidden");gallery.innerHTML="";updateSelectionUI();};

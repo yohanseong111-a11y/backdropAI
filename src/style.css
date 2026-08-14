@@ -270,3 +270,5 @@ input[type="checkbox"] { accent-color: #846fff; transform: scale(1.15); }
 }
 .api-key-row input:focus{border-color:rgba(139,112,255,.75);box-shadow:0 0 0 3px rgba(139,112,255,.10)}
 .api-key-status{margin:0 0 10px;line-height:1.4}
+
+.single-mode-badge{font-weight:700;color:#c8b9ff;background:rgba(126,91,255,.10);border:1px solid rgba(126,91,255,.25);padding:8px 10px;border-radius:10px}
