@@ -1012,6 +1012,151 @@ function makeProductSafeAlpha(rgb,inputAlpha,w,h){
   return removeTinyBackgroundSpecks(rgb,smooth,w,h);
 }
 
+
+function cleanFinalForegroundComponents(rgb,alpha,w,h){
+  const total=w*h;
+  const visibleThreshold=24;
+  const visited=new Uint8Array(total);
+  const queue=new Int32Array(total);
+  const components=[];
+
+  // Learn what the original background looks like from the outside frame.
+  const bgClusters=dominantBorderColours(rgb,alpha,w,h);
+
+  const colourLooksLikeBackground=i=>{
+    const o=i*4;
+    const r=rgb[o],g=rgb[o+1],b=rgb[o+2];
+    let d=999;
+    for(const c of bgClusters){
+      d=Math.min(d,colourDistance(r,g,b,c.r,c.g,c.b));
+    }
+    return d<125;
+  };
+
+  for(let start=0;start<total;start++){
+    if(visited[start]||alpha[start]<=visibleThreshold)continue;
+
+    let head=0,tail=0;
+    queue[tail++]=start;
+    visited[start]=1;
+
+    const pixels=[];
+    let minX=w,maxX=0,minY=h,maxY=0;
+    let bgLike=0;
+
+    while(head<tail){
+      const i=queue[head++];
+      pixels.push(i);
+
+      const x=i%w;
+      const y=(i/w)|0;
+      if(x<minX)minX=x;
+      if(x>maxX)maxX=x;
+      if(y<minY)minY=y;
+      if(y>maxY)maxY=y;
+
+      if(colourLooksLikeBackground(i))bgLike++;
+
+      const add=j=>{
+        if(j<0||j>=total||visited[j]||alpha[j]<=visibleThreshold)return;
+        visited[j]=1;
+        queue[tail++]=j;
+      };
+
+      if(x>0)add(i-1);
+      if(x<w-1)add(i+1);
+      if(y>0)add(i-w);
+      if(y<h-1)add(i+w);
+    }
+
+    components.push({
+      pixels,
+      area:pixels.length,
+      minX,maxX,minY,maxY,
+      bgRatio:pixels.length ? bgLike/pixels.length : 0
+    });
+  }
+
+  if(!components.length)return new Uint8Array(alpha);
+
+  components.sort((a,b)=>b.area-a.area);
+  const largest=components[0];
+  const result=new Uint8Array(alpha);
+
+  // Scale thresholds with the actual image size.
+  const minDim=Math.min(w,h);
+  const absoluteTiny=Math.max(24,Math.round(total*0.00012));
+  const smallIsland=Math.max(80,Math.round(total*0.00065));
+  const meaningfulSide=Math.max(14,Math.round(minDim*0.055));
+
+  // The main foreground component is always preserved.
+  // Other components are preserved if they are clearly substantial.
+  // Small isolated components that resemble the learned background are removed.
+  for(let ci=1;ci<components.length;ci++){
+    const c=components[ci];
+    const bw=c.maxX-c.minX+1;
+    const bh=c.maxY-c.minY+1;
+
+    const tinyByArea=c.area<=absoluteTiny;
+    const smallByArea=c.area<=smallIsland;
+    const smallByBox=bw<=meaningfulSide && bh<=meaningfulSide;
+
+    // Remove any truly tiny disconnected island, even if the earlier
+    // product-protection step accidentally made it fully opaque.
+    //
+    // For slightly larger islands, require strong background-colour evidence
+    // before deleting them. This protects detached accessories/details.
+    const shouldRemove=
+      tinyByArea ||
+      ((smallByArea||smallByBox) && c.bgRatio>=0.42);
+
+    if(shouldRemove){
+      for(const i of c.pixels)result[i]=0;
+    }
+  }
+
+  return result;
+}
+
+function removeBackgroundColourFringe(rgb,alpha,w,h){
+  const result=new Uint8Array(alpha);
+  const clusters=dominantBorderColours(rgb,alpha,w,h);
+  if(!clusters.length)return result;
+
+  // Only inspect pixels close to transparency. This removes green/grass
+  // contamination around cutout edges without recolouring the jacket itself.
+  for(let y=1;y<h-1;y++){
+    for(let x=1;x<w-1;x++){
+      const i=y*w+x;
+      if(result[i]===0)continue;
+
+      const neighbourTransparent=
+        result[i-1]<18 || result[i+1]<18 ||
+        result[i-w]<18 || result[i+w]<18;
+
+      if(!neighbourTransparent)continue;
+
+      const o=i*4;
+      const r=rgb[o],g=rgb[o+1],b=rgb[o+2];
+
+      let d=999;
+      for(const c of clusters){
+        d=Math.min(d,colourDistance(r,g,b,c.r,c.g,c.b));
+      }
+
+      // A pixel that is very close to the learned background colour and lies
+      // immediately beside transparency is overwhelmingly likely to be residue.
+      if(d<72){
+        result[i]=0;
+      }else if(d<98 && result[i]<150){
+        result[i]=Math.min(result[i],28);
+      }
+    }
+  }
+
+  return result;
+}
+
 async function applyMaskBufferToFile(file,maskBuffer,maskWidth,maskHeight){
   if(!maskBuffer||!maskWidth||!maskHeight)throw new Error("The AI returned an invalid mask.");
 
@@ -1062,10 +1207,19 @@ async function applyMaskBufferToFile(file,maskBuffer,maskWidth,maskHeight){
   // analysis from the ORIGINAL image.
   const safeAlpha=makeProductSafeAlpha(image.data,modelAlpha,ow,oh);
 
+  // FINAL cleanup happens after product protection so restored grass islands
+  // cannot survive as solid green dots.
+  let finalAlpha=cleanFinalForegroundComponents(image.data,safeAlpha,ow,oh);
+  finalAlpha=removeBackgroundColourFringe(image.data,finalAlpha,ow,oh);
+
   for(let i=0;i<ow*oh;i++){
-    let a=safeAlpha[i];
-    if(a<28)a=0;
-    else if(a>238)a=255;
+    let a=finalAlpha[i];
+
+    // Snap obvious background fully transparent and obvious product fully solid.
+    // Keep only the genuinely soft edge band.
+    if(a<34)a=0;
+    else if(a>236)a=255;
+
     image.data[i*4+3]=a;
   }
   ctx.putImageData(image,0,0);
