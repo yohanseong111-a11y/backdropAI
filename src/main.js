@@ -482,6 +482,13 @@ async function downloadSelected(){await downloadItems(selectedItems(),$("#downlo
 async function downloadAll(){await downloadItems(state.items,$("#downloadAllBtn"),"BackshotAI");}
 function openHelp(){tutorialIndex=0;renderTutorial();$("#helpModal").classList.remove("hidden");}
 function closeHelp(){$("#helpModal").classList.add("hidden");}
+photoInput.addEventListener("change", e => {
+  addFiles(e.target.files);
+  // Allow choosing the same file again later.
+  e.target.value = "";
+});
+$("#addMoreBtn").onclick = () => photoInput.click();
+
 $("#helpBtn").onclick=openHelp;$("#closeHelp").onclick=closeHelp;$("#helpModal").onclick=e=>{if(e.target.id==="helpModal")closeHelp();};
 $("#tutorialBack").onclick=()=>{if(tutorialIndex>0){tutorialIndex--;renderTutorial();}};
 $("#tutorialNext").onclick=()=>{if(tutorialIndex<tutorialSteps.length-1){tutorialIndex++;renderTutorial();}else closeHelp();};
