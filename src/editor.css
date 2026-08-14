@@ -62,14 +62,14 @@
 .brush-row input{width:130px}
 .small-btn{padding:8px 10px;font-size:11px;border-radius:9px}
 .editor-stage{
-  min-height:0;position:relative;overflow:hidden;display:grid;place-items:center;touch-action:none;
+  min-height:0;position:relative;overflow:hidden;display:grid;place-items:center;touch-action:none;padding:12px;
   background:
     linear-gradient(45deg,#1b1b20 25%,transparent 25%) 0 0/24px 24px,
     linear-gradient(-45deg,#1b1b20 25%,transparent 25%) 0 12px/24px 24px,
     linear-gradient(45deg,transparent 75%,#1b1b20 75%) 12px -12px/24px 24px,
     linear-gradient(-45deg,transparent 75%,#1b1b20 75%) -12px 0/24px 24px,#101014
 }
-#editorCanvas{max-width:100%;max-height:100%;display:block;touch-action:none;cursor:none}
+#editorCanvas{display:block;touch-action:none;cursor:none;max-width:100%;max-height:100%;width:auto;height:auto;box-shadow:0 0 0 1px rgba(255,255,255,.12);object-fit:contain}
 .brush-cursor{
   position:absolute;border:1.5px solid white;border-radius:50%;pointer-events:none;display:none;z-index:10;
   box-shadow:0 0 0 1px rgba(0,0,0,.7),0 0 10px rgba(0,0,0,.45)
@@ -117,3 +117,34 @@
 }
 .scan-glow { height:14%; animation-duration:.92s; opacity:.55; }
 .status.revealing { background:rgba(81,65,184,.92); }
+
+/* vNext: selection, background preview, filters and smoother scanner */
+.processing-original{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block;z-index:1}
+.preview-wrap.scanning .scan-line,.preview-wrap.scanning .scan-glow{will-change:transform,top;transform:translateZ(0);backface-visibility:hidden}
+.preview-wrap.scanning .scan-line{z-index:7;animation:scanSweepFast .86s linear infinite alternate}
+.preview-wrap.scanning .scan-glow{z-index:6;animation:scanGlowFast .86s linear infinite alternate}
+@keyframes scanSweepFast{0%{top:1%}100%{top:98%}}
+@keyframes scanGlowFast{0%{top:-8%}100%{top:84%}}
+
+.photo-card{position:relative;transition:border-color .15s ease,box-shadow .15s ease,transform .15s ease}
+.photo-card.selected{border-color:rgba(132,111,255,.9);box-shadow:0 0 0 2px rgba(132,111,255,.18),0 16px 40px rgba(0,0,0,.2)}
+.photo-card.selected .preview-wrap{outline:1px solid rgba(151,132,255,.45);outline-offset:-1px}
+.select-chip{position:absolute;right:10px;top:10px;z-index:12;width:27px;height:27px;padding:0;border-radius:50%;border:1px solid rgba(255,255,255,.42);background:rgba(9,9,12,.6);backdrop-filter:blur(8px);font-size:14px;display:grid;place-items:center}
+.photo-card.selected .select-chip{background:#765fff;border-color:#9d8cff}
+.selection-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.selection-head>div:first-child{display:flex;flex-direction:column;gap:3px}.selection-head #selectedCount{font-size:11px;color:#85858e}
+.selection-actions{display:flex;gap:5px}.text-btn{background:transparent;padding:5px 6px;color:#a596ff;font-size:11px}
+.selection-help{font-size:10px;line-height:1.45;color:#707079;margin:8px 0 10px}.no-margin{margin:0}.mini-title{font-size:11px;font-weight:800;color:#c9c9cf;margin:16px 0 6px}
+fieldset{border:0;padding:0;margin:0;min-width:0}fieldset:disabled{opacity:.42}.reset-btn{width:100%;margin-top:9px;font-size:11px}
+.background-preview{margin-top:10px;padding:9px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.07);border-radius:13px;display:grid;grid-template-columns:60px 1fr 30px;align-items:center;gap:10px}
+.background-preview img{width:60px;height:48px;object-fit:cover;border-radius:9px;background:#08080a}.background-preview>div{min-width:0;display:flex;flex-direction:column;gap:3px}.background-preview strong{font-size:11px}.background-preview span{font-size:9px;color:#777780;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.icon-btn.mini{width:30px;height:30px;font-size:17px;border-radius:9px}
+
+/* reveal is the real processed result, exposed exactly behind the scan line */
+.preview-wrap.revealing{isolation:isolate}
+.reveal-cutout{will-change:clip-path;animation-duration:.72s}
+.reveal-scan-line{will-change:top;animation-duration:.72s;height:2px}
+
+@media(max-width:700px){
+  .select-chip{width:25px;height:25px;right:8px;top:8px}
+  .background-preview{grid-template-columns:54px 1fr 30px}.background-preview img{width:54px;height:44px}
+}
