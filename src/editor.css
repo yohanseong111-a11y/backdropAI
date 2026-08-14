@@ -197,3 +197,5 @@ fieldset{border:0;padding:0;margin:0;min-width:0}fieldset:disabled{opacity:.42}.
   .controls::-webkit-scrollbar,.gallery-shell::-webkit-scrollbar{width:9px}.controls::-webkit-scrollbar-thumb,.gallery-shell::-webkit-scrollbar-thumb{background:#2b2b31;border-radius:999px;border:2px solid #111114}
 }
 @media(max-width:700px){.drag-guide{grid-template-columns:38px 1fr auto;padding:11px 12px;gap:10px}.drag-guide-icon{width:34px;height:30px}.drag-guide-copy strong{font-size:12px}.drag-guide-copy span{font-size:9px}.guide-got-it{padding:7px 10px;font-size:10px}.gallery-head-actions{gap:5px}.gallery-head-actions button{font-size:10px;padding:9px 10px}.help-body{grid-template-columns:1fr;padding:20px}.tutorial-visual{height:92px;font-size:42px}.help-card{border-radius:20px}.help-modal{padding:10px}}
+
+.photo-card canvas,.editor-stage canvas{image-rendering:auto}

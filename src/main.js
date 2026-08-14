@@ -27,7 +27,7 @@ const state = {
 const app = document.querySelector("#app");
 app.innerHTML = `
 <header class="topbar">
-  <div><div class="brand">BackshotAI</div><div class="subtitle">Bulk background studio</div></div>
+  <div class="brand-wrap"><img class="brand-logo" src="./icon-192.png" alt=""><div><div class="brand">BackshotAI</div><div class="subtitle">Bulk background studio</div></div></div>
   <button id="installBtn" class="ghost hidden">Install</button>
 </header>
 
@@ -115,6 +115,7 @@ app.innerHTML = `
       <label class="control-row"><span>Distance</span><input id="shadowY" type="range" min="-30" max="70" step="1" value="18" /></label>
 
       <div class="divider"></div>
+      <button id="downloadSelectedBtn" class="primary success secondary-download">Download selected</button>
       <button id="downloadAllBtn" class="primary success">Download all as ZIP</button>
       <button id="clearBtn" class="danger ghost">Clear batch</button>
     </aside>
@@ -260,7 +261,7 @@ function renderGallery() {
   requestAnimationFrame(renderAllPreviews);
 }
 
-function updateSelectionUI(){
+function updateSelectionUI(){const ds=$("#downloadSelectedBtn");if(ds)ds.disabled=state.selected.size===0;
   const items=selectedItems(), first=items[0];
   $("#selectedCount").textContent=`${items.length} selected`;
   $("#selectedControls").disabled=!items.length;
@@ -458,29 +459,27 @@ async function applyEditor(){const e=state.editor;if(!e)return;let blob=await ne
 function closeEditor(){$("#cutoutModal").classList.add("hidden");state.editor=null;}
 
 /* ---------- Export ---------- */
-async function downloadAll(){if(!state.items.length)return;$("#downloadAllBtn").disabled=true;$("#downloadAllBtn").textContent="Preparing ZIP…";try{const zip=new JSZip();let counter=1;for(const item of state.items){const img=await imageFromURL(item.cutoutURL||item.originalURL),canvas=document.createElement("canvas");await drawComposite(canvas,item,{width:img.naturalWidth||img.width,height:img.naturalHeight||img.height});const transparent=state.bgMode==="transparent",mime=transparent?"image/png":"image/jpeg",ext=transparent?"png":"jpg",blob=await new Promise(r=>canvas.toBlob(r,mime,transparent?undefined:.94)),name=(item.name.replace(/\.[^.]+$/,"")||`image-${counter}`).replace(/[^\w\- ]+/g,"").trim().replace(/\s+/g,"-");zip.file(`${name||`image-${counter}`}-edited.${ext}`,blob);counter++;}const out=await zip.generateAsync({type:"blob",compression:"DEFLATE"});downloadBlob(out,`BackshotAI-${new Date().toISOString().slice(0,10)}.zip`);}catch(e){console.error(e);toast("Couldn't create ZIP.");}$("#downloadAllBtn").disabled=false;$("#downloadAllBtn").textContent="Download all as ZIP";}
-function downloadBlob(blob,name){const a=document.createElement("a"),url=URL.createObjectURL(blob);a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),5000);}
-
-/* ---------- controls ---------- */
-photoInput.onchange=e=>addFiles(e.target.files);
-$("#addMoreBtn").onclick=()=>photoInput.click();
-const tutorialSteps=[
-  {icon:"＋",title:"Add your photos",text:"Select one photo or upload a whole batch from your phone or computer."},
-  {icon:"▦",title:"Select exactly what you want",text:"Tap cards one by one, or click and drag across several photos to select them together."},
-  {icon:"✦",title:"Remove backgrounds",text:"Use Remove selected backgrounds for your selection, or Remove all backgrounds only when you want the entire batch processed."},
-  {icon:"▣",title:"Choose a replacement background",text:"Pick Transparent, Colour, or Image. When you choose an image, its preview stays visible in the left panel."},
-  {icon:"↔",title:"Position and filter selected photos",text:"Scale, move, brighten, adjust contrast, or change saturation. These controls only affect the photos you selected."},
-  {icon:"⌁",title:"Fix difficult cutouts",text:"Open Edit cutout. Assisted mode follows a connected region you tap; Manual mode lets you erase or restore with mouse or finger."},
-  {icon:"↓",title:"Export your batch",text:"When everything looks right, download all edited photos together as a ZIP."}
-];
-let tutorialIndex=0;
-function renderTutorial(){
-  const step=tutorialSteps[tutorialIndex];
-  $("#tutorialVisual").textContent=step.icon;$("#tutorialTitle").textContent=step.title;$("#tutorialText").textContent=step.text;
-  $("#tutorialCount").textContent=`${tutorialIndex+1} / ${tutorialSteps.length}`;
-  $("#tutorialDots").innerHTML=tutorialSteps.map((_,i)=>`<span class="${i===tutorialIndex?"active":""}"></span>`).join("");
-  $("#tutorialBack").disabled=tutorialIndex===0;$("#tutorialNext").textContent=tutorialIndex===tutorialSteps.length-1?"Done":"Next";
+async function downloadItems(items, button, filenamePrefix){
+  if(!items.length){toast("Select one or more photos first.");return;}
+  const originalText=button.textContent;
+  button.disabled=true;button.textContent="Preparing…";
+  try{
+    const zip=new JSZip();let counter=1;
+    for(const item of items){
+      const img=await imageFromURL(item.cutoutURL||item.originalURL),canvas=document.createElement("canvas");
+      await drawComposite(canvas,item,{width:img.naturalWidth||img.width,height:img.naturalHeight||img.height});
+      const transparent=state.bgMode==="transparent",mime=transparent?"image/png":"image/jpeg",ext=transparent?"png":"jpg";
+      const blob=await new Promise(r=>canvas.toBlob(r,mime,transparent?undefined:.95));
+      const name=(item.name.replace(/\.[^.]+$/,"")||`image-${counter}`).replace(/[^\w\- ]+/g,"").trim().replace(/\s+/g,"-");
+      zip.file(`${name||`image-${counter}`}-edited.${ext}`,blob);counter++;
+    }
+    const out=await zip.generateAsync({type:"blob",compression:"DEFLATE"});
+    downloadBlob(out,`${filenamePrefix}-${new Date().toISOString().slice(0,10)}.zip`);
+  }catch(e){console.error(e);toast("Couldn't create ZIP.");}
+  button.disabled=false;button.textContent=originalText;
 }
+async function downloadSelected(){await downloadItems(selectedItems(),$("#downloadSelectedBtn"),"BackshotAI-selected");}
+async function downloadAll(){await downloadItems(state.items,$("#downloadAllBtn"),"BackshotAI");}
 function openHelp(){tutorialIndex=0;renderTutorial();$("#helpModal").classList.remove("hidden");}
 function closeHelp(){$("#helpModal").classList.add("hidden");}
 $("#helpBtn").onclick=openHelp;$("#closeHelp").onclick=closeHelp;$("#helpModal").onclick=e=>{if(e.target.id==="helpModal")closeHelp();};
@@ -492,7 +491,7 @@ $("#dragGuideGotIt").onclick=()=>{dragGuide.classList.add("guide-dismiss");local
 
 $("#removeSelectedBtn").onclick=removeSelectedBackgrounds;
 $("#removeAllBtn").onclick=removeAllBackgrounds;
-$("#downloadAllBtn").onclick=downloadAll;
+$("#downloadSelectedBtn").onclick=downloadSelected;$("#downloadAllBtn").onclick=downloadAll;
 $("#qualitySelect").onchange=e=>state.quality=e.target.value;
 $("#clearBtn").onclick=()=>{for(const i of state.items)cleanupItem(i);state.items=[];state.selected.clear();workspace.classList.add("hidden");gallery.innerHTML="";updateSelectionUI();};
 document.querySelectorAll(".seg").forEach(btn=>btn.onclick=()=>{state.bgMode=btn.dataset.bg;document.querySelectorAll(".seg").forEach(b=>b.classList.toggle("active",b===btn));$("#solidControls").classList.toggle("hidden",state.bgMode!=="solid");$("#backgroundPicker").classList.toggle("hidden",state.bgMode!=="image");renderAllPreviews();});
@@ -558,3 +557,19 @@ $("#eraseTool").onclick=()=>{state.editor.mode="erase";updateEditorUI();};$("#re
 let installPrompt=null;window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();installPrompt=e;$("#installBtn").classList.remove("hidden");});$("#installBtn").onclick=async()=>{if(!installPrompt){toast("On iPhone: Safari → Share → Add to Home Screen");return;}installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;$("#installBtn").classList.add("hidden");};
 window.addEventListener("resize",()=>{if(state.editor)requestAnimationFrame(fitEditorCanvasToStage);});
 preloadRemovalModel();if("serviceWorker" in navigator)window.addEventListener("load",()=>navigator.serviceWorker.register("./sw.js").catch(console.warn));
+
+
+function enableScrollChaining(el){
+  if(!el)return;
+  el.addEventListener("wheel",e=>{
+    const up=e.deltaY<0,down=e.deltaY>0;
+    const atTop=el.scrollTop<=0;
+    const atBottom=Math.ceil(el.scrollTop+el.clientHeight)>=el.scrollHeight;
+    if((up&&atTop)||(down&&atBottom)){
+      e.preventDefault();
+      window.scrollBy({top:e.deltaY,behavior:"auto"});
+    }
+  },{passive:false});
+}
+enableScrollChaining(document.querySelector(".control-panel"));
+enableScrollChaining(document.querySelector(".gallery-shell"));

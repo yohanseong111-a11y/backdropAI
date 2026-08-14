@@ -250,3 +250,15 @@ input[type="checkbox"] { accent-color: #846fff; transform: scale(1.15); }
   .controls { border-radius:20px; padding:17px; }
   .gallery-head { padding:0 4px; }
 }
+
+.brand-wrap{display:flex;align-items:center;gap:12px}
+.brand-logo{width:42px;height:42px;border-radius:12px;display:block;object-fit:cover;box-shadow:0 0 22px rgba(128,90,255,.18)}
+.secondary-download{margin-bottom:8px}
+@media (min-width:900px){
+  .control-panel,.gallery-shell{
+    max-height:calc(100vh - 120px);
+    overflow-y:auto;
+    overscroll-behavior-y:auto;
+    scrollbar-gutter:stable;
+  }
+}
