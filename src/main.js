@@ -54,8 +54,8 @@ app.innerHTML = `
       <div class="quality-row">
         <span>Removal mode</span>
         <select id="qualitySelect">
-          <option value="smart" selected>Smart — recommended</option>
-          <option value="best">Best quality</option>
+          <option value="smart" selected>Smart — clean product cutout</option>
+          <option value="best">Best quality — full precision</option>
           <option value="fast">Fast</option>
         </select>
       </div>
@@ -290,7 +290,7 @@ function applyShadowToSelected(key,value){
 }
 
 function removalConfig(mode, progress, useWorker = true) {
-  const model = mode === "best" ? "isnet" : mode === "fast" ? "isnet_quint8" : "isnet_fp16";
+  const model = mode === "fast" ? "isnet_quint8" : "isnet";
   return {
     model,
     device: "cpu",
@@ -423,47 +423,126 @@ async function alphaStats(blob) {
 }
 
 async function cleanCutoutEdges(blob){
+  // Matting-style refinement: preserve the model's foreground alpha and clean only the boundary.
+  // PhotoRoom's own API docs note that matting is what improves cutout edges over a raw mask.
   const bmp=await createImageBitmap(blob),c=document.createElement("canvas");
   c.width=bmp.width;c.height=bmp.height;
   const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0);
   const img=ctx.getImageData(0,0,c.width,c.height),d=img.data,w=c.width,h=c.height;
   const alpha=new Uint8Array(w*h);
   for(let i=0,p=3;i<alpha.length;i++,p+=4)alpha[i]=d[p];
-  const outA=new Uint8Array(alpha);
 
+  const newA=new Uint8Array(alpha);
   for(let y=1;y<h-1;y++){
     for(let x=1;x<w-1;x++){
-      const i=y*w+x,a=alpha[i];if(a===0)continue;
-      let transparent=0,best=-1,bestA=0;
-      for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){
-        if(!ox&&!oy)continue;
-        const n=(y+oy)*w+x+ox,na=alpha[n];
-        if(na<18)transparent++;
-        if(na>bestA){bestA=na;best=n;}
+      const i=y*w+x,a=alpha[i];
+      if(a===0)continue;
+
+      let minA=255,maxA=0,sumA=0,count=0,best=-1,bestA=-1;
+      for(let oy=-2;oy<=2;oy++){
+        for(let ox=-2;ox<=2;ox++){
+          const nx=x+ox,ny=y+oy;
+          if(nx<0||ny<0||nx>=w||ny>=h)continue;
+          const n=ny*w+nx,na=alpha[n];
+          minA=Math.min(minA,na);maxA=Math.max(maxA,na);sumA+=na;count++;
+          if(na>bestA){bestA=na;best=n;}
+        }
       }
-      if(transparent>=4)outA[i]=Math.min(a,48);
-      else if(transparent>=2)outA[i]=Math.min(a,118);
-      else if(transparent===1)outA[i]=Math.min(a,190);
-      if(a<24)outA[i]=0;
-      if(outA[i]>0&&outA[i]<225&&best>=0&&bestA>235){
-        const mix=Math.min(.68,(225-outA[i])/225*.7);
-        for(let k=0;k<3;k++)d[i*4+k]=Math.round(d[i*4+k]*(1-mix)+d[best*4+k]*mix);
+
+      const boundary=minA<20 && maxA>210;
+      if(boundary){
+        // Feather without deleting opaque subject pixels.
+        const local=sumA/count;
+        if(a<245)newA[i]=Math.max(a,Math.min(245,Math.round(a*.70+local*.30)));
+
+        // Remove colour spill on the fringe by borrowing colour from the most opaque
+        // neighbouring subject pixel. This targets green/white outlines without shrinking.
+        if(best>=0&&bestA>220){
+          const mix=a>230?.72:a>150?.58:.42;
+          for(let k=0;k<3;k++){
+            d[i*4+k]=Math.round(d[i*4+k]*(1-mix)+d[best*4+k]*mix);
+          }
+        }
       }
+      if(a<5)newA[i]=0;
     }
     if(y%96===0)await new Promise(r=>setTimeout(r,0));
   }
-  for(let i=0;i<outA.length;i++)d[i*4+3]=outA[i];
+
+  // One tiny alpha blur only in the unknown edge band for smoother anti-aliasing.
+  for(let y=1;y<h-1;y++){
+    for(let x=1;x<w-1;x++){
+      const i=y*w+x,a=newA[i];
+      if(a<=5||a>=250)continue;
+      let s=0,n=0;
+      for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){s+=newA[(y+oy)*w+x+ox];n++;}
+      d[i*4+3]=Math.round(a*.78+(s/n)*.22);
+    }
+  }
+  for(let i=0;i<newA.length;i++)if(newA[i]<=5||newA[i]>=250)d[i*4+3]=newA[i];
+
   ctx.putImageData(img,0,0);
   return await new Promise(res=>c.toBlob(res,"image/png",1));
 }
 
-async function chooseSafeCutout(file, mode, progress){
-  let primary=await removeStable(file,mode,progress);
-  let stats=await alphaStats(primary);
-  if(mode==="smart" && (stats.visible<0.012 || stats.strong<0.006 || stats.visible>0.985)){
-    $("#progressText").textContent="Protecting the product — running a safer pass…";
-    const best=await removeStable(file,"best",progress), bstats=await alphaStats(best);
-    if(bstats.strong>stats.strong*1.15 || stats.visible<0.012) primary=best;
+
+async function cutoutShapeStats(blob){
+  const bmp=await createImageBitmap(blob);
+  const maxSide=220,s=Math.min(1,maxSide/Math.max(bmp.width,bmp.height));
+  const w=Math.max(1,Math.round(bmp.width*s)),h=Math.max(1,Math.round(bmp.height*s));
+  const c=document.createElement("canvas");c.width=w;c.height=h;
+  const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0,w,h);
+  const d=ctx.getImageData(0,0,w,h).data,mask=new Uint8Array(w*h);
+  let visible=0;
+  for(let i=0;i<w*h;i++){if(d[i*4+3]>80){mask[i]=1;visible++;}}
+  const seen=new Uint8Array(w*h);let largest=0,components=0;
+  for(let i=0;i<w*h;i++){
+    if(!mask[i]||seen[i])continue;
+    components++;let size=0,q=[i];seen[i]=1;
+    for(let qi=0;qi<q.length;qi++){
+      const p=q[qi],x=p%w,y=(p/w)|0;size++;
+      for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){
+        const nx=x+dx,ny=y+dy;if(nx<0||ny<0||nx>=w||ny>=h)continue;
+        const n=ny*w+nx;if(mask[n]&&!seen[n]){seen[n]=1;q.push(n);}
+      }
+    }
+    largest=Math.max(largest,size);
+  }
+  return {visible:visible/(w*h),largestShare:visible?largest/visible:0,components};
+}
+
+async function fuseCutoutsPreserveSubject(aBlob,bBlob){
+  // Conservative union of two AI passes. If one model pass accidentally deletes a
+  // product section, the other pass can restore it. We prefer preserving subject
+  // over aggressively deleting uncertain pixels.
+  const [a,b]=await Promise.all([createImageBitmap(aBlob),createImageBitmap(bBlob)]);
+  const w=a.width,h=a.height,c=document.createElement("canvas");c.width=w;c.height=h;
+  const ctx=c.getContext("2d",{willReadFrequently:true});
+  ctx.drawImage(a,0,0);const ai=ctx.getImageData(0,0,w,h);
+  ctx.clearRect(0,0,w,h);ctx.drawImage(b,0,0,w,h);const bi=ctx.getImageData(0,0,w,h);
+  const ad=ai.data,bd=bi.data;
+  for(let i=0;i<w*h;i++){
+    const o=i*4,aa=ad[o+3],ba=bd[o+3];
+    if(ba>aa){
+      // Use RGB from whichever cutout is more confident at this pixel.
+      ad[o]=bd[o];ad[o+1]=bd[o+1];ad[o+2]=bd[o+2];ad[o+3]=ba;
+    }
+  }
+  ctx.putImageData(ai,0,0);
+  return await new Promise(res=>c.toBlob(res,"image/png",1));
+}
+
+async function chooseSafeCutout(file,mode,progress){
+  const requested=mode==="fast"?"fast":"best";
+  let primary=await removeStable(file,requested,progress);
+  const shape=await cutoutShapeStats(primary);
+
+  // Fragmented or unusually tiny masks are the failure mode visible in apparel batches.
+  // Run a second full-quality pass and union them instead of accepting missing product parts.
+  if(mode!=="fast" && (shape.visible<0.10 || shape.largestShare<0.72 || shape.components>10)){
+    $("#progressText").textContent="Refining subject and edges…";
+    const second=await removeStable(file,"best",progress);
+    primary=await fuseCutoutsPreserveSubject(primary,second);
   }
   return cleanCutoutEdges(primary);
 }
@@ -478,23 +557,7 @@ async function removeOne(item, queueTotal) {
       if(total>0&&/fetch|model/i.test(key))$("#progressText").textContent=`Loading removal model… ${Math.round(current/total*100)}%`;
     };
 
-    let blob=null;
-    if(state.quality!=="best"){
-      try{blob=await trySimpleBackgroundRemoval(item.file);}catch(e){console.warn("Simple background fast path skipped",e);}
-    }
-    if(!blob){
-      blob=await removeStable(item.file,state.quality,progress);
-      if(state.quality==="smart"){
-        const stats=await alphaStats(blob);
-        // Retry conservatively whenever the model appears to have removed too much subject.
-        if(stats.strong<0.08||stats.visible<0.13){
-          $("#progressText").textContent="Protecting the subject — retrying with Best quality…";
-          blob=await removeStable(item.file,"best",progress);
-        }
-      }
-    }
-
-    blob=await cleanCutoutEdges(blob);
+    const blob=await chooseSafeCutout(item.file,state.quality,progress);
     item.cutoutBlob=blob;
     if(item.cutoutURL)URL.revokeObjectURL(item.cutoutURL);
     item.cutoutURL=URL.createObjectURL(blob);
@@ -769,5 +832,5 @@ function enableScrollChaining(el){
     }
   },{passive:false});
 }
-enableScrollChaining(document.querySelector(".control-panel"));
+enableScrollChaining(document.querySelector(".controls"));
 enableScrollChaining(document.querySelector(".gallery-shell"));
