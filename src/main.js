@@ -2,6 +2,7 @@ import "./style.css";
 import "./editor.css";
 import JSZip from "jszip";
 import { removeBackground, preload } from "@imgly/background-removal";
+import { AutoModel, AutoProcessor, RawImage } from "@huggingface/transformers";
 
 const DEFAULT_ADJ = () => ({
   scale: 1, offsetX: 0, offsetY: 0,
@@ -54,8 +55,8 @@ app.innerHTML = `
       <div class="quality-row">
         <span>Removal mode</span>
         <select id="qualitySelect">
-          <option value="smart" selected>Smart — clean product cutout</option>
-          <option value="best">Best quality — full precision</option>
+          <option value="smart" selected>Smart — product-safe precision</option>
+          <option value="best">Best quality — BiRefNet precision</option>
           <option value="fast">Fast</option>
         </select>
       </div>
@@ -532,18 +533,140 @@ async function fuseCutoutsPreserveSubject(aBlob,bBlob){
   return await new Promise(res=>c.toBlob(res,"image/png",1));
 }
 
+
+let birefModelPromise=null;
+let birefProcessorPromise=null;
+
+async function getBiRefNet(){
+  if(!birefModelPromise){
+    const modelId="onnx-community/BiRefNet_lite-ONNX";
+    const device=navigator.gpu?"webgpu":"wasm";
+    const dtype=navigator.gpu?"fp16":"fp32";
+    $("#progressText").textContent="Loading precision cutout model…";
+    birefModelPromise=AutoModel.from_pretrained(modelId,{device,dtype});
+    birefProcessorPromise=AutoProcessor.from_pretrained(modelId);
+  }
+  return Promise.all([birefModelPromise,birefProcessorPromise]);
+}
+
+async function removeWithBiRefNet(file){
+  const [model,processor]=await getBiRefNet();
+  const original=await RawImage.fromBlob(file);
+  const {pixel_values}=await processor(original);
+  const {output_image}=await model({input_image:pixel_values});
+  const mask=await RawImage
+    .fromTensor(output_image[0].sigmoid().mul(255).to("uint8"))
+    .resize(original.width,original.height);
+
+  const bmp=await createImageBitmap(file);
+  const c=document.createElement("canvas");
+  c.width=bmp.width;c.height=bmp.height;
+  const ctx=c.getContext("2d",{willReadFrequently:true});
+  ctx.drawImage(bmp,0,0);
+  const out=ctx.getImageData(0,0,c.width,c.height),d=out.data,md=mask.data;
+
+  // BiRefNet returns a full alpha matte, not a tiny "salient object" crop.
+  for(let i=0;i<c.width*c.height;i++)d[i*4+3]=md[i]??255;
+  ctx.putImageData(out,0,0);
+  return await new Promise(res=>c.toBlob(res,"image/png",1));
+}
+
+async function conservativeCloseupFallback(file){
+  // Only remove a dominant border background connected to the outer edge.
+  // This is intentionally conservative: when uncertain, keep the product.
+  const bmp=await createImageBitmap(file);
+  const maxSide=420,s=Math.min(1,maxSide/Math.max(bmp.width,bmp.height));
+  const w=Math.max(64,Math.round(bmp.width*s)),h=Math.max(64,Math.round(bmp.height*s));
+  const c=document.createElement("canvas");c.width=w;c.height=h;
+  const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0,w,h);
+  const img=ctx.getImageData(0,0,w,h),d=img.data;
+
+  // Sample the top border heavily: product closeups often touch side/bottom edges.
+  const samples=[];
+  const rows=Math.max(3,Math.round(h*.045));
+  for(let y=0;y<rows;y+=2){
+    for(let x=0;x<w;x+=3){
+      const o=(y*w+x)*4;samples.push([d[o],d[o+1],d[o+2]]);
+    }
+  }
+  if(samples.length<20)return null;
+
+  // Median RGB gives a robust background seed even with texture such as grass.
+  const med=k=>{const a=samples.map(v=>v[k]).sort((a,b)=>a-b);return a[(a.length/2)|0];};
+  const seed=[med(0),med(1),med(2)];
+
+  let spread=0;
+  for(const p of samples)spread+=Math.hypot(p[0]-seed[0],p[1]-seed[1],p[2]-seed[2]);
+  spread/=samples.length;
+  const tol=Math.max(58,Math.min(125,spread*2.2+42));
+
+  const candidate=new Uint8Array(w*h);
+  for(let i=0;i<w*h;i++){
+    const o=i*4;
+    const dist=Math.hypot(d[o]-seed[0],d[o+1]-seed[1],d[o+2]-seed[2]);
+    if(dist<tol)candidate[i]=1;
+  }
+
+  // Flood only from top/upper-side edge seeds, never from the whole frame.
+  const bg=new Uint8Array(w*h),q=[];
+  const push=(x,y)=>{const i=y*w+x;if(candidate[i]&&!bg[i]){bg[i]=1;q.push(i);}};
+  for(let x=0;x<w;x++)push(x,0);
+  for(let y=0;y<Math.round(h*.35);y++){push(0,y);push(w-1,y);}
+  for(let qi=0;qi<q.length;qi++){
+    const i=q[qi],x=i%w,y=(i/w)|0;
+    if(x>0)push(x-1,y);if(x<w-1)push(x+1,y);if(y>0)push(x,y-1);if(y<h-1)push(x,y+1);
+  }
+
+  let bgCount=0;for(const v of bg)bgCount+=v;
+  const ratio=bgCount/(w*h);
+  if(ratio<.025||ratio>.48)return null;
+
+  const full=document.createElement("canvas");full.width=bmp.width;full.height=bmp.height;
+  const fctx=full.getContext("2d",{willReadFrequently:true});fctx.drawImage(bmp,0,0);
+  const out=fctx.getImageData(0,0,full.width,full.height),od=out.data;
+
+  for(let y=0;y<full.height;y++){
+    const sy=Math.min(h-1,Math.floor(y*h/full.height));
+    for(let x=0;x<full.width;x++){
+      const sx=Math.min(w-1,Math.floor(x*w/full.width));
+      if(bg[sy*w+sx])od[(y*full.width+x)*4+3]=0;
+    }
+    if(y%180===0)await new Promise(r=>setTimeout(r,0));
+  }
+  fctx.putImageData(out,0,0);
+  return await new Promise(res=>full.toBlob(res,"image/png",1));
+}
+
 async function chooseSafeCutout(file,mode,progress){
-  const requested=mode==="fast"?"fast":"best";
-  let primary=await removeStable(file,requested,progress);
+  if(mode==="fast"){
+    const quick=await removeStable(file,"fast",progress);
+    return cleanCutoutEdges(quick);
+  }
+
+  $("#progressText").textContent="Finding the complete product…";
+  let primary;
+  try{
+    primary=await removeWithBiRefNet(file);
+  }catch(err){
+    console.warn("BiRefNet precision model failed; falling back to local remover",err);
+    primary=await removeStable(file,"best",progress);
+  }
+
   const shape=await cutoutShapeStats(primary);
 
-  // Fragmented or unusually tiny masks are the failure mode visible in apparel batches.
-  // Run a second full-quality pass and union them instead of accepting missing product parts.
-  if(mode!=="fast" && (shape.visible<0.10 || shape.largestShare<0.72 || shape.components>10)){
-    $("#progressText").textContent="Refining subject and edges…";
-    const second=await removeStable(file,"best",progress);
-    primary=await fuseCutoutsPreserveSubject(primary,second);
+  // A close-up product filling the frame should never collapse to a tiny strip.
+  // If that happens, use a conservative edge-connected background removal instead.
+  if(shape.visible<0.30 || shape.largestShare<0.82){
+    $("#progressText").textContent="Protecting close-up product…";
+    try{
+      const safe=await conservativeCloseupFallback(file);
+      if(safe){
+        const safeShape=await cutoutShapeStats(safe);
+        if(safeShape.visible>shape.visible)primary=safe;
+      }
+    }catch(e){console.warn("Close-up fallback skipped",e);}
   }
+
   return cleanCutoutEdges(primary);
 }
 
@@ -704,7 +827,7 @@ function pushHistory(){const e=state.editor;e.history.push(e.ctx.getImageData(0,
 function undo(){const e=state.editor;if(e.history.length<=1)return;const cur=e.history.pop();e.redo.push(cur);e.ctx.putImageData(e.history[e.history.length-1],0,0);updateEditorUI();}
 function redo(){const e=state.editor;if(!e.redo.length)return;const img=e.redo.pop();e.history.push(img);e.ctx.putImageData(img,0,0);updateEditorUI();}
 function moveBrushCursor(ev){const stage=$(".editor-stage").getBoundingClientRect(),size=$("#assistToggle").checked?28:Number($("#brushSize").value),el=$("#brushCursor");el.classList.add("show");el.style.width=`${size}px`;el.style.height=`${size}px`;el.style.left=`${ev.clientX-stage.left-size/2}px`;el.style.top=`${ev.clientY-stage.top-size/2}px`;}
-async function smartRecover(){const e=state.editor;if(!e)return;$("#smartRecover").disabled=true;$("#smartRecover").textContent="Checking…";try{const blob=await removeStable(e.item.file,"best",()=>{}),clean=await cleanCutoutEdges(blob),img=await imageFromURL(URL.createObjectURL(clean));e.ctx.save();e.ctx.globalCompositeOperation="source-over";e.ctx.drawImage(img,0,0,e.canvas.width,e.canvas.height);e.ctx.restore();pushHistory();toast("Safer high-quality subject pass merged.");}catch(err){toast("Re-check failed on this device.");}$("#smartRecover").disabled=false;$("#smartRecover").textContent="Re-check subject";}
+async function smartRecover(){const e=state.editor;if(!e)return;$("#smartRecover").disabled=true;$("#smartRecover").textContent="Checking…";try{const clean=await chooseSafeCutout(e.item.file,"best",()=>{}),img=await imageFromURL(URL.createObjectURL(clean));e.ctx.save();e.ctx.globalCompositeOperation="source-over";e.ctx.drawImage(img,0,0,e.canvas.width,e.canvas.height);e.ctx.restore();pushHistory();toast("Safer high-quality subject pass merged.");}catch(err){toast("Re-check failed on this device.");}$("#smartRecover").disabled=false;$("#smartRecover").textContent="Re-check subject";}
 async function applyEditor(){const e=state.editor;if(!e)return;let blob=await new Promise(res=>e.canvas.toBlob(res,"image/png",1));blob=await cleanCutoutEdges(blob);e.item.cutoutBlob=blob;if(e.item.cutoutURL)URL.revokeObjectURL(e.item.cutoutURL);e.item.cutoutURL=URL.createObjectURL(blob);e.item.status="done";closeEditor();renderGallery();toast("Cutout updated.");}
 function closeEditor(){$("#cutoutModal").classList.add("hidden");state.editor=null;}
 
