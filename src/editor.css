@@ -1,0 +1,88 @@
+
+/* BackdropAI enhanced cutout UX */
+.quality-row{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
+  margin:0 0 12px;font-size:12px;color:#aaaab2
+}
+.quality-row select{
+  min-width:150px;background:#09090b;color:#f3f3f5;border:1px solid rgba(255,255,255,.1);
+  border-radius:10px;padding:8px 9px;outline:none
+}
+.photo-actions{display:flex;align-items:center;gap:7px;padding:9px 9px 0}
+.edit-cutout{flex:1;background:#24242a;color:#f2f2f4;padding:8px 9px;font-size:11px;border-radius:9px}
+.edit-cutout:hover{background:#303038}
+.edit-cutout.disabled{opacity:.35}
+.photo-name{padding:8px 11px 11px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#85858e;font-size:10px}
+.remove-one{margin-left:auto}
+
+.preview-wrap.scanning::after{
+  content:"";position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(180deg,rgba(118,95,255,.04),transparent 25%,transparent 75%,rgba(118,95,255,.04))
+}
+.scan-line{
+  position:absolute;left:0;right:0;height:2px;top:0;z-index:5;
+  background:linear-gradient(90deg,transparent,#b6a9ff 15%,#fff 50%,#b6a9ff 85%,transparent);
+  box-shadow:0 0 14px rgba(151,130,255,.9);
+  animation:scanSweep 1.55s cubic-bezier(.45,0,.55,1) infinite alternate
+}
+.scan-glow{
+  position:absolute;left:0;right:0;height:22%;top:0;z-index:4;pointer-events:none;
+  background:linear-gradient(180deg,rgba(125,105,255,.20),rgba(125,105,255,0));
+  animation:scanSweepGlow 1.55s cubic-bezier(.45,0,.55,1) infinite alternate
+}
+@keyframes scanSweep{from{top:2%}to{top:98%}}
+@keyframes scanSweepGlow{from{top:0}to{top:78%}}
+
+/* cutout editor */
+.modal{
+  position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.78);backdrop-filter:blur(12px);
+  display:grid;place-items:center;padding:18px
+}
+.modal-card{
+  width:min(1180px,100%);height:min(900px,94vh);background:#111114;border:1px solid rgba(255,255,255,.1);
+  border-radius:24px;overflow:hidden;display:grid;grid-template-rows:auto auto 1fr auto;
+  box-shadow:0 35px 100px rgba(0,0,0,.55)
+}
+.modal-head,.editor-foot{
+  display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 17px;
+  border-bottom:1px solid rgba(255,255,255,.07)
+}
+.modal-head>div{display:flex;flex-direction:column;gap:3px}
+.modal-head strong{font-size:16px}
+.modal-head span,.editor-foot span{color:#85858e;font-size:11px}
+.icon-btn{width:38px;height:38px;padding:0;background:#24242a;font-size:22px;border-radius:11px}
+.editor-toolbar{
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 14px;
+  border-bottom:1px solid rgba(255,255,255,.07);background:#0d0d10
+}
+.tool-group{display:flex;background:#070709;border-radius:11px;padding:3px}
+.tool{background:transparent;color:#85858e;padding:8px 13px;font-size:12px;border-radius:8px}
+.tool.active{background:#765fff;color:white}
+.smart-toggle,.brush-row{display:flex;align-items:center;gap:8px;font-size:11px;color:#aaaab2}
+.brush-row input{width:130px}
+.small-btn{padding:8px 10px;font-size:11px;border-radius:9px}
+.editor-stage{
+  min-height:0;position:relative;overflow:hidden;display:grid;place-items:center;touch-action:none;
+  background:
+    linear-gradient(45deg,#1b1b20 25%,transparent 25%) 0 0/24px 24px,
+    linear-gradient(-45deg,#1b1b20 25%,transparent 25%) 0 12px/24px 24px,
+    linear-gradient(45deg,transparent 75%,#1b1b20 75%) 12px -12px/24px 24px,
+    linear-gradient(-45deg,transparent 75%,#1b1b20 75%) -12px 0/24px 24px,#101014
+}
+#editorCanvas{max-width:100%;max-height:100%;display:block;touch-action:none;cursor:none}
+.brush-cursor{
+  position:absolute;border:1.5px solid white;border-radius:50%;pointer-events:none;display:none;z-index:10;
+  box-shadow:0 0 0 1px rgba(0,0,0,.7),0 0 10px rgba(0,0,0,.45)
+}
+.brush-cursor.show{display:block}
+.editor-foot{border-top:1px solid rgba(255,255,255,.07);border-bottom:0}
+.compact{width:auto;padding:10px 16px}
+
+@media(max-width:700px){
+  .modal{padding:0}
+  .modal-card{width:100%;height:100dvh;border-radius:0;border:0}
+  .editor-toolbar{gap:7px;padding:8px}
+  .brush-row{width:100%}.brush-row input{flex:1}
+  .editor-foot{padding-bottom:max(12px,env(safe-area-inset-bottom))}
+  .quality-row{align-items:flex-start;flex-direction:column}.quality-row select{width:100%}
+}
