@@ -299,6 +299,102 @@ function removalConfig(mode, progress, useWorker = true) {
     progress
   };
 }
+
+async function trySimpleBackgroundRemoval(file){
+  // Fast path for simple/minimal backgrounds: estimate the dominant border colour family
+  // and remove ONLY background pixels connected to the image edges.
+  // This preserves every disconnected object/product in the middle of the frame.
+  const bmp=await createImageBitmap(file);
+  const maxSide=320,scale=Math.min(1,maxSide/Math.max(bmp.width,bmp.height));
+  const w=Math.max(32,Math.round(bmp.width*scale)),h=Math.max(32,Math.round(bmp.height*scale));
+  const c=document.createElement("canvas");c.width=w;c.height=h;
+  const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0,w,h);
+  const img=ctx.getImageData(0,0,w,h),d=img.data;
+
+  function rgb2hsv(r,g,b){
+    r/=255;g/=255;b/=255;const mx=Math.max(r,g,b),mn=Math.min(r,g,b),df=mx-mn;
+    let hh=0;if(df){
+      if(mx===r)hh=((g-b)/df)%6;
+      else if(mx===g)hh=(b-r)/df+2;
+      else hh=(r-g)/df+4;
+      hh*=60;if(hh<0)hh+=360;
+    }
+    return [hh,mx?df/mx:0,mx];
+  }
+  const border=[];
+  const step=Math.max(1,Math.floor(Math.min(w,h)/80));
+  for(let x=0;x<w;x+=step){
+    for(const y of [0,h-1]){const o=(y*w+x)*4;border.push([d[o],d[o+1],d[o+2]]);}
+  }
+  for(let y=0;y<h;y+=step){
+    for(const x of [0,w-1]){const o=(y*w+x)*4;border.push([d[o],d[o+1],d[o+2]]);}
+  }
+  if(border.length<20)return null;
+
+  // Quantize HSV to find a dominant border family.
+  const bins=new Map();
+  for(const [r,g,b] of border){
+    const [hh,s,v]=rgb2hsv(r,g,b);
+    const hb=Math.round(hh/24),sb=Math.round(s*5),vb=Math.round(v*5);
+    const key=`${hb}|${sb}|${vb}`;
+    const a=bins.get(key)||[];a.push([r,g,b,hh,s,v]);bins.set(key,a);
+  }
+  let dominant=null;
+  for(const arr of bins.values())if(!dominant||arr.length>dominant.length)dominant=arr;
+  if(!dominant||dominant.length/border.length<0.32)return null;
+
+  let mr=0,mg=0,mb=0,mh=0,ms=0,mv=0;
+  for(const p of dominant){mr+=p[0];mg+=p[1];mb+=p[2];mh+=p[3];ms+=p[4];mv+=p[5];}
+  mr/=dominant.length;mg/=dominant.length;mb/=dominant.length;mh/=dominant.length;ms/=dominant.length;mv/=dominant.length;
+
+  // Adaptive tolerance from cluster spread.
+  let spread=0;
+  for(const p of dominant)spread+=Math.hypot(p[0]-mr,p[1]-mg,p[2]-mb);
+  spread/=dominant.length;
+  const rgbTol=Math.max(34,Math.min(92,spread*2.6+24));
+  const hueTol=Math.max(18,Math.min(52,spread*.55+20));
+
+  const candidate=new Uint8Array(w*h);
+  for(let i=0;i<w*h;i++){
+    const o=i*4,r=d[o],g=d[o+1],b=d[o+2],dist=Math.hypot(r-mr,g-mg,b-mb);
+    const [hh,s,v]=rgb2hsv(r,g,b);
+    let hd=Math.abs(hh-mh);hd=Math.min(hd,360-hd);
+    const similarRGB=dist<rgbTol;
+    const similarHue=ms>.18 && s>.12 && hd<hueTol && Math.abs(v-mv)<.35;
+    if(similarRGB||similarHue)candidate[i]=1;
+  }
+
+  // Flood only from edges. Similar-colour product pixels that are not edge-connected survive.
+  const bg=new Uint8Array(w*h),q=[];
+  const push=(x,y)=>{const i=y*w+x;if(candidate[i]&&!bg[i]){bg[i]=1;q.push(i);}};
+  for(let x=0;x<w;x++){push(x,0);push(x,h-1);}
+  for(let y=0;y<h;y++){push(0,y);push(w-1,y);}
+  for(let qi=0;qi<q.length;qi++){
+    const i=q[qi],x=i%w,y=(i/w)|0;
+    if(x>0)push(x-1,y);if(x<w-1)push(x+1,y);if(y>0)push(x,y-1);if(y<h-1)push(x,y+1);
+  }
+  let bgCount=0;for(const v of bg)bgCount+=v;
+  const ratio=bgCount/(w*h);
+  // Only trust this shortcut when it clearly identified a substantial background, but not nearly everything.
+  if(ratio<0.12||ratio>0.78)return null;
+
+  // Create a full-resolution alpha mask using nearest scaling of the connected background mask,
+  // then lightly feather the boundary.
+  const full=document.createElement("canvas");full.width=bmp.width;full.height=bmp.height;
+  const fctx=full.getContext("2d",{willReadFrequently:true});fctx.drawImage(bmp,0,0);
+  const out=fctx.getImageData(0,0,full.width,full.height),od=out.data;
+  for(let y=0;y<full.height;y++){
+    const sy=Math.min(h-1,Math.floor(y*h/full.height));
+    for(let x=0;x<full.width;x++){
+      const sx=Math.min(w-1,Math.floor(x*w/full.width)),si=sy*w+sx,o=(y*full.width+x)*4;
+      if(bg[si])od[o+3]=0;
+    }
+    if(y%180===0)await new Promise(r=>setTimeout(r,0));
+  }
+  fctx.putImageData(out,0,0);
+  return await new Promise(res=>full.toBlob(res,"image/png",1));
+}
+
 async function removeStable(file, mode, progress) {
   // Reliability-first: keep inference off the UI thread when possible.
   // If worker execution is unsupported on a browser, retry directly on CPU.
@@ -374,37 +470,69 @@ async function chooseSafeCutout(file, mode, progress){
 
 function nextFrame(){return new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));}
 async function removeOne(item, queueTotal) {
-  item.status="processing"; renderGallery(); await nextFrame(); await new Promise(r=>setTimeout(r,40));
+  item.status="processing";renderGallery();
+  // Yield a couple frames first so scrolling/zooming remains responsive before work begins.
+  await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
   try {
-    const progress=(key,current,total)=>{if(total>0&&/fetch|model/i.test(key))$("#progressText").textContent=`Loading removal model… ${Math.round(current/total*100)}%`;};
-    const blob=await chooseSafeCutout(item.file,state.quality,progress);
-    item.cutoutBlob=blob;if(item.cutoutURL)URL.revokeObjectURL(item.cutoutURL);item.cutoutURL=URL.createObjectURL(blob);
-    item.status="revealing";item.error=null;renderGallery();await new Promise(resolve=>setTimeout(resolve,760));
+    const progress=(key,current,total)=>{
+      if(total>0&&/fetch|model/i.test(key))$("#progressText").textContent=`Loading removal model… ${Math.round(current/total*100)}%`;
+    };
+
+    let blob=null;
+    if(state.quality!=="best"){
+      try{blob=await trySimpleBackgroundRemoval(item.file);}catch(e){console.warn("Simple background fast path skipped",e);}
+    }
+    if(!blob){
+      blob=await removeStable(item.file,state.quality,progress);
+      if(state.quality==="smart"){
+        const stats=await alphaStats(blob);
+        // Retry conservatively whenever the model appears to have removed too much subject.
+        if(stats.strong<0.08||stats.visible<0.13){
+          $("#progressText").textContent="Protecting the subject — retrying with Best quality…";
+          blob=await removeStable(item.file,"best",progress);
+        }
+      }
+    }
+
+    blob=await cleanCutoutEdges(blob);
+    item.cutoutBlob=blob;
+    if(item.cutoutURL)URL.revokeObjectURL(item.cutoutURL);
+    item.cutoutURL=URL.createObjectURL(blob);
+    item.status="revealing";item.error=null;renderGallery();
+    await new Promise(resolve=>setTimeout(resolve,900));
     item.status="done";state.completed++;
   } catch(error) {
     console.error(error);item.status="failed";item.error=error?.message||"Background removal failed";state.failed++;
   }
   updateProgress(queueTotal);renderGallery();
 }
-async function processRemovalQueue(queue, label) {
+async function processRemovalQueue(queue,label){
   if(state.processing)return;
-  queue = queue.filter(i=>!i.cutoutBlob);
+  queue=queue.filter(i=>!i.cutoutBlob);
   if(!queue.length){toast(`${label} already have backgrounds removed.`);return;}
-
   state.processing=true;state.completed=0;state.failed=0;
-  $("#removeSelectedBtn").disabled=true;
-  $("#removeAllBtn").disabled=true;
-  $("#progressWrap").classList.remove("hidden");
+  $("#removeSelectedBtn").disabled=true;$("#removeAllBtn").disabled=true;$("#progressWrap").classList.remove("hidden");
 
-  // One removal at a time is much more reliable on phones and also avoids
-  // multiple ONNX sessions fighting for memory.
-  for (const item of queue) {
-    await removeOne(item, queue.length);
+  // Real bulk mode: run several photos at once, but cap concurrency to avoid crashing phones.
+  const mem=Number(navigator.deviceMemory||4);
+  const cores=Number(navigator.hardwareConcurrency||4);
+  const mobile=/iPad|iPhone|iPod|Android/i.test(navigator.userAgent);
+  let concurrency=mobile?2:Math.min(4,Math.max(2,Math.floor(cores/3)));
+  if(mem<=3)concurrency=1;
+  else if(mem<=5)concurrency=Math.min(concurrency,2);
+
+  let cursor=0;
+  async function worker(){
+    while(cursor<queue.length){
+      const item=queue[cursor++];
+      await removeOne(item,queue.length);
+      // Yield between jobs so page scrolling/pinch-zoom and scanner animation get paint time.
+      await new Promise(r=>setTimeout(r,0));
+    }
   }
+  await Promise.all(Array.from({length:Math.min(concurrency,queue.length)},()=>worker()));
 
-  state.processing=false;
-  $("#removeSelectedBtn").disabled=false;
-  $("#removeAllBtn").disabled=false;
+  state.processing=false;$("#removeSelectedBtn").disabled=false;$("#removeAllBtn").disabled=false;
   updateProgress(queue.length);
   toast(state.failed?`${state.completed} finished, ${state.failed} failed.`:`Finished ${state.completed} cutouts.`);
 }

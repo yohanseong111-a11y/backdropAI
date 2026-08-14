@@ -201,3 +201,7 @@ fieldset{border:0;padding:0;margin:0;min-width:0}fieldset:disabled{opacity:.42}.
 .photo-card canvas,.editor-stage canvas{image-rendering:auto}
 
 .page,.workspace,.controls,.gallery-shell,.gallery,.photo-card{touch-action:pan-x pan-y pinch-zoom}
+
+/* Processing must never lock the page. */
+body.processing,.page.processing,.workspace.processing{pointer-events:auto!important;overflow:visible!important}
+.preview-wrap.scanning{pointer-events:auto}
