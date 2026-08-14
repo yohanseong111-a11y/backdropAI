@@ -772,9 +772,15 @@ function getRemovalWorker(){
     }
     if(!job)return;
 
-    if(msg.type==="mask"){
+    if(msg.type==="dual-mask"){
       try{
-        const blob=await applyMaskBufferToFile(job.file,msg.maskBuffer,msg.width,msg.height);
+        const blob=await applyDualMaskToFile(
+          job.file,
+          msg.primaryBuffer,
+          msg.safetyBuffer,
+          msg.width,
+          msg.height
+        );
         clearTimeout(job.timeout);
         removalPending.delete(msg.id);
         job.resolve(blob);
@@ -812,156 +818,38 @@ function getRemovalWorker(){
   return removalWorker;
 }
 
-function colourDistance(r1,g1,b1,r2,g2,b2){
-  const dr=r1-r2,dg=g1-g2,db=b1-b2;
-  return Math.sqrt(dr*dr+dg*dg+db*db);
-}
+function combineForegroundMasks(primary,safety){
+  const out=new Uint8Array(primary.length);
 
-function dominantBorderColours(rgb,alpha,w,h){
-  // Find the dominant colours around the outside of the image, but only
-  // from pixels the AI already thinks are probably background.
-  // Quantisation makes grass/concrete/studio backgrounds form stable clusters.
-  const bins=new Map();
-  const band=Math.max(2,Math.round(Math.min(w,h)*0.035));
+  for(let i=0;i<primary.length;i++){
+    const a=primary[i];
+    const b=safety?safety[i]:0;
 
-  const sample=(x,y)=>{
-    const i=y*w+x;
-    if(alpha[i]>190)return;
-    const o=i*4;
-    const r=rgb[o],g=rgb[o+1],b=rgb[o+2];
-    const key=`${r>>5},${g>>5},${b>>5}`;
-    let entry=bins.get(key);
-    if(!entry){
-      entry={count:0,r:0,g:0,b:0};
-      bins.set(key,entry);
+    if(b>=210){
+      out[i]=Math.max(a,b);
+    }else if(b>=150 && a>=72){
+      out[i]=Math.max(a,Math.round(b*0.88));
+    }else{
+      out[i]=a;
     }
-    entry.count++;
-    entry.r+=r;entry.g+=g;entry.b+=b;
-  };
-
-  for(let x=0;x<w;x+=2){
-    for(let y=0;y<band;y++)sample(x,y);
-    for(let y=h-band;y<h;y++)sample(x,y);
-  }
-  for(let y=band;y<h-band;y+=2){
-    for(let x=0;x<band;x++)sample(x,y);
-    for(let x=w-band;x<w;x++)sample(x,y);
   }
 
-  const ranked=[...bins.values()]
-    .sort((a,b)=>b.count-a.count)
-    .slice(0,4)
-    .map(e=>({
-      count:e.count,
-      r:e.r/e.count,
-      g:e.g/e.count,
-      b:e.b/e.count
-    }));
-
-  return ranked;
+  return out;
 }
 
-
-function removeTinyBackgroundSpecks(rgb,alpha,w,h){
+function fillEnclosedAlphaHoles(alpha,w,h){
   const total=w*h;
-  const visited=new Uint8Array(total);
-  const result=new Uint8Array(alpha);
-  const queue=new Int32Array(total);
-  const clusters=dominantBorderColours(rgb,alpha,w,h);
-
-  const isBgLike=i=>{
-    if(alpha[i]===0)return false;
-    const o=i*4,r=rgb[o],g=rgb[o+1],b=rgb[o+2];
-    let d=999;
-    for(const c of clusters){
-      d=Math.min(d,colourDistance(r,g,b,c.r,c.g,c.b));
-    }
-    return d<108 && alpha[i]<245;
-  };
-
-  const minDim=Math.min(w,h);
-  const maxSpeckArea=Math.max(24,Math.round(total*0.0015));
-  const maxSpeckSide=Math.max(10,Math.round(minDim*0.05));
-
-  for(let start=0;start<total;start++){
-    if(visited[start]||!isBgLike(start))continue;
-
-    let head=0,tail=0;
-    queue[tail++]=start;
-    visited[start]=1;
-
-    let count=0,minX=w,maxX=0,minY=h,maxY=0;
-    while(head<tail){
-      const i=queue[head++],x=i%w,y=(i/w)|0;
-      count++;
-      if(x<minX)minX=x;if(x>maxX)maxX=x;
-      if(y<minY)minY=y;if(y>maxY)maxY=y;
-
-      const add=j=>{
-        if(j<0||j>=total||visited[j]||!isBgLike(j))return;
-        visited[j]=1;
-        queue[tail++]=j;
-      };
-      if(x>0)add(i-1);
-      if(x<w-1)add(i+1);
-      if(y>0)add(i-w);
-      if(y<h-1)add(i+w);
-    }
-
-    const bw=maxX-minX+1,bh=maxY-minY+1;
-    const tiny=count<=maxSpeckArea || (bw<=maxSpeckSide && bh<=maxSpeckSide);
-
-    if(tiny){
-      for(let q=0;q<tail;q++)result[queue[q]]=0;
-    }
-  }
-  return result;
-}
-
-function makeProductSafeAlpha(rgb,inputAlpha,w,h){
-  const total=w*h;
-  const alpha=new Uint8Array(inputAlpha);
-  const clusters=dominantBorderColours(rgb,alpha,w,h);
-
-  // If border analysis is inconclusive, still fill obvious enclosed AI holes.
-  const connected=new Uint8Array(total);
+  const outsideBg=new Uint8Array(total);
   const queue=new Int32Array(total);
   let head=0,tail=0;
+  const threshold=72;
 
-  const nearBackgroundColour=(i,from=-1)=>{
-    const o=i*4,r=rgb[o],g=rgb[o+1],b=rgb[o+2];
-
-    let clusterDist=999;
-    for(const c of clusters){
-      clusterDist=Math.min(clusterDist,colourDistance(r,g,b,c.r,c.g,c.b));
-    }
-
-    // Texture propagation: grass/concrete can vary considerably from the
-    // dominant colour, so also allow gradual colour changes from a neighbour
-    // already accepted as background.
-    let localDist=999;
-    if(from>=0){
-      const fo=from*4;
-      localDist=colourDistance(
-        r,g,b,
-        rgb[fo],rgb[fo+1],rgb[fo+2]
-      );
-    }
-
-    // The AI must also have background evidence. Very confident foreground
-    // pixels are never turned transparent by this protection pass.
-    const a=alpha[i];
-    return a<218 && (clusterDist<92 || localDist<34);
-  };
-
-  const add=(i,from=-1)=>{
-    if(i<0||i>=total||connected[i])return;
-    if(!nearBackgroundColour(i,from))return;
-    connected[i]=1;
+  const add=i=>{
+    if(i<0||i>=total||outsideBg[i]||alpha[i]>=threshold)return;
+    outsideBg[i]=1;
     queue[tail++]=i;
   };
 
-  // Seed from all four image borders.
   for(let x=0;x<w;x++){
     add(x);
     add((h-1)*w+x);
@@ -974,67 +862,33 @@ function makeProductSafeAlpha(rgb,inputAlpha,w,h){
   while(head<tail){
     const i=queue[head++];
     const x=i%w,y=(i/w)|0;
-    if(x>0)add(i-1,i);
-    if(x<w-1)add(i+1,i);
-    if(y>0)add(i-w,i);
-    if(y<h-1)add(i+w,i);
+    if(x>0)add(i-1);
+    if(x<w-1)add(i+1);
+    if(y>0)add(i-w);
+    if(y<h-1)add(i+w);
   }
 
-  // Product preservation:
-  // Only frame-connected, background-coloured pixels are allowed to stay
-  // transparent. Any low-alpha pocket inside the product is restored.
-  const repaired=new Uint8Array(total);
+  const out=new Uint8Array(alpha);
   for(let i=0;i<total;i++){
-    if(connected[i]){
-      // Keep the model's soft edge/matting on real background boundaries.
-      repaired[i]=alpha[i];
-    }else{
-      // Do not force already-confident foreground to change.
-      // Restore AI-cut holes and over-segmented garment sections.
-      repaired[i]=Math.max(alpha[i],245);
+    if(alpha[i]<threshold && !outsideBg[i]){
+      out[i]=Math.max(out[i],242);
     }
   }
 
-  // Tiny 3x3 smoothing only on uncertain edges to avoid hard stair-steps.
-  const smooth=new Uint8Array(repaired);
-  for(let y=1;y<h-1;y++){
-    for(let x=1;x<w-1;x++){
-      const i=y*w+x,a=repaired[i];
-      if(a<=8||a>=247)continue;
-      let sum=0;
-      for(let oy=-1;oy<=1;oy++){
-        for(let ox=-1;ox<=1;ox++)sum+=repaired[(y+oy)*w+x+ox];
-      }
-      smooth[i]=Math.round(a*0.72+(sum/9)*0.28);
-    }
-  }
-
-  return removeTinyBackgroundSpecks(rgb,smooth,w,h);
+  return out;
 }
 
-
-function cleanFinalForegroundComponents(rgb,alpha,w,h){
+function removeTinyForegroundIslands(alpha,w,h){
   const total=w*h;
-  const visibleThreshold=24;
   const visited=new Uint8Array(total);
+  const out=new Uint8Array(alpha);
   const queue=new Int32Array(total);
   const components=[];
 
-  // Learn what the original background looks like from the outside frame.
-  const bgClusters=dominantBorderColours(rgb,alpha,w,h);
-
-  const colourLooksLikeBackground=i=>{
-    const o=i*4;
-    const r=rgb[o],g=rgb[o+1],b=rgb[o+2];
-    let d=999;
-    for(const c of bgClusters){
-      d=Math.min(d,colourDistance(r,g,b,c.r,c.g,c.b));
-    }
-    return d<125;
-  };
+  const visible=i=>alpha[i]>=48;
 
   for(let start=0;start<total;start++){
-    if(visited[start]||alpha[start]<=visibleThreshold)continue;
+    if(visited[start]||!visible(start))continue;
 
     let head=0,tail=0;
     queue[tail++]=start;
@@ -1042,23 +896,16 @@ function cleanFinalForegroundComponents(rgb,alpha,w,h){
 
     const pixels=[];
     let minX=w,maxX=0,minY=h,maxY=0;
-    let bgLike=0;
 
     while(head<tail){
       const i=queue[head++];
       pixels.push(i);
-
-      const x=i%w;
-      const y=(i/w)|0;
-      if(x<minX)minX=x;
-      if(x>maxX)maxX=x;
-      if(y<minY)minY=y;
-      if(y>maxY)maxY=y;
-
-      if(colourLooksLikeBackground(i))bgLike++;
+      const x=i%w,y=(i/w)|0;
+      if(x<minX)minX=x;if(x>maxX)maxX=x;
+      if(y<minY)minY=y;if(y>maxY)maxY=y;
 
       const add=j=>{
-        if(j<0||j>=total||visited[j]||alpha[j]<=visibleThreshold)return;
+        if(j<0||j>=total||visited[j]||!visible(j))return;
         visited[j]=1;
         queue[tail++]=j;
       };
@@ -1069,169 +916,146 @@ function cleanFinalForegroundComponents(rgb,alpha,w,h){
       if(y<h-1)add(i+w);
     }
 
-    components.push({
-      pixels,
-      area:pixels.length,
-      minX,maxX,minY,maxY,
-      bgRatio:pixels.length ? bgLike/pixels.length : 0
-    });
+    components.push({pixels,area:pixels.length,minX,maxX,minY,maxY});
   }
 
-  if(!components.length)return new Uint8Array(alpha);
+  if(!components.length)return out;
 
   components.sort((a,b)=>b.area-a.area);
-  const largest=components[0];
-  const result=new Uint8Array(alpha);
+  const largestArea=components[0].area;
 
-  // Scale thresholds with the actual image size.
-  const minDim=Math.min(w,h);
-  const absoluteTiny=Math.max(24,Math.round(total*0.00012));
-  const smallIsland=Math.max(80,Math.round(total*0.00065));
-  const meaningfulSide=Math.max(14,Math.round(minDim*0.055));
+  const hardTiny=Math.max(14,Math.round(total*0.00009));
+  const softTiny=Math.max(50,Math.round(total*0.00032));
+  const maxRelative=largestArea*0.008;
 
-  // The main foreground component is always preserved.
-  // Other components are preserved if they are clearly substantial.
-  // Small isolated components that resemble the learned background are removed.
   for(let ci=1;ci<components.length;ci++){
     const c=components[ci];
     const bw=c.maxX-c.minX+1;
     const bh=c.maxY-c.minY+1;
 
-    const tinyByArea=c.area<=absoluteTiny;
-    const smallByArea=c.area<=smallIsland;
-    const smallByBox=bw<=meaningfulSide && bh<=meaningfulSide;
+    const definitelyTiny=c.area<=hardTiny;
+    const smallAndCompact=
+      c.area<=Math.min(softTiny,maxRelative) &&
+      bw<=Math.max(16,Math.round(w*0.045)) &&
+      bh<=Math.max(16,Math.round(h*0.045));
 
-    // Remove any truly tiny disconnected island, even if the earlier
-    // product-protection step accidentally made it fully opaque.
-    //
-    // For slightly larger islands, require strong background-colour evidence
-    // before deleting them. This protects detached accessories/details.
-    const shouldRemove=
-      tinyByArea ||
-      ((smallByArea||smallByBox) && c.bgRatio>=0.42);
-
-    if(shouldRemove){
-      for(const i of c.pixels)result[i]=0;
+    if(definitelyTiny||smallAndCompact){
+      for(const i of c.pixels)out[i]=0;
     }
   }
 
-  return result;
+  return out;
 }
 
-function removeBackgroundColourFringe(rgb,alpha,w,h){
-  const result=new Uint8Array(alpha);
-  const clusters=dominantBorderColours(rgb,alpha,w,h);
-  if(!clusters.length)return result;
+function refineAlphaEdge(alpha,w,h){
+  const out=new Uint8Array(alpha);
 
-  // Only inspect pixels close to transparency. This removes green/grass
-  // contamination around cutout edges without recolouring the jacket itself.
   for(let y=1;y<h-1;y++){
     for(let x=1;x<w-1;x++){
       const i=y*w+x;
-      if(result[i]===0)continue;
+      const a=alpha[i];
 
-      const neighbourTransparent=
-        result[i-1]<18 || result[i+1]<18 ||
-        result[i-w]<18 || result[i+w]<18;
-
-      if(!neighbourTransparent)continue;
-
-      const o=i*4;
-      const r=rgb[o],g=rgb[o+1],b=rgb[o+2];
-
-      let d=999;
-      for(const c of clusters){
-        d=Math.min(d,colourDistance(r,g,b,c.r,c.g,c.b));
+      if(a<26){
+        out[i]=0;
+        continue;
       }
 
-      // A pixel that is very close to the learned background colour and lies
-      // immediately beside transparency is overwhelmingly likely to be residue.
-      if(d<72){
-        result[i]=0;
-      }else if(d<98 && result[i]<150){
-        result[i]=Math.min(result[i],28);
+      if(a>238){
+        out[i]=255;
+        continue;
       }
+
+      let sum=0;
+      for(let oy=-1;oy<=1;oy++){
+        for(let ox=-1;ox<=1;ox++){
+          sum+=alpha[(y+oy)*w+x+ox];
+        }
+      }
+      const avg=sum/9;
+      out[i]=Math.max(0,Math.min(255,Math.round(a*0.78+avg*0.22)));
     }
   }
 
-  return result;
+  return out;
 }
 
-async function applyMaskBufferToFile(file,maskBuffer,maskWidth,maskHeight){
-  if(!maskBuffer||!maskWidth||!maskHeight)throw new Error("The AI returned an invalid mask.");
+async function applyDualMaskToFile(file,primaryBuffer,safetyBuffer,maskWidth,maskHeight){
+  if(!primaryBuffer||!maskWidth||!maskHeight){
+    throw new Error("The AI returned an invalid mask.");
+  }
 
   const bitmap=await createImageBitmap(file);
   const ow=bitmap.width,oh=bitmap.height;
-  const raw=new Uint8Array(maskBuffer);
 
-  if(raw.length!==maskWidth*maskHeight){
+  const primaryRaw=new Uint8Array(primaryBuffer);
+  const safetyRaw=safetyBuffer?new Uint8Array(safetyBuffer):null;
+
+  if(primaryRaw.length!==maskWidth*maskHeight){
     bitmap.close?.();
     throw new Error("The AI mask size did not match the image.");
   }
 
-  // Scale the raw AI mask to original image size first.
-  const maskCanvas=document.createElement("canvas");
-  maskCanvas.width=maskWidth;maskCanvas.height=maskHeight;
-  const mctx=maskCanvas.getContext("2d",{willReadFrequently:true});
-  if(!mctx){
-    bitmap.close?.();
-    throw new Error("Canvas is unavailable in this browser.");
-  }
+  const scaleMask=raw=>{
+    if(maskWidth===ow&&maskHeight===oh){
+      return new Uint8Array(raw);
+    }
 
-  const rgba=new Uint8ClampedArray(maskWidth*maskHeight*4);
-  for(let i=0;i<raw.length;i++){
-    const a=raw[i],o=i*4;
-    rgba[o]=a;rgba[o+1]=a;rgba[o+2]=a;rgba[o+3]=255;
-  }
-  mctx.putImageData(new ImageData(rgba,maskWidth,maskHeight),0,0);
+    const maskCanvas=document.createElement("canvas");
+    maskCanvas.width=maskWidth;maskCanvas.height=maskHeight;
+    const mctx=maskCanvas.getContext("2d",{willReadFrequently:true});
 
-  const scaled=document.createElement("canvas");
-  scaled.width=ow;scaled.height=oh;
-  const sctx=scaled.getContext("2d",{willReadFrequently:true});
-  sctx.imageSmoothingEnabled=true;
-  sctx.imageSmoothingQuality="high";
-  sctx.drawImage(maskCanvas,0,0,ow,oh);
-  const scaledMaskRGBA=sctx.getImageData(0,0,ow,oh).data;
-  const modelAlpha=new Uint8Array(ow*oh);
-  for(let i=0;i<ow*oh;i++)modelAlpha[i]=scaledMaskRGBA[i*4];
+    const rgba=new Uint8ClampedArray(maskWidth*maskHeight*4);
+    for(let i=0;i<raw.length;i++){
+      const a=raw[i],o=i*4;
+      rgba[o]=a;rgba[o+1]=a;rgba[o+2]=a;rgba[o+3]=255;
+    }
+    mctx.putImageData(new ImageData(rgba,maskWidth,maskHeight),0,0);
 
-  const out=document.createElement("canvas");
-  out.width=ow;out.height=oh;
-  const ctx=out.getContext("2d",{willReadFrequently:true});
+    const scaled=document.createElement("canvas");
+    scaled.width=ow;scaled.height=oh;
+    const sctx=scaled.getContext("2d",{willReadFrequently:true});
+    sctx.imageSmoothingEnabled=true;
+    sctx.imageSmoothingQuality="high";
+    sctx.drawImage(maskCanvas,0,0,ow,oh);
+
+    const rgbaScaled=sctx.getImageData(0,0,ow,oh).data;
+    const out=new Uint8Array(ow*oh);
+    for(let i=0;i<ow*oh;i++)out[i]=rgbaScaled[i*4];
+    return out;
+  };
+
+  const primary=scaleMask(primaryRaw);
+  const safety=safetyRaw?scaleMask(safetyRaw):null;
+
+  let alpha=combineForegroundMasks(primary,safety);
+  alpha=fillEnclosedAlphaHoles(alpha,ow,oh);
+  alpha=removeTinyForegroundIslands(alpha,ow,oh);
+  alpha=refineAlphaEdge(alpha,ow,oh);
+
+  const outCanvas=document.createElement("canvas");
+  outCanvas.width=ow;outCanvas.height=oh;
+  const ctx=outCanvas.getContext("2d",{willReadFrequently:true});
   ctx.drawImage(bitmap,0,0);
   bitmap.close?.();
 
   const image=ctx.getImageData(0,0,ow,oh);
-
-  // Core jacket-hole fix: combine the AI mask with connected-background
-  // analysis from the ORIGINAL image.
-  const safeAlpha=makeProductSafeAlpha(image.data,modelAlpha,ow,oh);
-
-  // FINAL cleanup happens after product protection so restored grass islands
-  // cannot survive as solid green dots.
-  let finalAlpha=cleanFinalForegroundComponents(image.data,safeAlpha,ow,oh);
-  finalAlpha=removeBackgroundColourFringe(image.data,finalAlpha,ow,oh);
-
   for(let i=0;i<ow*oh;i++){
-    let a=finalAlpha[i];
-
-    // Snap obvious background fully transparent and obvious product fully solid.
-    // Keep only the genuinely soft edge band.
-    if(a<34)a=0;
-    else if(a>236)a=255;
-
+    let a=alpha[i];
+    if(a<22)a=0;
+    else if(a>242)a=255;
     image.data[i*4+3]=a;
   }
   ctx.putImageData(image,0,0);
 
   return new Promise((resolve,reject)=>{
-    out.toBlob(
+    outCanvas.toBlob(
       b=>b&&b.size?resolve(b):reject(new Error("The browser could not create the cutout PNG.")),
       "image/png",
       1
     );
   });
 }
+
 
 function warmBackshotEngine(){
   if(engineWarmStarted)return;
@@ -1310,6 +1134,8 @@ async function chooseSafeCutout(file){
       $("#progressText").textContent=`Backshot Engine: loading ${Math.round(msg.progress)}%`;
     }else if(msg.stage==="remove"){
       $("#progressText").textContent="Backshot Engine: removing background…";
+    }else if(msg.stage==="safety"){
+      $("#progressText").textContent=msg.message||"Protecting product details…";
     }else if(msg.stage==="fallback"){
       $("#progressText").textContent=msg.message||"Switching removal engine…";
     }
