@@ -861,6 +861,63 @@ function dominantBorderColours(rgb,alpha,w,h){
   return ranked;
 }
 
+
+function removeTinyBackgroundSpecks(rgb,alpha,w,h){
+  const total=w*h;
+  const visited=new Uint8Array(total);
+  const result=new Uint8Array(alpha);
+  const queue=new Int32Array(total);
+  const clusters=dominantBorderColours(rgb,alpha,w,h);
+
+  const isBgLike=i=>{
+    if(alpha[i]===0)return false;
+    const o=i*4,r=rgb[o],g=rgb[o+1],b=rgb[o+2];
+    let d=999;
+    for(const c of clusters){
+      d=Math.min(d,colourDistance(r,g,b,c.r,c.g,c.b));
+    }
+    return d<108 && alpha[i]<245;
+  };
+
+  const minDim=Math.min(w,h);
+  const maxSpeckArea=Math.max(24,Math.round(total*0.0015));
+  const maxSpeckSide=Math.max(10,Math.round(minDim*0.05));
+
+  for(let start=0;start<total;start++){
+    if(visited[start]||!isBgLike(start))continue;
+
+    let head=0,tail=0;
+    queue[tail++]=start;
+    visited[start]=1;
+
+    let count=0,minX=w,maxX=0,minY=h,maxY=0;
+    while(head<tail){
+      const i=queue[head++],x=i%w,y=(i/w)|0;
+      count++;
+      if(x<minX)minX=x;if(x>maxX)maxX=x;
+      if(y<minY)minY=y;if(y>maxY)maxY=y;
+
+      const add=j=>{
+        if(j<0||j>=total||visited[j]||!isBgLike(j))return;
+        visited[j]=1;
+        queue[tail++]=j;
+      };
+      if(x>0)add(i-1);
+      if(x<w-1)add(i+1);
+      if(y>0)add(i-w);
+      if(y<h-1)add(i+w);
+    }
+
+    const bw=maxX-minX+1,bh=maxY-minY+1;
+    const tiny=count<=maxSpeckArea || (bw<=maxSpeckSide && bh<=maxSpeckSide);
+
+    if(tiny){
+      for(let q=0;q<tail;q++)result[queue[q]]=0;
+    }
+  }
+  return result;
+}
+
 function makeProductSafeAlpha(rgb,inputAlpha,w,h){
   const total=w*h;
   const alpha=new Uint8Array(inputAlpha);
@@ -952,7 +1009,7 @@ function makeProductSafeAlpha(rgb,inputAlpha,w,h){
     }
   }
 
-  return smooth;
+  return removeTinyBackgroundSpecks(rgb,smooth,w,h);
 }
 
 async function applyMaskBufferToFile(file,maskBuffer,maskWidth,maskHeight){
@@ -1005,7 +1062,12 @@ async function applyMaskBufferToFile(file,maskBuffer,maskWidth,maskHeight){
   // analysis from the ORIGINAL image.
   const safeAlpha=makeProductSafeAlpha(image.data,modelAlpha,ow,oh);
 
-  for(let i=0;i<ow*oh;i++)image.data[i*4+3]=safeAlpha[i];
+  for(let i=0;i<ow*oh;i++){
+    let a=safeAlpha[i];
+    if(a<28)a=0;
+    else if(a>238)a=255;
+    image.data[i*4+3]=a;
+  }
   ctx.putImageData(image,0,0);
 
   return new Promise((resolve,reject)=>{
@@ -1239,6 +1301,8 @@ async function drawComposite(canvas,item,exportSize=null){
 async function renderAllPreviews(){for(const canvas of document.querySelectorAll(".preview-canvas")){const item=state.items[Number(canvas.dataset.index)];if(!item)continue;try{const img=await imageFromURL(item.cutoutURL||item.originalURL),ratio=(img.naturalHeight||img.height)/(img.naturalWidth||img.width),w=Math.max(260,canvas.parentElement.clientWidth*2);await drawComposite(canvas,item,{width:Math.round(w),height:Math.round(w*ratio)});}catch{}}}
 
 /* ---------- Cutout editor ---------- */
+const ASSIST_LOCAL_RADIUS=96;
+
 async function openEditor(id){
   const item=state.items.find(x=>x.id===id);if(!item?.cutoutURL)return;
   const original=await imageFromURL(item.originalURL),cutout=await imageFromURL(item.cutoutURL),canvas=$("#editorCanvas"),max=1400,s=Math.min(1,max/Math.max(original.naturalWidth,original.naturalHeight));
