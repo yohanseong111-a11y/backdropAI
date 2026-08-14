@@ -812,17 +812,162 @@ function getRemovalWorker(){
   return removalWorker;
 }
 
+function colourDistance(r1,g1,b1,r2,g2,b2){
+  const dr=r1-r2,dg=g1-g2,db=b1-b2;
+  return Math.sqrt(dr*dr+dg*dg+db*db);
+}
+
+function dominantBorderColours(rgb,alpha,w,h){
+  // Find the dominant colours around the outside of the image, but only
+  // from pixels the AI already thinks are probably background.
+  // Quantisation makes grass/concrete/studio backgrounds form stable clusters.
+  const bins=new Map();
+  const band=Math.max(2,Math.round(Math.min(w,h)*0.035));
+
+  const sample=(x,y)=>{
+    const i=y*w+x;
+    if(alpha[i]>190)return;
+    const o=i*4;
+    const r=rgb[o],g=rgb[o+1],b=rgb[o+2];
+    const key=`${r>>5},${g>>5},${b>>5}`;
+    let entry=bins.get(key);
+    if(!entry){
+      entry={count:0,r:0,g:0,b:0};
+      bins.set(key,entry);
+    }
+    entry.count++;
+    entry.r+=r;entry.g+=g;entry.b+=b;
+  };
+
+  for(let x=0;x<w;x+=2){
+    for(let y=0;y<band;y++)sample(x,y);
+    for(let y=h-band;y<h;y++)sample(x,y);
+  }
+  for(let y=band;y<h-band;y+=2){
+    for(let x=0;x<band;x++)sample(x,y);
+    for(let x=w-band;x<w;x++)sample(x,y);
+  }
+
+  const ranked=[...bins.values()]
+    .sort((a,b)=>b.count-a.count)
+    .slice(0,4)
+    .map(e=>({
+      count:e.count,
+      r:e.r/e.count,
+      g:e.g/e.count,
+      b:e.b/e.count
+    }));
+
+  return ranked;
+}
+
+function makeProductSafeAlpha(rgb,inputAlpha,w,h){
+  const total=w*h;
+  const alpha=new Uint8Array(inputAlpha);
+  const clusters=dominantBorderColours(rgb,alpha,w,h);
+
+  // If border analysis is inconclusive, still fill obvious enclosed AI holes.
+  const connected=new Uint8Array(total);
+  const queue=new Int32Array(total);
+  let head=0,tail=0;
+
+  const nearBackgroundColour=(i,from=-1)=>{
+    const o=i*4,r=rgb[o],g=rgb[o+1],b=rgb[o+2];
+
+    let clusterDist=999;
+    for(const c of clusters){
+      clusterDist=Math.min(clusterDist,colourDistance(r,g,b,c.r,c.g,c.b));
+    }
+
+    // Texture propagation: grass/concrete can vary considerably from the
+    // dominant colour, so also allow gradual colour changes from a neighbour
+    // already accepted as background.
+    let localDist=999;
+    if(from>=0){
+      const fo=from*4;
+      localDist=colourDistance(
+        r,g,b,
+        rgb[fo],rgb[fo+1],rgb[fo+2]
+      );
+    }
+
+    // The AI must also have background evidence. Very confident foreground
+    // pixels are never turned transparent by this protection pass.
+    const a=alpha[i];
+    return a<218 && (clusterDist<92 || localDist<34);
+  };
+
+  const add=(i,from=-1)=>{
+    if(i<0||i>=total||connected[i])return;
+    if(!nearBackgroundColour(i,from))return;
+    connected[i]=1;
+    queue[tail++]=i;
+  };
+
+  // Seed from all four image borders.
+  for(let x=0;x<w;x++){
+    add(x);
+    add((h-1)*w+x);
+  }
+  for(let y=0;y<h;y++){
+    add(y*w);
+    add(y*w+w-1);
+  }
+
+  while(head<tail){
+    const i=queue[head++];
+    const x=i%w,y=(i/w)|0;
+    if(x>0)add(i-1,i);
+    if(x<w-1)add(i+1,i);
+    if(y>0)add(i-w,i);
+    if(y<h-1)add(i+w,i);
+  }
+
+  // Product preservation:
+  // Only frame-connected, background-coloured pixels are allowed to stay
+  // transparent. Any low-alpha pocket inside the product is restored.
+  const repaired=new Uint8Array(total);
+  for(let i=0;i<total;i++){
+    if(connected[i]){
+      // Keep the model's soft edge/matting on real background boundaries.
+      repaired[i]=alpha[i];
+    }else{
+      // Do not force already-confident foreground to change.
+      // Restore AI-cut holes and over-segmented garment sections.
+      repaired[i]=Math.max(alpha[i],245);
+    }
+  }
+
+  // Tiny 3x3 smoothing only on uncertain edges to avoid hard stair-steps.
+  const smooth=new Uint8Array(repaired);
+  for(let y=1;y<h-1;y++){
+    for(let x=1;x<w-1;x++){
+      const i=y*w+x,a=repaired[i];
+      if(a<=8||a>=247)continue;
+      let sum=0;
+      for(let oy=-1;oy<=1;oy++){
+        for(let ox=-1;ox<=1;ox++)sum+=repaired[(y+oy)*w+x+ox];
+      }
+      smooth[i]=Math.round(a*0.72+(sum/9)*0.28);
+    }
+  }
+
+  return smooth;
+}
+
 async function applyMaskBufferToFile(file,maskBuffer,maskWidth,maskHeight){
   if(!maskBuffer||!maskWidth||!maskHeight)throw new Error("The AI returned an invalid mask.");
 
   const bitmap=await createImageBitmap(file);
   const ow=bitmap.width,oh=bitmap.height;
   const raw=new Uint8Array(maskBuffer);
+
   if(raw.length!==maskWidth*maskHeight){
     bitmap.close?.();
     throw new Error("The AI mask size did not match the image.");
   }
 
+  // Scale the raw AI mask to original image size first.
   const maskCanvas=document.createElement("canvas");
   maskCanvas.width=maskWidth;maskCanvas.height=maskHeight;
   const mctx=maskCanvas.getContext("2d",{willReadFrequently:true});
@@ -844,7 +989,9 @@ async function applyMaskBufferToFile(file,maskBuffer,maskWidth,maskHeight){
   sctx.imageSmoothingEnabled=true;
   sctx.imageSmoothingQuality="high";
   sctx.drawImage(maskCanvas,0,0,ow,oh);
-  const scaledMask=sctx.getImageData(0,0,ow,oh).data;
+  const scaledMaskRGBA=sctx.getImageData(0,0,ow,oh).data;
+  const modelAlpha=new Uint8Array(ow*oh);
+  for(let i=0;i<ow*oh;i++)modelAlpha[i]=scaledMaskRGBA[i*4];
 
   const out=document.createElement("canvas");
   out.width=ow;out.height=oh;
@@ -853,7 +1000,12 @@ async function applyMaskBufferToFile(file,maskBuffer,maskWidth,maskHeight){
   bitmap.close?.();
 
   const image=ctx.getImageData(0,0,ow,oh);
-  for(let i=0;i<ow*oh;i++)image.data[i*4+3]=scaledMask[i*4];
+
+  // Core jacket-hole fix: combine the AI mask with connected-background
+  // analysis from the ORIGINAL image.
+  const safeAlpha=makeProductSafeAlpha(image.data,modelAlpha,ow,oh);
+
+  for(let i=0;i<ow*oh;i++)image.data[i*4+3]=safeAlpha[i];
   ctx.putImageData(image,0,0);
 
   return new Promise((resolve,reject)=>{
@@ -1015,11 +1167,18 @@ async function processRemovalQueue(queue,label){
   $("#progressWrap").classList.remove("hidden");
   updateProgress(queue.length);
 
-  // One model instance processes the batch sequentially.
-  // This is intentionally memory-safe for iPhone and avoids browser lockups.
-  for(const item of queue){
-    await removeOne(item,queue.length);
-    await new Promise(resolve=>setTimeout(resolve,0));
+  const isMobile=/iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  const cores=Math.max(2,Number(navigator.hardwareConcurrency||4));
+
+  // Cap at four simultaneous photos on laptops/desktops.
+  // Phones use two to avoid Safari memory crashes.
+  const concurrency=isMobile ? 2 : Math.min(4,Math.max(2,Math.floor(cores/2)));
+
+  for(let start=0;start<queue.length;start+=concurrency){
+    const chunk=queue.slice(start,start+concurrency);
+    await Promise.all(chunk.map(item=>removeOne(item,queue.length)));
+    // Yield to scrolling/zooming/animations between chunks.
+    await new Promise(resolve=>requestAnimationFrame(()=>setTimeout(resolve,0)));
   }
 
   state.processing=false;
@@ -1051,7 +1210,15 @@ async function removeAllBackgrounds(){
   await processRemovalQueue(state.items,"All photos");
 }
 
-function updateProgress(total=state.items.length){const finished=state.completed+state.failed,pct=total?Math.round(finished/total*100):0;$("#progressBar").style.width=`${pct}%`;$("#progressText").textContent=state.processing?`${finished}/${total} processed`:`${finished}/${total} finished${state.failed?` • ${state.failed} failed`:""}`;}
+function updateProgress(total=state.items.length){
+  const finished=state.completed+state.failed;
+  const active=state.items.filter(i=>i.status==="processing"||i.status==="revealing").length;
+  const pct=total?Math.round(finished/total*100):0;
+  $("#progressBar").style.width=`${pct}%`;
+  $("#progressText").textContent=state.processing
+    ? `${finished}/${total} finished${active?` • ${active} removing now`:""}`
+    : `${finished}/${total} finished${state.failed?` • ${state.failed} failed`:""}`;
+}
 
 async function imageFromURL(url){return new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>resolve(img);img.onerror=reject;img.src=url;});}
 function drawCover(ctx,img,w,h){const iw=img.naturalWidth||img.width,ih=img.naturalHeight||img.height,s=Math.max(w/iw,h/ih),dw=iw*s,dh=ih*s;ctx.drawImage(img,(w-dw)/2,(h-dh)/2,dw,dh);}
