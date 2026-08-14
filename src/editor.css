@@ -1,5 +1,5 @@
 
-/* BackdropAI enhanced cutout UX */
+/* BackshotAI enhanced cutout UX */
 .quality-row{
   display:flex;align-items:center;justify-content:space-between;gap:10px;
   margin:0 0 12px;font-size:12px;color:#aaaab2
@@ -163,3 +163,37 @@ fieldset{border:0;padding:0;margin:0;min-width:0}fieldset:disabled{opacity:.42}.
   border-radius:6px
 }
 .status.failed{cursor:help}
+
+
+/* v5 tutorial, always-on drag select, independent workspace scrolling */
+.gallery-head-actions{display:flex;gap:8px;align-items:center}
+.drag-guide{display:grid;grid-template-columns:48px 1fr auto;align-items:center;gap:14px;margin:0 0 14px;padding:14px 16px;border:1px solid rgba(124,98,255,.36);border-radius:15px;background:linear-gradient(135deg,rgba(118,95,255,.08),rgba(118,95,255,.025));transition:.18s ease}
+.drag-guide.guide-dismiss{opacity:0;transform:translateY(-6px)}
+.drag-guide-icon{width:42px;height:34px;position:relative;display:grid;grid-template-columns:repeat(3,1fr);align-items:stretch}
+.drag-guide-icon span{border-left:2px solid #765fff;border-right:1px solid rgba(118,95,255,.65);position:relative}
+.drag-guide-icon:before,.drag-guide-icon:after{content:"";position:absolute;left:0;right:0;height:2px;background:#765fff}.drag-guide-icon:before{top:7px}.drag-guide-icon:after{bottom:7px}
+.drag-guide-copy{display:flex;flex-direction:column;gap:3px;min-width:0}.drag-guide-copy strong{font-size:14px;color:#b8adff}.drag-guide-copy span{font-size:11px;color:#9b91df;line-height:1.35}
+.guide-got-it{background:transparent;color:#a997ff;border:1px solid rgba(128,104,255,.42);padding:9px 15px;border-radius:11px}
+
+.help-modal{position:fixed;inset:0;z-index:130;background:rgba(0,0,0,.72);backdrop-filter:blur(12px);display:grid;place-items:center;padding:18px}
+.help-card{width:min(620px,100%);background:#111114;border:1px solid rgba(255,255,255,.1);border-radius:24px;overflow:hidden;box-shadow:0 34px 100px rgba(0,0,0,.55)}
+.help-head,.help-foot{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:15px 17px;border-bottom:1px solid rgba(255,255,255,.07)}
+.help-head>div{display:flex;flex-direction:column;gap:3px}.help-kicker{font-size:9px;letter-spacing:.13em;color:#8274e5}.help-head strong{font-size:17px}
+.help-body{padding:26px;display:grid;grid-template-columns:120px 1fr;gap:24px;align-items:center;min-height:260px}.tutorial-visual{height:120px;border-radius:26px;display:grid;place-items:center;font-size:52px;background:radial-gradient(circle at 30% 30%,rgba(144,126,255,.35),rgba(118,95,255,.1) 55%,rgba(255,255,255,.02));border:1px solid rgba(150,135,255,.22);color:#b9adff}.tutorial-count{font-size:10px;color:#7c6cef;font-weight:800;letter-spacing:.06em}.tutorial-copy h3{font-size:23px;margin:7px 0 8px}.tutorial-copy p{margin:0;color:#9a9aa3;line-height:1.55;font-size:13px}.help-foot{border-top:1px solid rgba(255,255,255,.07);border-bottom:0}.tutorial-dots{display:flex;gap:5px}.tutorial-dots span{width:6px;height:6px;border-radius:50%;background:#34343a}.tutorial-dots span.active{width:18px;border-radius:999px;background:#765fff}.tutorial-nav{display:flex;gap:8px}.tutorial-nav button{width:auto}.tutorial-nav button:disabled{opacity:.3}
+
+.gallery{touch-action:pan-y}.gallery.drag-select-active{cursor:crosshair}.drag-select-box{backdrop-filter:brightness(1.06)}
+
+/* Compositor-driven scanner: the full-height track moves, instead of animating top on the line itself. */
+.scan-track{position:absolute;inset:0;z-index:7;pointer-events:none;will-change:transform;transform:translate3d(0,-100%,0);animation:scanTrackSweep .82s cubic-bezier(.42,0,.58,1) infinite alternate}
+.scan-track .scan-line{position:absolute;left:-3%;right:-3%;top:100%;height:2px;animation:none;background:linear-gradient(90deg,transparent 0%,rgba(181,169,255,.6) 13%,#fff 50%,rgba(181,169,255,.6) 87%,transparent 100%);box-shadow:0 0 8px rgba(255,255,255,.82),0 0 20px rgba(130,108,255,.8)}
+.scan-track .scan-glow{position:absolute;left:0;right:0;top:82%;height:18%;animation:none;background:linear-gradient(180deg,transparent,rgba(119,97,255,.20));opacity:.8}
+@keyframes scanTrackSweep{from{transform:translate3d(0,-100%,0)}to{transform:translate3d(0,0,0)}}
+.preview-wrap.scanning .scan-line,.preview-wrap.scanning .scan-glow{animation:none!important;transform:none!important}
+
+@media(min-width:901px){
+  .workspace{height:min(780px,calc(100vh - 108px));min-height:560px;overflow:hidden;align-items:stretch}
+  .controls{position:static!important;height:100%;max-height:none;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:18px}
+  .gallery-shell{height:100%;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:8px}
+  .controls::-webkit-scrollbar,.gallery-shell::-webkit-scrollbar{width:9px}.controls::-webkit-scrollbar-thumb,.gallery-shell::-webkit-scrollbar-thumb{background:#2b2b31;border-radius:999px;border:2px solid #111114}
+}
+@media(max-width:700px){.drag-guide{grid-template-columns:38px 1fr auto;padding:11px 12px;gap:10px}.drag-guide-icon{width:34px;height:30px}.drag-guide-copy strong{font-size:12px}.drag-guide-copy span{font-size:9px}.guide-got-it{padding:7px 10px;font-size:10px}.gallery-head-actions{gap:5px}.gallery-head-actions button{font-size:10px;padding:9px 10px}.help-body{grid-template-columns:1fr;padding:20px}.tutorial-visual{height:92px;font-size:42px}.help-card{border-radius:20px}.help-modal{padding:10px}}

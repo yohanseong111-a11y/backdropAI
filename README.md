@@ -1,4 +1,4 @@
-# BackdropAI
+# BackshotAI
 
 Bulk background removal and product-photo editor for desktop and mobile browsers.
 

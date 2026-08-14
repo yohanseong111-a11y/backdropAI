@@ -1,5 +1,5 @@
 BACKDROPAI SPEED + CUTOUT FIX
 
-Upload everything in this folder to the existing backdropAI repository, EXCEPT .github if Windows hides it.
+Upload everything in this folder to the existing backshotAI repository, EXCEPT .github if Windows hides it.
 The important replacements are package.json, src/main.js, src/editor.css and public/sw.js.
 Commit the upload and GitHub Pages will redeploy automatically.

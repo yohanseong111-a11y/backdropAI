@@ -1,6 +1,6 @@
 {
-  "name": "BackdropAI Bulk Background Studio",
-  "short_name": "BackdropAI",
+  "name": "BackshotAI Bulk Background Studio",
+  "short_name": "BackshotAI",
   "description": "Bulk background removal and replacement directly in your browser.",
   "start_url": "./",
   "display": "standalone",

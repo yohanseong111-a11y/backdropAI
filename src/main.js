@@ -18,8 +18,8 @@ const state = {
   failed: 0,
   quality: "smart",
   editor: null,
-  dragSelectMode: false,
   dragSelecting: false,
+  dragMoved: false,
   dragStartX: 0,
   dragStartY: 0
 };
@@ -27,7 +27,7 @@ const state = {
 const app = document.querySelector("#app");
 app.innerHTML = `
 <header class="topbar">
-  <div><div class="brand">BackdropAI</div><div class="subtitle">Bulk background studio</div></div>
+  <div><div class="brand">BackshotAI</div><div class="subtitle">Bulk background studio</div></div>
   <button id="installBtn" class="ghost hidden">Install</button>
 </header>
 
@@ -90,12 +90,11 @@ app.innerHTML = `
       <div class="selection-head">
         <div><div class="section-title no-margin">3. Selected photos</div><span id="selectedCount">0 selected</span></div>
         <div class="selection-actions">
-          <button id="dragSelectBtn" class="text-btn" type="button">Drag select</button>
           <button id="selectAll" class="text-btn" type="button">All</button>
           <button id="selectNone" class="text-btn" type="button">None</button>
         </div>
       </div>
-      <p class="selection-help">Tap photos, or turn on Drag select and sweep across several. Edits and “Remove selected” only affect those photos.</p>
+      <p class="selection-help">Tap photos individually or click-drag across the batch to select several. Edits and “Remove selected” only affect those photos.</p>
       <fieldset id="selectedControls" disabled>
         <label class="control-row"><span>Scale</span><input id="scaleRange" type="range" min="0.55" max="1.35" step="0.01" value="1" /></label>
         <label class="control-row"><span>Horizontal</span><input id="xRange" type="range" min="-30" max="30" step="1" value="0" /></label>
@@ -123,7 +122,15 @@ app.innerHTML = `
     <section class="gallery-shell">
       <div class="gallery-head">
         <div><h2>Your batch</h2><p id="batchCount">0 photos</p></div>
-        <button id="addMoreBtn" class="ghost">+ Add more</button>
+        <div class="gallery-head-actions">
+          <button id="helpBtn" class="ghost">Get help</button>
+          <button id="addMoreBtn" class="ghost">+ Add more</button>
+        </div>
+      </div>
+      <div id="dragGuide" class="drag-guide">
+        <div class="drag-guide-icon" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div class="drag-guide-copy"><strong>Drag to select multiple photos</strong><span>Click and drag across photo cards to select several at once.</span></div>
+        <button id="dragGuideGotIt" class="guide-got-it" type="button">Got it</button>
       </div>
       <div id="gallery" class="gallery"></div>
       <div id="dragSelectBox" class="drag-select-box hidden"></div>
@@ -153,8 +160,29 @@ app.innerHTML = `
       <div id="brushCursor" class="brush-cursor"></div>
     </div>
     <div class="editor-foot">
-      <span id="editorHint">Assisted: tap a missed area and BackdropAI follows that region.</span>
+      <span id="editorHint">Assisted: tap a missed area and BackshotAI follows that region.</span>
       <button id="applyEdit" class="primary compact">Apply cutout</button>
+    </div>
+  </div>
+</div>
+
+<div id="helpModal" class="help-modal hidden" role="dialog" aria-modal="true" aria-labelledby="helpTitle">
+  <div class="help-card">
+    <div class="help-head">
+      <div><span class="help-kicker">HOW TO USE BACKDROPAI</span><strong id="helpTitle">Quick tutorial</strong></div>
+      <button id="closeHelp" class="icon-btn" type="button">×</button>
+    </div>
+    <div class="help-body">
+      <div class="tutorial-visual" id="tutorialVisual"></div>
+      <div class="tutorial-copy">
+        <div class="tutorial-count" id="tutorialCount">1 / 7</div>
+        <h3 id="tutorialTitle"></h3>
+        <p id="tutorialText"></p>
+      </div>
+    </div>
+    <div class="help-foot">
+      <div id="tutorialDots" class="tutorial-dots"></div>
+      <div class="tutorial-nav"><button id="tutorialBack" class="ghost" type="button">Back</button><button id="tutorialNext" class="primary compact" type="button">Next</button></div>
     </div>
   </div>
 </div>
@@ -204,7 +232,7 @@ function renderGallery() {
   gallery.innerHTML = state.items.map((item,index)=>`
     <article class="photo-card ${state.selected.has(item.id) ? "selected" : ""}" data-card="${item.id}">
       <div class="preview-wrap ${item.status === "processing" ? "scanning" : ""} ${item.status === "revealing" ? "revealing" : ""}">
-        ${item.status === "processing" ? `<img class="processing-original" src="${item.originalURL}" alt="" /><div class="scan-line"></div><div class="scan-glow"></div>` : item.status === "revealing" ? `
+        ${item.status === "processing" ? `<img class="processing-original" src="${item.originalURL}" alt="" /><div class="scan-track"><div class="scan-glow"></div><div class="scan-line"></div></div>` : item.status === "revealing" ? `
           <img class="reveal-original" src="${item.originalURL}" alt="" />
           <img class="reveal-cutout" src="${item.cutoutURL}" alt="" />
           <div class="reveal-scan-line"></div>
@@ -220,7 +248,7 @@ function renderGallery() {
     </article>`).join("");
 
   document.querySelectorAll("[data-card]").forEach(card=>card.onclick=e=>{
-    if(e.target.closest("button")) return;
+    if(e.target.closest("button") || state.dragMoved) return;
     toggleSelected(card.dataset.card);
   });
   document.querySelectorAll(".select-chip").forEach(btn=>btn.onclick=e=>{e.stopPropagation();toggleSelected(btn.dataset.select);});
@@ -324,7 +352,7 @@ async function chooseSafeCutout(file, mode, progress){
 
 function nextFrame(){return new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));}
 async function removeOne(item, queueTotal) {
-  item.status="processing"; renderGallery(); await nextFrame();
+  item.status="processing"; renderGallery(); await nextFrame(); await new Promise(r=>setTimeout(r,40));
   try {
     const progress=(key,current,total)=>{if(total>0&&/fetch|model/i.test(key))$("#progressText").textContent=`Loading removal model… ${Math.round(current/total*100)}%`;};
     const blob=await chooseSafeCutout(item.file,state.quality,progress);
@@ -400,7 +428,7 @@ function fitEditorCanvasToStage(){
   canvas.style.width=`${Math.max(1,Math.floor(canvas.width*fit))}px`;
   canvas.style.height=`${Math.max(1,Math.floor(canvas.height*fit))}px`;
 }
-function updateEditorUI(){if(!state.editor)return;$("#eraseTool").classList.toggle("active",state.editor.mode==="erase");$("#restoreTool").classList.toggle("active",state.editor.mode==="restore");const assisted=$("#assistToggle").checked;$("#brushSize").disabled=assisted;$("#editorHint").textContent=assisted?`Assisted: tap a ${state.editor.mode==="erase"?"missed background area":"missing product area"} and BackdropAI follows that region.`:state.editor.mode==="erase"?"Manual: brush over unwanted areas.":"Manual: brush over missing parts to restore them.";$("#undoEdit").disabled=state.editor.history.length<=1;$("#redoEdit").disabled=!state.editor.redo.length;}
+function updateEditorUI(){if(!state.editor)return;$("#eraseTool").classList.toggle("active",state.editor.mode==="erase");$("#restoreTool").classList.toggle("active",state.editor.mode==="restore");const assisted=$("#assistToggle").checked;$("#brushSize").disabled=assisted;$("#editorHint").textContent=assisted?`Assisted: tap a ${state.editor.mode==="erase"?"missed background area":"missing product area"} and BackshotAI follows that region.`:state.editor.mode==="erase"?"Manual: brush over unwanted areas.":"Manual: brush over missing parts to restore them.";$("#undoEdit").disabled=state.editor.history.length<=1;$("#redoEdit").disabled=!state.editor.redo.length;}
 function setupEditorEvents(){
   const e=state.editor,c=e.canvas;
   c.onpointerdown=ev=>{const p=pointFor(ev,c);c.setPointerCapture(ev.pointerId);if($("#assistToggle").checked){assistedTap(p);return;}e.drawing=true;e.last=p;paintAt(p);};
@@ -430,12 +458,38 @@ async function applyEditor(){const e=state.editor;if(!e)return;let blob=await ne
 function closeEditor(){$("#cutoutModal").classList.add("hidden");state.editor=null;}
 
 /* ---------- Export ---------- */
-async function downloadAll(){if(!state.items.length)return;$("#downloadAllBtn").disabled=true;$("#downloadAllBtn").textContent="Preparing ZIP…";try{const zip=new JSZip();let counter=1;for(const item of state.items){const img=await imageFromURL(item.cutoutURL||item.originalURL),canvas=document.createElement("canvas");await drawComposite(canvas,item,{width:img.naturalWidth||img.width,height:img.naturalHeight||img.height});const transparent=state.bgMode==="transparent",mime=transparent?"image/png":"image/jpeg",ext=transparent?"png":"jpg",blob=await new Promise(r=>canvas.toBlob(r,mime,transparent?undefined:.94)),name=(item.name.replace(/\.[^.]+$/,"")||`image-${counter}`).replace(/[^\w\- ]+/g,"").trim().replace(/\s+/g,"-");zip.file(`${name||`image-${counter}`}-edited.${ext}`,blob);counter++;}const out=await zip.generateAsync({type:"blob",compression:"DEFLATE"});downloadBlob(out,`BackdropAI-${new Date().toISOString().slice(0,10)}.zip`);}catch(e){console.error(e);toast("Couldn't create ZIP.");}$("#downloadAllBtn").disabled=false;$("#downloadAllBtn").textContent="Download all as ZIP";}
+async function downloadAll(){if(!state.items.length)return;$("#downloadAllBtn").disabled=true;$("#downloadAllBtn").textContent="Preparing ZIP…";try{const zip=new JSZip();let counter=1;for(const item of state.items){const img=await imageFromURL(item.cutoutURL||item.originalURL),canvas=document.createElement("canvas");await drawComposite(canvas,item,{width:img.naturalWidth||img.width,height:img.naturalHeight||img.height});const transparent=state.bgMode==="transparent",mime=transparent?"image/png":"image/jpeg",ext=transparent?"png":"jpg",blob=await new Promise(r=>canvas.toBlob(r,mime,transparent?undefined:.94)),name=(item.name.replace(/\.[^.]+$/,"")||`image-${counter}`).replace(/[^\w\- ]+/g,"").trim().replace(/\s+/g,"-");zip.file(`${name||`image-${counter}`}-edited.${ext}`,blob);counter++;}const out=await zip.generateAsync({type:"blob",compression:"DEFLATE"});downloadBlob(out,`BackshotAI-${new Date().toISOString().slice(0,10)}.zip`);}catch(e){console.error(e);toast("Couldn't create ZIP.");}$("#downloadAllBtn").disabled=false;$("#downloadAllBtn").textContent="Download all as ZIP";}
 function downloadBlob(blob,name){const a=document.createElement("a"),url=URL.createObjectURL(blob);a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),5000);}
 
 /* ---------- controls ---------- */
 photoInput.onchange=e=>addFiles(e.target.files);
 $("#addMoreBtn").onclick=()=>photoInput.click();
+const tutorialSteps=[
+  {icon:"＋",title:"Add your photos",text:"Select one photo or upload a whole batch from your phone or computer."},
+  {icon:"▦",title:"Select exactly what you want",text:"Tap cards one by one, or click and drag across several photos to select them together."},
+  {icon:"✦",title:"Remove backgrounds",text:"Use Remove selected backgrounds for your selection, or Remove all backgrounds only when you want the entire batch processed."},
+  {icon:"▣",title:"Choose a replacement background",text:"Pick Transparent, Colour, or Image. When you choose an image, its preview stays visible in the left panel."},
+  {icon:"↔",title:"Position and filter selected photos",text:"Scale, move, brighten, adjust contrast, or change saturation. These controls only affect the photos you selected."},
+  {icon:"⌁",title:"Fix difficult cutouts",text:"Open Edit cutout. Assisted mode follows a connected region you tap; Manual mode lets you erase or restore with mouse or finger."},
+  {icon:"↓",title:"Export your batch",text:"When everything looks right, download all edited photos together as a ZIP."}
+];
+let tutorialIndex=0;
+function renderTutorial(){
+  const step=tutorialSteps[tutorialIndex];
+  $("#tutorialVisual").textContent=step.icon;$("#tutorialTitle").textContent=step.title;$("#tutorialText").textContent=step.text;
+  $("#tutorialCount").textContent=`${tutorialIndex+1} / ${tutorialSteps.length}`;
+  $("#tutorialDots").innerHTML=tutorialSteps.map((_,i)=>`<span class="${i===tutorialIndex?"active":""}"></span>`).join("");
+  $("#tutorialBack").disabled=tutorialIndex===0;$("#tutorialNext").textContent=tutorialIndex===tutorialSteps.length-1?"Done":"Next";
+}
+function openHelp(){tutorialIndex=0;renderTutorial();$("#helpModal").classList.remove("hidden");}
+function closeHelp(){$("#helpModal").classList.add("hidden");}
+$("#helpBtn").onclick=openHelp;$("#closeHelp").onclick=closeHelp;$("#helpModal").onclick=e=>{if(e.target.id==="helpModal")closeHelp();};
+$("#tutorialBack").onclick=()=>{if(tutorialIndex>0){tutorialIndex--;renderTutorial();}};
+$("#tutorialNext").onclick=()=>{if(tutorialIndex<tutorialSteps.length-1){tutorialIndex++;renderTutorial();}else closeHelp();};
+const dragGuide=$("#dragGuide");
+if(localStorage.getItem("backshotaiDragGuideDismissed")==="1")dragGuide.classList.add("hidden");
+$("#dragGuideGotIt").onclick=()=>{dragGuide.classList.add("guide-dismiss");localStorage.setItem("backshotaiDragGuideDismissed","1");setTimeout(()=>dragGuide.classList.add("hidden"),180);};
+
 $("#removeSelectedBtn").onclick=removeSelectedBackgrounds;
 $("#removeAllBtn").onclick=removeAllBackgrounds;
 $("#downloadAllBtn").onclick=downloadAll;
@@ -450,64 +504,54 @@ $("#scaleRange").oninput=e=>applyToSelected("scale",Number(e.target.value));$("#
 
 $("#resetSelected").onclick=()=>{for(const i of selectedItems())i.adj=DEFAULT_ADJ();updateSelectionUI();renderAllPreviews();};
 
-const dragSelectBtn=$("#dragSelectBtn");
 const dragSelectBox=$("#dragSelectBox");
 
-function setDragSelectMode(on){
-  state.dragSelectMode=on;
-  dragSelectBtn.classList.toggle("active",on);
-  gallery.classList.toggle("drag-select-active",on);
-  dragSelectBtn.textContent=on?"Drag select: ON":"Drag select";
-}
-dragSelectBtn.onclick=()=>setDragSelectMode(!state.dragSelectMode);
-
-function pagePoint(e){
-  return {x:e.clientX,y:e.clientY};
-}
+function pagePoint(e){ return {x:e.clientX,y:e.clientY}; }
 function updateDragBox(x1,y1,x2,y2){
   const left=Math.min(x1,x2),top=Math.min(y1,y2),right=Math.max(x1,x2),bottom=Math.max(y1,y2);
-  dragSelectBox.style.left=`${left}px`;
-  dragSelectBox.style.top=`${top}px`;
-  dragSelectBox.style.width=`${right-left}px`;
-  dragSelectBox.style.height=`${bottom-top}px`;
+  dragSelectBox.style.left=`${left}px`;dragSelectBox.style.top=`${top}px`;
+  dragSelectBox.style.width=`${right-left}px`;dragSelectBox.style.height=`${bottom-top}px`;
   return {left,top,right,bottom};
 }
 function applyDragSelection(rect){
+  let hits=0;
   for(const card of gallery.querySelectorAll(".photo-card")){
     const r=card.getBoundingClientRect();
     const hit=!(r.right<rect.left||r.left>rect.right||r.bottom<rect.top||r.top>rect.bottom);
-    if(hit){
-      const id=card.dataset.card;
-      if(id)state.selected.add(id);
-    }
+    if(hit){const id=card.dataset.card;if(id&&!state.selected.has(id)){state.selected.add(id);hits++;}}
   }
-  renderGallery();updateSelectionUI();
+  if(hits){renderGallery();updateSelectionUI();}
 }
 gallery.addEventListener("pointerdown",e=>{
-  if(!state.dragSelectMode)return;
+  if(e.target.closest("button"))return;
   if(e.button!==undefined&&e.button!==0)return;
-  e.preventDefault();
   const p=pagePoint(e);
-  state.dragSelecting=true;state.dragStartX=p.x;state.dragStartY=p.y;
-  dragSelectBox.classList.remove("hidden");
+  state.dragSelecting=true;state.dragMoved=false;state.dragStartX=p.x;state.dragStartY=p.y;
   updateDragBox(p.x,p.y,p.x,p.y);
   try{gallery.setPointerCapture(e.pointerId);}catch{}
 });
 gallery.addEventListener("pointermove",e=>{
-  if(!state.dragSelectMode||!state.dragSelecting)return;
-  e.preventDefault();
-  const p=pagePoint(e);
+  if(!state.dragSelecting)return;
+  const p=pagePoint(e),dx=p.x-state.dragStartX,dy=p.y-state.dragStartY;
+  if(!state.dragMoved && Math.hypot(dx,dy)<9)return;
+  // Keep ordinary vertical touch scrolling usable; mouse/pen drag-select is always ready.
+  if(e.pointerType==="touch" && Math.abs(dy)>Math.abs(dx)*1.25 && !state.dragMoved){state.dragSelecting=false;return;}
+  state.dragMoved=true;e.preventDefault();dragSelectBox.classList.remove("hidden");
   updateDragBox(state.dragStartX,state.dragStartY,p.x,p.y);
 });
 function finishDragSelection(e){
   if(!state.dragSelecting)return;
-  const p=pagePoint(e);
-  const rect=updateDragBox(state.dragStartX,state.dragStartY,p.x,p.y);
-  state.dragSelecting=false;dragSelectBox.classList.add("hidden");
-  if(Math.abs(rect.right-rect.left)>8||Math.abs(rect.bottom-rect.top)>8)applyDragSelection(rect);
+  const p=pagePoint(e);state.dragSelecting=false;
+  if(state.dragMoved){
+    e.preventDefault();e.stopPropagation();
+    const rect=updateDragBox(state.dragStartX,state.dragStartY,p.x,p.y);
+    applyDragSelection(rect);
+  }
+  dragSelectBox.classList.add("hidden");
+  setTimeout(()=>state.dragMoved=false,0);
 }
 gallery.addEventListener("pointerup",finishDragSelection);
-gallery.addEventListener("pointercancel",()=>{state.dragSelecting=false;dragSelectBox.classList.add("hidden");});
+gallery.addEventListener("pointercancel",()=>{state.dragSelecting=false;state.dragMoved=false;dragSelectBox.classList.add("hidden");});
 
 $("#shadowEnabled").onchange=e=>{state.shadow.enabled=e.target.checked;renderAllPreviews();};$("#shadowOpacity").oninput=e=>{state.shadow.opacity=Number(e.target.value);renderAllPreviews();};$("#shadowBlur").oninput=e=>{state.shadow.blur=Number(e.target.value);renderAllPreviews();};$("#shadowY").oninput=e=>{state.shadow.offsetY=Number(e.target.value);renderAllPreviews();};
 $("#eraseTool").onclick=()=>{state.editor.mode="erase";updateEditorUI();};$("#restoreTool").onclick=()=>{state.editor.mode="restore";updateEditorUI();};$("#assistToggle").onchange=updateEditorUI;$("#undoEdit").onclick=undo;$("#redoEdit").onclick=redo;$("#smartRecover").onclick=smartRecover;$("#applyEdit").onclick=applyEditor;$("#closeEditor").onclick=closeEditor;$("#cutoutModal").onclick=e=>{if(e.target.id==="cutoutModal")closeEditor();};
