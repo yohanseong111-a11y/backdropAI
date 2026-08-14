@@ -262,3 +262,11 @@ input[type="checkbox"] { accent-color: #846fff; transform: scale(1.15); }
     scrollbar-gutter:stable;
   }
 }
+
+.api-key-row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;margin:10px 0 6px}
+.api-key-row input{
+  min-width:0;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.04);
+  color:inherit;border-radius:10px;padding:10px 12px;outline:none
+}
+.api-key-row input:focus{border-color:rgba(139,112,255,.75);box-shadow:0 0 0 3px rgba(139,112,255,.10)}
+.api-key-status{margin:0 0 10px;line-height:1.4}

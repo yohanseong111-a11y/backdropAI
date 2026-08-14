@@ -2,7 +2,6 @@ import "./style.css";
 import "./editor.css";
 import JSZip from "jszip";
 import { removeBackground, preload } from "@imgly/background-removal";
-import { AutoModel, AutoProcessor, RawImage } from "@huggingface/transformers";
 
 const DEFAULT_ADJ = () => ({
   scale: 1, offsetX: 0, offsetY: 0,
@@ -55,11 +54,16 @@ app.innerHTML = `
       <div class="quality-row">
         <span>Removal mode</span>
         <select id="qualitySelect">
-          <option value="smart" selected>Smart — product-safe precision</option>
-          <option value="best">Best quality — BiRefNet precision</option>
-          <option value="fast">Fast</option>
+          <option value="smart" selected>Smart — PhotoRoom precision</option>
+          <option value="best">Best quality — PhotoRoom full resolution</option>
+          <option value="fast">Fast — local browser model</option>
         </select>
       </div>
+      <div class="api-key-row">
+        <input id="photoroomKey" type="password" autocomplete="off" placeholder="PhotoRoom API key" />
+        <button id="savePhotoRoomKey" class="ghost small-btn" type="button">Use key</button>
+      </div>
+      <p id="apiKeyStatus" class="small api-key-status">Smart/Best use PhotoRoom's background-removal engine. Your key is kept only for this browser session.</p>
       <div class="remove-button-stack">
         <button id="removeSelectedBtn" class="primary">Remove selected backgrounds</button>
         <button id="removeAllBtn" class="ghost remove-all-btn">Remove all backgrounds</button>
@@ -68,7 +72,7 @@ app.innerHTML = `
         <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
         <div id="progressText" class="small"></div>
       </div>
-      <p class="privacy-note">The model is cached after first use. Removal runs off the main UI thread when supported.</p>
+      <p class="privacy-note">Smart/Best are processed by PhotoRoom’s API for cleaner product-safe cutouts. Fast stays local on your device.</p>
 
       <div class="divider"></div>
       <div class="section-title">2. New background</div>
@@ -731,46 +735,72 @@ async function protectSubjectWithBackgroundMask(file,cutout,maskInfo){
   return await new Promise(res=>c.toBlob(res,"image/png",1));
 }
 
-async function chooseSafeCutout(file,mode,progress){
-  // 1) First inspect the border. Easy plain/grass/studio backgrounds can be removed
-  // much faster without a heavy AI pass.
-  let bgMask=null;
-  try{bgMask=await buildConservativeBackgroundMask(file);}catch(e){console.warn("Background analysis skipped",e);}
 
-  if(mode!=="best" && bgMask){
-    $("#progressText").textContent="Removing simple background…";
-    const fast=await applyBackgroundMask(file,bgMask);
-    return cleanCutoutEdges(fast);
-  }
+const PHOTOROOM_ENDPOINT="https://sdk.photoroom.com/v1/segment";
 
-  // 2) Harder scenes use BiRefNet precision.
-  $("#progressText").textContent="Finding the complete product…";
-  let primary;
+function getPhotoRoomKey(){
+  return sessionStorage.getItem("backshotai-photoroom-key")||"";
+}
+
+function updatePhotoRoomKeyStatus(){
+  const status=$("#apiKeyStatus");
+  if(!status)return;
+  status.textContent=getPhotoRoomKey()
+    ?"PhotoRoom precision is ready for this session."
+    :"Smart/Best need your PhotoRoom API key. Fast mode works without one.";
+}
+
+async function removeWithPhotoRoom(file,mode){
+  const apiKey=getPhotoRoomKey();
+  if(!apiKey)throw new Error("PHOTOROOM_KEY_MISSING");
+
+  const form=new FormData();
+  form.append("image_file",file);
+  form.append("format","png");
+  form.append("channels","rgba");
+  form.append("crop","false");
+  // HD is materially quicker for normal editing previews; full keeps original resolution.
+  form.append("size",mode==="best"?"full":"hd");
+  // Do not enable green-screen despill here: PhotoRoom notes that despill can alter subject colours.
+  form.append("despill","false");
+
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),90000);
   try{
-    primary=await removeWithBiRefNet(file);
-  }catch(err){
-    console.warn("BiRefNet precision model failed; falling back to local remover",err);
-    primary=await removeStable(file,"best",progress);
+    const response=await fetch(PHOTOROOM_ENDPOINT,{
+      method:"POST",
+      headers:{"X-Api-Key":apiKey},
+      body:form,
+      signal:controller.signal
+    });
+    if(!response.ok){
+      let detail="";
+      try{detail=await response.text();}catch{}
+      const err=new Error(`PhotoRoom ${response.status}${detail?`: ${detail.slice(0,160)}`:""}`);
+      err.status=response.status;
+      throw err;
+    }
+    return await response.blob();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function chooseSafeCutout(file,mode,progress){
+  if(mode==="fast"){
+    $("#progressText").textContent="Removing background locally…";
+    const quick=await removeStable(file,"fast",progress);
+    return cleanCutoutEdges(quick);
   }
 
-  // 3) Subject protection: if edge analysis found a plausible background, never allow
-  // the AI to delete large non-background regions inside the product.
-  if(bgMask){
-    primary=await protectSubjectWithBackgroundMask(file,primary,bgMask);
-  }
+  $("#progressText").textContent=mode==="best"
+    ?"PhotoRoom: full-resolution cutout…"
+    :"PhotoRoom: removing background…";
 
-  const shape=await cutoutShapeStats(primary);
-  if(shape.visible<0.28 || shape.largestShare<0.80){
-    $("#progressText").textContent="Protecting close-up product…";
-    try{
-      const safe=await conservativeCloseupFallback(file);
-      if(safe){
-        const safeShape=await cutoutShapeStats(safe);
-        if(safeShape.visible>shape.visible)primary=safe;
-      }
-    }catch(e){console.warn("Close-up fallback skipped",e);}
-  }
-  return cleanCutoutEdges(primary);
+  const result=await removeWithPhotoRoom(file,mode);
+  // PhotoRoom already applies matting to RGBA cutouts. Do not run our previous
+  // erosion/colour-mask algorithms over the result; that was causing product holes.
+  return result;
 }
 
 function nextFrame(){return new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));}
@@ -791,7 +821,20 @@ async function removeOne(item, queueTotal) {
     await new Promise(resolve=>setTimeout(resolve,900));
     item.status="done";state.completed++;
   } catch(error) {
-    console.error(error);item.status="failed";item.error=error?.message||"Background removal failed";state.failed++;
+    console.error(error);
+    item.status="failed";
+    if(error?.message==="PHOTOROOM_KEY_MISSING"){
+      item.error="Add your PhotoRoom API key or switch to Fast mode.";
+    }else if(error?.status===402){
+      item.error="PhotoRoom API credits are empty.";
+    }else if(error?.status===401||error?.status===403){
+      item.error="PhotoRoom API key was rejected.";
+    }else if(error?.name==="AbortError"){
+      item.error="PhotoRoom request timed out.";
+    }else{
+      item.error=error?.message||"Background removal failed";
+    }
+    state.failed++;
   }
   updateProgress(queueTotal);renderGallery();
 }
@@ -803,12 +846,10 @@ async function processRemovalQueue(queue,label){
   $("#removeSelectedBtn").disabled=true;$("#removeAllBtn").disabled=true;$("#progressWrap").classList.remove("hidden");
 
   // Real bulk mode: run several photos at once, but cap concurrency to avoid crashing phones.
-  const mem=Number(navigator.deviceMemory||4);
-  const cores=Number(navigator.hardwareConcurrency||4);
   const mobile=/iPad|iPhone|iPod|Android/i.test(navigator.userAgent);
-  let concurrency=mobile?2:Math.min(3,Math.max(2,Math.floor(cores/4)));
-  if(mem<=3)concurrency=1;
-  else if(mem<=5)concurrency=Math.min(concurrency,2);
+  // Smart/Best are network/API work, so several can run at once without locking the UI.
+  // Fast is local inference, so keep its concurrency conservative.
+  let concurrency=state.quality==="fast" ? (mobile?1:2) : (mobile?3:5);
 
   let cursor=0;
   async function worker(){
@@ -976,6 +1017,13 @@ $("#removeSelectedBtn").onclick=removeSelectedBackgrounds;
 $("#removeAllBtn").onclick=removeAllBackgrounds;
 $("#downloadSelectedBtn").onclick=downloadSelected;$("#downloadAllBtn").onclick=downloadAll;
 $("#qualitySelect").onchange=e=>state.quality=e.target.value;
+$("#savePhotoRoomKey").onclick=()=>{
+  const key=$("#photoroomKey").value.trim();
+  if(!key){sessionStorage.removeItem("backshotai-photoroom-key");toast("PhotoRoom key cleared.");}
+  else{sessionStorage.setItem("backshotai-photoroom-key",key);$("#photoroomKey").value="";toast("PhotoRoom precision enabled.");}
+  updatePhotoRoomKeyStatus();
+};
+updatePhotoRoomKeyStatus();
 $("#clearBtn").onclick=()=>{for(const i of state.items)cleanupItem(i);state.items=[];state.selected.clear();workspace.classList.add("hidden");gallery.innerHTML="";updateSelectionUI();};
 document.querySelectorAll(".seg").forEach(btn=>btn.onclick=()=>{state.bgMode=btn.dataset.bg;document.querySelectorAll(".seg").forEach(b=>b.classList.toggle("active",b===btn));$("#solidControls").classList.toggle("hidden",state.bgMode!=="solid");$("#backgroundPicker").classList.toggle("hidden",state.bgMode!=="image");renderAllPreviews();});
 $("#solidColor").oninput=e=>{state.solidColor=e.target.value;renderAllPreviews();};
@@ -1042,7 +1090,7 @@ $("#shadowY").oninput=e=>applyShadowToSelected("offsetY",Number(e.target.value))
 $("#eraseTool").onclick=()=>{state.editor.mode="erase";updateEditorUI();};$("#restoreTool").onclick=()=>{state.editor.mode="restore";updateEditorUI();};$("#assistToggle").onchange=updateEditorUI;$("#undoEdit").onclick=undo;$("#redoEdit").onclick=redo;$("#smartRecover").onclick=smartRecover;$("#applyEdit").onclick=applyEditor;$("#closeEditor").onclick=closeEditor;$("#cutoutModal").onclick=e=>{if(e.target.id==="cutoutModal")closeEditor();};
 let installPrompt=null;window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();installPrompt=e;$("#installBtn").classList.remove("hidden");});$("#installBtn").onclick=async()=>{if(!installPrompt){toast("On iPhone: Safari → Share → Add to Home Screen");return;}installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;$("#installBtn").classList.add("hidden");};
 window.addEventListener("resize",()=>{if(state.editor)requestAnimationFrame(fitEditorCanvasToStage);});
-preloadRemovalModel();if("serviceWorker" in navigator)window.addEventListener("load",()=>navigator.serviceWorker.register("./sw.js").catch(console.warn));
+// Local model loads only when Fast mode is used.if("serviceWorker" in navigator)window.addEventListener("load",()=>navigator.serviceWorker.register("./sw.js").catch(console.warn));
 
 
 function enableScrollChaining(el){
