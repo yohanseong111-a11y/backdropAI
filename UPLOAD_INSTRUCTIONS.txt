@@ -1,15 +1,5 @@
-BACKDROPAI GITHUB UPLOAD
+BACKDROPAI SPEED + CUTOUT FIX
 
-Open this folder and drag EVERYTHING INSIDE it into GitHub.
-
-You should upload:
-- index.html
-- package.json
-- vite.config.js
-- README.md
-- .gitignore
-- src folder
-- public folder
-- .github folder
-
-Then click Commit changes.
+Upload everything in this folder to the existing backdropAI repository, EXCEPT .github if Windows hides it.
+The important replacements are package.json, src/main.js, src/editor.css and public/sw.js.
+Commit the upload and GitHub Pages will redeploy automatically.

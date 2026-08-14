@@ -86,3 +86,34 @@
   .editor-foot{padding-bottom:max(12px,env(safe-area-inset-bottom))}
   .quality-row{align-items:flex-start;flex-direction:column}.quality-row select{width:100%}
 }
+
+/* final scan reveal: processed cutout replaces original behind the moving line */
+.preview-wrap.revealing { position: relative; overflow: hidden; }
+.reveal-original,
+.reveal-cutout {
+  position:absolute; inset:0; width:100%; height:100%; object-fit:contain; display:block;
+}
+.reveal-original { z-index:1; }
+.reveal-cutout {
+  z-index:2;
+  animation: cutoutRevealDown .78s cubic-bezier(.3,.7,.2,1) forwards;
+  clip-path: inset(0 0 100% 0);
+}
+.reveal-scan-line {
+  position:absolute; left:-3%; width:106%; height:3px; top:0; z-index:6;
+  border-radius:999px;
+  background:linear-gradient(90deg,transparent 0%,rgba(174,160,255,.45) 11%,#fff 50%,rgba(174,160,255,.45) 89%,transparent 100%);
+  box-shadow:0 0 9px rgba(255,255,255,.8),0 0 22px rgba(132,111,255,.8);
+  animation: revealLineDown .78s cubic-bezier(.3,.7,.2,1) forwards;
+}
+@keyframes cutoutRevealDown { from { clip-path: inset(0 0 100% 0); } to { clip-path: inset(0 0 0 0); } }
+@keyframes revealLineDown { from { top:0%; } to { top:calc(100% - 3px); } }
+
+/* thinner, cleaner scanner while inference is running */
+.scan-line {
+  height:1.5px;
+  animation-duration:.92s;
+  box-shadow:0 0 8px rgba(255,255,255,.7),0 0 18px rgba(132,111,255,.68);
+}
+.scan-glow { height:14%; animation-duration:.92s; opacity:.55; }
+.status.revealing { background:rgba(81,65,184,.92); }

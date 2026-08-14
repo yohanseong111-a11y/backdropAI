@@ -1,4 +1,4 @@
-const CACHE = "backdropai-shell-v1";
+const CACHE = "backdropai-shell-v3";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest"];
 
 self.addEventListener("install", (event) => {

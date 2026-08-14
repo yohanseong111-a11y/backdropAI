@@ -2,7 +2,7 @@
 import "./style.css";
 import "./editor.css";
 import JSZip from "jszip";
-import { removeBackground } from "@imgly/background-removal";
+import removeBackground, { preload } from "@imgly/background-removal";
 
 const state = {
   items: [],
@@ -31,8 +31,8 @@ app.innerHTML = `
   <section class="hero card">
     <div class="hero-copy">
       <div class="eyebrow">PRIVATE • IN-BROWSER</div>
-      <h1>Cleaner cutouts, in bulk.</h1>
-      <p>Remove backgrounds from multiple photos, fix tricky edges with Smart Cutout, apply one replacement background, then export the whole batch.</p>
+      <h1>Remove 1 background or 100 in a whiff.</h1>
+      <p>Fast bulk cutouts with a live scan reveal, one-click background replacement, and mouse-or-finger cutout cleanup when an edge needs fixing.</p>
     </div>
     <label class="upload-zone">
       <input id="photoInput" type="file" accept="image/*" multiple hidden />
@@ -163,14 +163,18 @@ function addFiles(fileList) {
   if (files.length) { workspace.classList.remove("hidden"); renderGallery(); }
 }
 function statusText(item) {
-  return item.status === "processing" ? "Removing…" : item.status === "done" ? "Ready" : item.status === "failed" ? "Failed" : "Waiting";
+  return item.status === "processing" ? "Removing…" : item.status === "revealing" ? "Cleaned" : item.status === "done" ? "Ready" : item.status === "failed" ? "Failed" : "Waiting";
 }
 function renderGallery() {
   $("#batchCount").textContent = `${state.items.length} photo${state.items.length === 1 ? "" : "s"}`;
   gallery.innerHTML = state.items.map((item,index)=>`
     <article class="photo-card">
-      <div class="preview-wrap ${item.status === "processing" ? "scanning" : ""}">
-        <canvas class="preview-canvas" data-index="${index}"></canvas>
+      <div class="preview-wrap ${item.status === "processing" ? "scanning" : ""} ${item.status === "revealing" ? "revealing" : ""}">
+        ${item.status === "revealing" ? `
+          <img class="reveal-original" src="${item.originalURL}" alt="" />
+          <img class="reveal-cutout" src="${item.cutoutURL}" alt="" />
+          <div class="reveal-scan-line"></div>
+        ` : `<canvas class="preview-canvas" data-index="${index}"></canvas>`}
         ${item.status === "processing" ? `<div class="scan-line"></div><div class="scan-glow"></div>` : ""}
         <div class="status ${item.status}">${statusText(item)}</div>
       </div>
@@ -189,15 +193,38 @@ function renderGallery() {
   requestAnimationFrame(renderAllPreviews);
 }
 
-function removalConfig(mode, progress) {
-  const hasGPU = !!navigator.gpu;
-  if (mode === "best") {
-    return { model: "isnet", device: hasGPU ? "gpu" : "cpu", proxyToWorker: true, output: {format:"image/png",quality:1,type:"foreground"}, progress };
+function removalConfig(mode, progress, forceCPU = false) {
+  const hasGPU = !!navigator.gpu && !forceCPU;
+  const model = mode === "best" ? "isnet" : mode === "fast" ? "isnet_quint8" : "isnet_fp16";
+  return {
+    model,
+    device: hasGPU ? "gpu" : "cpu",
+    output: { format: "image/png", quality: 1, type: "foreground" },
+    progress
+  };
+}
+
+async function removeStable(file, mode, progress) {
+  // Try WebGPU first when supported, then automatically fall back to CPU.
+  try {
+    return await removeBackground(file, removalConfig(mode, progress, false));
+  } catch (gpuError) {
+    if (!navigator.gpu) throw gpuError;
+    console.warn("GPU removal failed; retrying on CPU", gpuError);
+    return await removeBackground(file, removalConfig(mode, progress, true));
   }
-  if (mode === "fast") {
-    return { model: "isnet_quint8", device: hasGPU ? "gpu" : "cpu", proxyToWorker: true, output: {format:"image/png",quality:1,type:"foreground"}, progress };
-  }
-  return { model: "isnet_fp16", device: hasGPU ? "gpu" : "cpu", proxyToWorker: true, output: {format:"image/png",quality:1,type:"foreground"}, progress };
+}
+
+function preloadRemovalModel() {
+  const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 250));
+  idle(async () => {
+    try {
+      await preload(removalConfig("smart", () => {}, false));
+      document.documentElement.dataset.removerReady = "true";
+    } catch (error) {
+      console.warn("Background model preload skipped", error);
+    }
+  });
 }
 
 async function alphaStats(blob) {
@@ -220,19 +247,23 @@ async function removeOne(item, queueTotal) {
         $("#progressText").textContent=`Loading removal model… ${Math.round(current/total*100)}%`;
       }
     };
-    let blob = await removeBackground(item.file, removalConfig(state.quality, progress));
+    let blob = await removeStable(item.file, state.quality, progress);
     if (state.quality === "smart") {
       const stats = await alphaStats(blob);
       // If the balanced pass looks suspiciously empty, automatically retry with the full-precision model.
       if (stats.strong < 0.025 || stats.visible < 0.04) {
         $("#progressText").textContent="Cutout looked too aggressive — retrying with Best quality…";
-        blob = await removeBackground(item.file, removalConfig("best", progress));
+        blob = await removeStable(item.file, "best", progress);
       }
     }
     item.cutoutBlob=blob;
     if(item.cutoutURL)URL.revokeObjectURL(item.cutoutURL);
     item.cutoutURL=URL.createObjectURL(blob);
-    item.status="done"; item.error=null; state.completed++;
+    item.status="revealing"; item.error=null;
+    renderGallery();
+    // One clean final sweep: the transparent cutout replaces the original exactly behind the scan line.
+    await new Promise(resolve => setTimeout(resolve, 820));
+    item.status="done"; state.completed++;
   } catch(error) {
     console.error(error); item.status="failed"; item.error=error?.message||"Background removal failed"; state.failed++;
   }
@@ -245,7 +276,8 @@ async function removeAllBackgrounds() {
   if(!queue.length){toast("All backgrounds are already removed.");return;}
   state.processing=true; state.completed=0; state.failed=0;
   $("#removeAllBtn").disabled=true;$("#progressWrap").classList.remove("hidden");
-  const concurrency = navigator.gpu ? 2 : 1;
+  const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+  const concurrency = isIOS ? 1 : (navigator.gpu ? 2 : 1);
   let cursor=0;
   async function worker(){while(cursor<queue.length){const item=queue[cursor++];await removeOne(item,queue.length);}}
   await Promise.all(Array.from({length:Math.min(concurrency,queue.length)},worker));
@@ -334,7 +366,7 @@ async function smartRecover(){
   const e=state.editor;if(!e)return;
   $("#smartRecover").disabled=true;$("#smartRecover").textContent="Checking…";
   try{
-    const blob=await removeBackground(e.item.file,removalConfig("best",()=>{}));
+    const blob=await removeStable(e.item.file,"best",()=>{});
     const img=await imageFromURL(URL.createObjectURL(blob));
     // Union the high-quality pass with current mask: useful when the initial cutout removed too much.
     e.ctx.save();e.ctx.globalCompositeOperation="source-over";e.ctx.drawImage(img,0,0,e.canvas.width,e.canvas.height);e.ctx.restore();pushHistory();
@@ -396,4 +428,5 @@ $("#cutoutModal").onclick=e=>{if(e.target.id==="cutoutModal")closeEditor();};
 let installPrompt=null;
 window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();installPrompt=e;$("#installBtn").classList.remove("hidden");});
 $("#installBtn").onclick=async()=>{if(!installPrompt){toast("On iPhone: Safari → Share → Add to Home Screen");return;}installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;$("#installBtn").classList.add("hidden");};
+preloadRemovalModel();
 if("serviceWorker" in navigator)window.addEventListener("load",()=>navigator.serviceWorker.register("./sw.js").catch(console.warn));
