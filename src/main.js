@@ -2,7 +2,7 @@
 import "./style.css";
 import "./editor.css";
 import JSZip from "jszip";
-import removeBackground, { preload } from "@imgly/background-removal";
+import { removeBackground, preload } from "@imgly/background-removal";
 
 const state = {
   items: [],
