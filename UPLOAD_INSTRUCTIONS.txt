@@ -1,0 +1,15 @@
+BACKDROPAI GITHUB UPLOAD
+
+Open this folder and drag EVERYTHING INSIDE it into GitHub.
+
+You should upload:
+- index.html
+- package.json
+- vite.config.js
+- README.md
+- .gitignore
+- src folder
+- public folder
+- .github folder
+
+Then click Commit changes.

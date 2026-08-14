@@ -1,0 +1,22 @@
+{
+  "name": "BackdropAI Bulk Background Studio",
+  "short_name": "BackdropAI",
+  "description": "Bulk background removal and replacement directly in your browser.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#0b0b0d",
+  "theme_color": "#0b0b0d",
+  "icons": [
+    {
+      "src": "./icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "./icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "scope": "./"
+}
