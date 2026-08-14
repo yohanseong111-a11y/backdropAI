@@ -53,13 +53,8 @@ app.innerHTML = `
       <div class="section-title">1. Background removal</div>
       <div class="quality-row">
         <span>Removal mode</span>
-        <div class="single-mode-badge">Best automatic</div>
+        <div class="single-mode-badge">Backshot Engine <span id="engineStatus">Preparing…</span></div>
       </div>
-      <div class="api-key-row">
-        <input id="photoroomKey" type="password" autocomplete="off" placeholder="PhotoRoom API key" />
-        <button id="savePhotoRoomKey" class="ghost small-btn" type="button">Test & use key</button>
-      </div>
-      <p id="apiKeyStatus" class="small api-key-status">Best automatic uses PhotoRoom precision when connected. Your key is kept only for this browser session.</p>
       <div class="remove-button-stack">
         <button id="removeSelectedBtn" class="primary">Remove selected backgrounds</button>
         <button id="removeAllBtn" class="ghost remove-all-btn">Remove all backgrounds</button>
@@ -68,7 +63,7 @@ app.innerHTML = `
         <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
         <div id="progressText" class="small"></div>
       </div>
-      <p class="privacy-note">Best automatic uses PhotoRoom precision for clean product-safe cutouts.</p>
+      <p class="privacy-note">Runs locally in your browser. No API key, no per-image fees, and no uploads.</p>
 
       <div class="divider"></div>
       <div class="section-title">2. New background</div>
@@ -222,7 +217,11 @@ function addFiles(fileList) {
       status: "waiting", error: null, adj: DEFAULT_ADJ()
     });
   }
-  if (files.length) { workspace.classList.remove("hidden"); renderGallery(); updateSelectionUI(); }
+  if (files.length) {
+    workspace.classList.remove("hidden");
+    renderGallery();
+    updateSelectionUI();
+  }
 }
 function statusText(item) {
   return item.status === "processing" ? "Removing…" : item.status === "revealing" ? "Cleaned" : item.status === "done" ? "Ready" : item.status === "failed" ? "Failed" : "Waiting";
@@ -425,7 +424,7 @@ async function alphaStats(blob) {
 
 async function cleanCutoutEdges(blob){
   // Matting-style refinement: preserve the model's foreground alpha and clean only the boundary.
-  // PhotoRoom's own API docs note that matting is what improves cutout edges over a raw mask.
+  // BackshotAI's own API docs note that matting is what improves cutout edges over a raw mask.
   const bmp=await createImageBitmap(blob),c=document.createElement("canvas");
   c.width=bmp.width;c.height=bmp.height;
   const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0);
@@ -732,81 +731,78 @@ async function protectSubjectWithBackgroundMask(file,cutout,maskInfo){
 }
 
 
-const PHOTOROOM_ENDPOINT="https://sdk.photoroom.com/v1/segment";
+let removalWorker=null;
+let removalSeq=0;
+const removalPending=new Map();
 
-function getPhotoRoomKey(){
-  return sessionStorage.getItem("backshotai-photoroom-key")||"";
-}
-
-function updatePhotoRoomKeyStatus(){
-  const status=$("#apiKeyStatus");
-  if(!status)return;
-  status.textContent=getPhotoRoomKey()
-    ?"PhotoRoom precision is ready for this session."
-    :"Best automatic needs your PhotoRoom API key.";
-}
-
-async function verifyPhotoRoomKey(key){
-  const response=await fetch("https://image-api.photoroom.com/v2/account",{
-    headers:{"X-Api-Key":key}
-  });
-  if(!response.ok){
-    const err=new Error(`PhotoRoom account check failed (${response.status})`);
-    err.status=response.status;
-    throw err;
-  }
-  return await response.json();
-}
-
-
-async function removeWithPhotoRoom(file,mode){
-  const apiKey=getPhotoRoomKey();
-  if(!apiKey)throw new Error("PHOTOROOM_KEY_MISSING");
-
-  const form=new FormData();
-  form.append("image_file",file);
-  form.append("format","png");
-  form.append("channels","rgba");
-  form.append("crop","false");
-  // HD is materially quicker for normal editing previews; full keeps original resolution.
-  form.append("size",mode==="best"?"full":"hd");
-  // Do not enable green-screen despill here: PhotoRoom notes that despill can alter subject colours.
-  form.append("despill","false");
-
-  const controller=new AbortController();
-  const timeout=setTimeout(()=>controller.abort(),90000);
-  try{
-    const response=await fetch(PHOTOROOM_ENDPOINT,{
-      method:"POST",
-      headers:{"X-Api-Key":apiKey},
-      body:form,
-      signal:controller.signal
-    });
-    if(!response.ok){
-      let detail="";
-      try{detail=await response.text();}catch{}
-      const err=new Error(`PhotoRoom ${response.status}${detail?`: ${detail.slice(0,160)}`:""}`);
-      err.status=response.status;
-      throw err;
+function getRemovalWorker(){
+  if(removalWorker)return removalWorker;
+  removalWorker=new Worker(new URL("./removal-worker.js",import.meta.url),{type:"module"});
+  removalWorker.onmessage=e=>{
+    const msg=e.data||{};
+    const job=removalPending.get(msg.id);
+    if(msg.type==="progress"){
+      if(job?.onProgress)job.onProgress(msg);
+      return;
     }
-    return await response.blob();
-  } finally {
-    clearTimeout(timeout);
-  }
+    if(!job)return;
+    if(msg.type==="done"){
+      removalPending.delete(msg.id);
+      job.resolve(msg.blob);
+    }else if(msg.type==="error"){
+      removalPending.delete(msg.id);
+      job.reject(new Error(msg.error||"Removal failed"));
+    }
+  };
+  removalWorker.onerror=e=>console.error("Backshot Engine worker error",e);
+  return removalWorker;
+}
+
+
+
+let engineWarmStarted=false;
+function warmBackshotEngine(){
+  if(engineWarmStarted)return;
+  engineWarmStarted=true;
+  const id=`warm-${Date.now()}`;
+  const worker=getRemovalWorker();
+  const status=$("#engineStatus");
+  if(status)status.textContent="Downloading AI…";
+  const handler=e=>{
+    const msg=e.data||{};
+    if(msg.id!==id)return;
+    if(msg.type==="progress"&&msg.stage==="load"&&status){
+      status.textContent=`Loading ${Math.round(msg.progress||0)}%`;
+    }else if(msg.type==="ready"){
+      worker.removeEventListener("message",handler);
+      if(status)status.textContent=msg.acceleration==="webgpu"?"AI Ready ✓ GPU":"AI Ready ✓";
+    }else if(msg.type==="error"){
+      worker.removeEventListener("message",handler);
+      engineWarmStarted=false;
+      if(status)status.textContent="Loads on Remove";
+    }
+  };
+  worker.addEventListener("message",handler);
+  worker.postMessage({type:"warm",id});
+}
+
+function removeWithBackshotEngine(file,onProgress){
+  return new Promise((resolve,reject)=>{
+    const id=++removalSeq;
+    removalPending.set(id,{resolve,reject,onProgress});
+    getRemovalWorker().postMessage({type:"remove",id,file});
+  });
 }
 
 async function chooseSafeCutout(file){
-  $("#progressText").textContent="Removing background…";
-  let result=await removeWithPhotoRoom(file,"smart");
-
-  // If the returned subject looks implausibly tiny or fragmented,
-  // retry once at full resolution automatically.
-  const shape=await cutoutShapeStats(result);
-  if(shape.visible<0.22 || shape.largestShare<0.78){
-    $("#progressText").textContent="Refining cutout…";
-    result=await removeWithPhotoRoom(file,"best");
-  }
-  return result;
+  $("#progressText").textContent="Backshot Engine: starting removal…";
+  return removeWithBackshotEngine(file,msg=>{
+    if(msg.stage==="load"&&Number.isFinite(msg.progress)){
+      $("#progressText").textContent=`Backshot Engine: loading ${Math.round(msg.progress)}%`;
+    }else if(msg.stage==="remove"){
+      $("#progressText").textContent="Backshot Engine: removing background…";
+    }
+  });
 }
 
 function nextFrame(){return new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));}
@@ -830,13 +826,13 @@ async function removeOne(item, queueTotal) {
     console.error(error);
     item.status="failed";
     if(error?.message==="PHOTOROOM_KEY_MISSING"){
-      item.error="Add your PhotoRoom API key or switch to Fast mode.";
+      item.error="Add your BackshotAI API key or switch to Fast mode.";
     }else if(error?.status===402){
-      item.error="PhotoRoom API credits are empty.";
+      item.error="BackshotAI API credits are empty.";
     }else if(error?.status===401||error?.status===403){
-      item.error="PhotoRoom API key was rejected.";
+      item.error="BackshotAI API key was rejected.";
     }else if(error?.name==="AbortError"){
-      item.error="PhotoRoom request timed out.";
+      item.error="BackshotAI request timed out.";
     }else{
       item.error=error?.message||"Background removal failed";
     }
@@ -846,19 +842,13 @@ async function removeOne(item, queueTotal) {
 }
 async function processRemovalQueue(queue,label){
   if(state.processing)return;
-  if(!getPhotoRoomKey()){
-    toast("Add and verify your PhotoRoom API key first.");
-    $("#photoroomKey")?.focus();
-    return;
-  }
   queue=queue.filter(i=>!i.cutoutBlob);
   if(!queue.length){toast(`${label} already have backgrounds removed.`);return;}
   state.processing=true;state.completed=0;state.failed=0;
   $("#removeSelectedBtn").disabled=true;$("#removeAllBtn").disabled=true;$("#progressWrap").classList.remove("hidden");
 
   // Real bulk mode: run several photos at once, but cap concurrency to avoid crashing phones.
-  const mobile=/iPad|iPhone|iPod|Android/i.test(navigator.userAgent);
-  let concurrency=mobile?3:5;
+  const concurrency=1;
 
   let cursor=0;
   async function worker(){
@@ -1025,37 +1015,6 @@ $("#dragGuideGotIt").onclick=()=>{dragGuide.classList.add("guide-dismiss");local
 $("#removeSelectedBtn").onclick=removeSelectedBackgrounds;
 $("#removeAllBtn").onclick=removeAllBackgrounds;
 $("#downloadSelectedBtn").onclick=downloadSelected;$("#downloadAllBtn").onclick=downloadAll;
-$("#savePhotoRoomKey").onclick=async()=>{
-  const btn=$("#savePhotoRoomKey");
-  const key=$("#photoroomKey").value.trim();
-  if(!key){
-    sessionStorage.removeItem("backshotai-photoroom-key");
-    updatePhotoRoomKeyStatus();
-    toast("Enter a PhotoRoom API key first.");
-    $("#photoroomKey").focus();
-    return;
-  }
-  btn.disabled=true;btn.textContent="Checking…";
-  try{
-    const account=await verifyPhotoRoomKey(key);
-    sessionStorage.setItem("backshotai-photoroom-key",key);
-    $("#photoroomKey").value="";
-    const available=account?.images?.available;
-    $("#apiKeyStatus").textContent=Number.isFinite(available)
-      ? `PhotoRoom connected • ${available} edits available.`
-      : "PhotoRoom connected and ready.";
-    toast("PhotoRoom precision enabled.");
-  }catch(err){
-    sessionStorage.removeItem("backshotai-photoroom-key");
-    if(err?.status===401||err?.status===403)toast("That PhotoRoom API key was rejected.");
-    else if(err?.status===402)toast("PhotoRoom credits are empty.");
-    else toast("Could not verify the PhotoRoom key.");
-    updatePhotoRoomKeyStatus();
-  }finally{
-    btn.disabled=false;btn.textContent="Test & use key";
-  }
-};
-updatePhotoRoomKeyStatus();
 $("#clearBtn").onclick=()=>{for(const i of state.items)cleanupItem(i);state.items=[];state.selected.clear();workspace.classList.add("hidden");gallery.innerHTML="";updateSelectionUI();};
 document.querySelectorAll(".seg").forEach(btn=>btn.onclick=()=>{state.bgMode=btn.dataset.bg;document.querySelectorAll(".seg").forEach(b=>b.classList.toggle("active",b===btn));$("#solidControls").classList.toggle("hidden",state.bgMode!=="solid");$("#backgroundPicker").classList.toggle("hidden",state.bgMode!=="image");renderAllPreviews();});
 $("#solidColor").oninput=e=>{state.solidColor=e.target.value;renderAllPreviews();};
@@ -1140,3 +1099,11 @@ function enableScrollChaining(el){
 }
 enableScrollChaining(document.querySelector(".controls"));
 enableScrollChaining(document.querySelector(".gallery-shell"));
+
+// Prepare/cache the AI model after the page becomes idle.
+// This never processes a photo; removal still starts only from the Remove buttons.
+if("requestIdleCallback" in window){
+  requestIdleCallback(()=>warmBackshotEngine(),{timeout:1800});
+}else{
+  setTimeout(()=>warmBackshotEngine(),1200);
+}
