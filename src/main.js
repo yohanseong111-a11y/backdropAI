@@ -3,7 +3,11 @@ import "./editor.css";
 import JSZip from "jszip";
 import { removeBackground, preload } from "@imgly/background-removal";
 
-const DEFAULT_ADJ = () => ({ scale: 1, offsetX: 0, offsetY: 0, brightness: 100, contrast: 100, saturation: 100 });
+const DEFAULT_ADJ = () => ({
+  scale: 1, offsetX: 0, offsetY: 0,
+  brightness: 100, contrast: 100, saturation: 100,
+  shadow: { enabled: true, opacity: 0.22, blur: 24, offsetY: 18 }
+});
 
 const state = {
   items: [],
@@ -12,7 +16,6 @@ const state = {
   backgroundName: "",
   bgMode: "transparent",
   solidColor: "#ffffff",
-  shadow: { enabled: true, opacity: 0.22, blur: 24, offsetY: 18 },
   processing: false,
   completed: 0,
   failed: 0,
@@ -268,11 +271,21 @@ function updateSelectionUI(){const ds=$("#downloadSelectedBtn");if(ds)ds.disable
   if(first){
     $("#scaleRange").value=first.adj.scale; $("#xRange").value=first.adj.offsetX; $("#yRange").value=first.adj.offsetY;
     $("#brightnessRange").value=first.adj.brightness; $("#contrastRange").value=first.adj.contrast; $("#saturationRange").value=first.adj.saturation;
+    const shadowCfg=first.adj.shadow||{enabled:true,opacity:.22,blur:24,offsetY:18};
+    $("#shadowEnabled").checked=shadowCfg.enabled; $("#shadowOpacity").value=shadowCfg.opacity; $("#shadowBlur").value=shadowCfg.blur; $("#shadowY").value=shadowCfg.offsetY;
   }
 }
 function applyToSelected(key,value){
   const items=selectedItems(); if(!items.length){toast("Select one or more photos first.");return;}
   for(const item of items)item.adj[key]=value;
+  renderAllPreviews();
+}
+function applyShadowToSelected(key,value){
+  const items=selectedItems(); if(!items.length){toast("Select one or more photos first.");return;}
+  for(const item of items){
+    item.adj.shadow ||= {enabled:true,opacity:.22,blur:24,offsetY:18};
+    item.adj.shadow[key]=value;
+  }
   renderAllPreviews();
 }
 
@@ -314,30 +327,38 @@ async function alphaStats(blob) {
 }
 
 async function cleanCutoutEdges(blob){
-  const bmp=await createImageBitmap(blob), c=document.createElement("canvas");c.width=bmp.width;c.height=bmp.height;
+  const bmp=await createImageBitmap(blob),c=document.createElement("canvas");
+  c.width=bmp.width;c.height=bmp.height;
   const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0);
   const img=ctx.getImageData(0,0,c.width,c.height),d=img.data,w=c.width,h=c.height;
-  const alpha=new Uint8Array(w*h);for(let i=0,p=3;i<alpha.length;i++,p+=4)alpha[i]=d[p];
-  // Conservative 1px edge decontamination: only modify semi-transparent boundary pixels.
+  const alpha=new Uint8Array(w*h);
+  for(let i=0,p=3;i<alpha.length;i++,p+=4)alpha[i]=d[p];
+  const outA=new Uint8Array(alpha);
+
   for(let y=1;y<h-1;y++){
     for(let x=1;x<w-1;x++){
-      const i=y*w+x,a=alpha[i];if(a===0||a===255)continue;
-      const minA=Math.min(alpha[i-1],alpha[i+1],alpha[i-w],alpha[i+w]);
-      let out=a;
-      if(minA<20 && a<215) out=Math.max(0,Math.round((a-24)*0.88));
-      if(a<28) out=0;
-      d[i*4+3]=out;
-      // Pull bright fringe colour toward a nearby opaque subject pixel.
-      if(out>0 && out<210){
-        const candidates=[i-1,i+1,i-w,i+w,i-w-1,i-w+1,i+w-1,i+w+1];
-        let best=-1,bestA=0;for(const n of candidates){if(alpha[n]>bestA){bestA=alpha[n];best=n;}}
-        if(best>=0&&bestA>225){const mix=(210-out)/210*.48;for(let k=0;k<3;k++)d[i*4+k]=Math.round(d[i*4+k]*(1-mix)+d[best*4+k]*mix);}
+      const i=y*w+x,a=alpha[i];if(a===0)continue;
+      let transparent=0,best=-1,bestA=0;
+      for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){
+        if(!ox&&!oy)continue;
+        const n=(y+oy)*w+x+ox,na=alpha[n];
+        if(na<18)transparent++;
+        if(na>bestA){bestA=na;best=n;}
+      }
+      if(transparent>=4)outA[i]=Math.min(a,48);
+      else if(transparent>=2)outA[i]=Math.min(a,118);
+      else if(transparent===1)outA[i]=Math.min(a,190);
+      if(a<24)outA[i]=0;
+      if(outA[i]>0&&outA[i]<225&&best>=0&&bestA>235){
+        const mix=Math.min(.68,(225-outA[i])/225*.7);
+        for(let k=0;k<3;k++)d[i*4+k]=Math.round(d[i*4+k]*(1-mix)+d[best*4+k]*mix);
       }
     }
-    // Yield regularly so the scanner and touch UI keep animating on large phone photos.
-    if(y%96===0) await new Promise(r=>setTimeout(r,0));
+    if(y%96===0)await new Promise(r=>setTimeout(r,0));
   }
-  ctx.putImageData(img,0,0);return await new Promise(res=>c.toBlob(res,"image/png",1));
+  for(let i=0;i<outA.length;i++)d[i*4+3]=outA[i];
+  ctx.putImageData(img,0,0);
+  return await new Promise(res=>c.toBlob(res,"image/png",1));
 }
 
 async function chooseSafeCutout(file, mode, progress){
@@ -406,7 +427,12 @@ async function drawComposite(canvas,item,exportSize=null){
   if(state.bgMode==="solid"){ctx.fillStyle=state.solidColor;ctx.fillRect(0,0,tw,th);}else if(state.bgMode==="image"&&state.backgroundURL){drawCover(ctx,await imageFromURL(state.backgroundURL),tw,th);}
   const a=item.adj||DEFAULT_ADJ(),dw=tw*a.scale,dh=th*a.scale,x=(tw-dw)/2+tw*(a.offsetX/100),y=(th-dh)/2+th*(a.offsetY/100);
   ctx.save();ctx.filter=`brightness(${a.brightness}%) contrast(${a.contrast}%) saturate(${a.saturation}%)`;
-  if(state.shadow.enabled&&item.cutoutURL){ctx.shadowColor=`rgba(0,0,0,${state.shadow.opacity})`;ctx.shadowBlur=state.shadow.blur*(tw/Math.max(900,tw));ctx.shadowOffsetY=state.shadow.offsetY*(th/Math.max(900,th));}
+  const shadowCfg=a.shadow||{enabled:true,opacity:.22,blur:24,offsetY:18};
+  if(shadowCfg.enabled&&item.cutoutURL){
+    ctx.shadowColor=`rgba(0,0,0,${shadowCfg.opacity})`;
+    ctx.shadowBlur=shadowCfg.blur*(tw/Math.max(900,tw));
+    ctx.shadowOffsetY=shadowCfg.offsetY*(th/Math.max(900,th));
+  }
   ctx.drawImage(subject,x,y,dw,dh);ctx.restore();
 }
 async function renderAllPreviews(){for(const canvas of document.querySelectorAll(".preview-canvas")){const item=state.items[Number(canvas.dataset.index)];if(!item)continue;try{const img=await imageFromURL(item.cutoutURL||item.originalURL),ratio=(img.naturalHeight||img.height)/(img.naturalWidth||img.width),w=Math.max(260,canvas.parentElement.clientWidth*2);await drawComposite(canvas,item,{width:Math.round(w),height:Math.round(w*ratio)});}catch{}}}
@@ -442,13 +468,46 @@ function paintLine(a,b){const dist=Math.hypot(b.x-a.x,b.y-a.y),step=Math.max(2,b
 function paintAt(p){const e=state.editor,r=brushRadius(),ctx=e.ctx;ctx.save();if(e.mode==="erase"){ctx.globalCompositeOperation="destination-out";ctx.fillStyle="#000";ctx.beginPath();ctx.arc(p.x,p.y,r,0,Math.PI*2);ctx.fill();}else{ctx.globalCompositeOperation="source-over";ctx.beginPath();ctx.arc(p.x,p.y,r,0,Math.PI*2);ctx.clip();const temp=document.createElement("canvas");temp.width=e.canvas.width;temp.height=e.canvas.height;temp.getContext("2d").putImageData(e.originalData,0,0);ctx.drawImage(temp,0,0);}ctx.restore();}
 
 function assistedTap(p){
-  const e=state.editor,w=e.canvas.width,h=e.canvas.height,x0=Math.max(0,Math.min(w-1,Math.round(p.x))),y0=Math.max(0,Math.min(h-1,Math.round(p.y))),start=y0*w+x0;
-  const cur=e.ctx.getImageData(0,0,w,h),cd=cur.data,od=e.originalData.data,seed=[od[start*4],od[start*4+1],od[start*4+2]],visited=new Uint8Array(w*h),stack=[start],region=[];
-  const tolerance=e.mode==="erase"?58:48,maxRegion=Math.round(w*h*.34);
-  while(stack.length&&region.length<maxRegion){const i=stack.pop();if(visited[i])continue;visited[i]=1;const x=i%w,y=(i/w)|0,off=i*4,alpha=cd[off+3];if(e.mode==="erase"&&alpha<6)continue;if(e.mode==="restore"&&alpha>245)continue;const dr=od[off]-seed[0],dg=od[off+1]-seed[1],db=od[off+2]-seed[2],dist=Math.sqrt(dr*dr+dg*dg+db*db);if(dist>tolerance)continue;region.push(i);if(x>0)stack.push(i-1);if(x<w-1)stack.push(i+1);if(y>0)stack.push(i-w);if(y<h-1)stack.push(i+w);}
-  if(region.length<2){toast("Try tapping directly on the missed area.");return;}
-  if(e.mode==="erase"){for(const i of region)cd[i*4+3]=0;}else{for(const i of region){const o=i*4;cd[o]=od[o];cd[o+1]=od[o+1];cd[o+2]=od[o+2];cd[o+3]=od[o+3];}}
-  e.ctx.putImageData(cur,0,0);pushHistory();toast(`${e.mode==="erase"?"Removed":"Restored"} connected area.`);
+  const e=state.editor,w=e.canvas.width,h=e.canvas.height;
+  const x0=Math.max(0,Math.min(w-1,Math.round(p.x))),y0=Math.max(0,Math.min(h-1,Math.round(p.y)));
+  const cur=e.ctx.getImageData(0,0,w,h),cd=cur.data,od=e.originalData.data;
+  let sr=0,sg=0,sb=0,sc=0;
+  const seedRadius=Math.max(2,Math.round(Math.min(w,h)/350));
+  for(let yy=Math.max(0,y0-seedRadius);yy<=Math.min(h-1,y0+seedRadius);yy++){
+    for(let xx=Math.max(0,x0-seedRadius);xx<=Math.min(w-1,x0+seedRadius);xx++){
+      const o=(yy*w+xx)*4;sr+=od[o];sg+=od[o+1];sb+=od[o+2];sc++;
+    }
+  }
+  const seed=[sr/sc,sg/sc,sb/sc],seedLum=.299*seed[0]+.587*seed[1]+.114*seed[2];
+  const visited=new Uint8Array(w*h),stack=[y0*w+x0],region=[];
+  const maxRegion=Math.round(w*h*.28),maxRadius=Math.max(70,Math.min(w,h)*.42);
+  const colourTol=e.mode==="erase"?82:72,lumTol=e.mode==="erase"?72:62;
+
+  while(stack.length&&region.length<maxRegion){
+    const i=stack.pop();if(visited[i])continue;visited[i]=1;
+    const x=i%w,y=(i/w)|0;if(Math.hypot(x-x0,y-y0)>maxRadius)continue;
+    const o=i*4,a=cd[o+3];
+    if(e.mode==="erase"&&a<5)continue;
+    if(e.mode==="restore"&&a>250)continue;
+    const r=od[o],g=od[o+1],b=od[o+2],dr=r-seed[0],dg=g-seed[1],db=b-seed[2];
+    const colour=Math.sqrt(dr*dr*.30+dg*dg*.59+db*db*.11),lum=.299*r+.587*g+.114*b;
+    if(colour>colourTol||Math.abs(lum-seedLum)>lumTol)continue;
+    region.push(i);
+    for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){
+      if(!ox&&!oy)continue;const nx=x+ox,ny=y+oy;if(nx>=0&&nx<w&&ny>=0&&ny<h)stack.push(ny*w+nx);
+    }
+  }
+  if(region.length<3){toast("Tap inside the area you want to change.");return;}
+  const expanded=new Set(region);
+  for(const i of region){
+    const x=i%w,y=(i/w)|0;
+    for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){
+      const nx=x+ox,ny=y+oy;if(nx>=0&&nx<w&&ny>=0&&ny<h)expanded.add(ny*w+nx);
+    }
+  }
+  if(e.mode==="erase"){for(const i of expanded)cd[i*4+3]=0;}
+  else{for(const i of expanded){const o=i*4;cd[o]=od[o];cd[o+1]=od[o+1];cd[o+2]=od[o+2];cd[o+3]=od[o+3];}}
+  e.ctx.putImageData(cur,0,0);pushHistory();toast(`${e.mode==="erase"?"Removed":"Restored"} the selected area.`);
 }
 function pushHistory(){const e=state.editor;e.history.push(e.ctx.getImageData(0,0,e.canvas.width,e.canvas.height));if(e.history.length>18)e.history.shift();e.redo=[];updateEditorUI();}
 function undo(){const e=state.editor;if(e.history.length<=1)return;const cur=e.history.pop();e.redo.push(cur);e.ctx.putImageData(e.history[e.history.length-1],0,0);updateEditorUI();}
@@ -559,7 +618,10 @@ function finishDragSelection(e){
 gallery.addEventListener("pointerup",finishDragSelection);
 gallery.addEventListener("pointercancel",()=>{state.dragSelecting=false;state.dragMoved=false;dragSelectBox.classList.add("hidden");});
 
-$("#shadowEnabled").onchange=e=>{state.shadow.enabled=e.target.checked;renderAllPreviews();};$("#shadowOpacity").oninput=e=>{state.shadow.opacity=Number(e.target.value);renderAllPreviews();};$("#shadowBlur").oninput=e=>{state.shadow.blur=Number(e.target.value);renderAllPreviews();};$("#shadowY").oninput=e=>{state.shadow.offsetY=Number(e.target.value);renderAllPreviews();};
+$("#shadowEnabled").onchange=e=>applyShadowToSelected("enabled",e.target.checked);
+$("#shadowOpacity").oninput=e=>applyShadowToSelected("opacity",Number(e.target.value));
+$("#shadowBlur").oninput=e=>applyShadowToSelected("blur",Number(e.target.value));
+$("#shadowY").oninput=e=>applyShadowToSelected("offsetY",Number(e.target.value));
 $("#eraseTool").onclick=()=>{state.editor.mode="erase";updateEditorUI();};$("#restoreTool").onclick=()=>{state.editor.mode="restore";updateEditorUI();};$("#assistToggle").onchange=updateEditorUI;$("#undoEdit").onclick=undo;$("#redoEdit").onclick=redo;$("#smartRecover").onclick=smartRecover;$("#applyEdit").onclick=applyEditor;$("#closeEditor").onclick=closeEditor;$("#cutoutModal").onclick=e=>{if(e.target.id==="cutoutModal")closeEditor();};
 let installPrompt=null;window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();installPrompt=e;$("#installBtn").classList.remove("hidden");});$("#installBtn").onclick=async()=>{if(!installPrompt){toast("On iPhone: Safari → Share → Add to Home Screen");return;}installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;$("#installBtn").classList.add("hidden");};
 window.addEventListener("resize",()=>{if(state.editor)requestAnimationFrame(fitEditorCanvasToStage);});
@@ -569,6 +631,7 @@ preloadRemovalModel();if("serviceWorker" in navigator)window.addEventListener("l
 function enableScrollChaining(el){
   if(!el)return;
   el.addEventListener("wheel",e=>{
+    if(e.ctrlKey||e.metaKey)return;
     const up=e.deltaY<0,down=e.deltaY>0;
     const atTop=el.scrollTop<=0;
     const atBottom=Math.ceil(el.scrollTop+el.clientHeight)>=el.scrollHeight;
