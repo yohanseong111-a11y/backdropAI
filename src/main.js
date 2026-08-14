@@ -541,7 +541,7 @@ async function getBiRefNet(){
   if(!birefModelPromise){
     const modelId="onnx-community/BiRefNet_lite-ONNX";
     const device=navigator.gpu?"webgpu":"wasm";
-    const dtype=navigator.gpu?"fp16":"fp32";
+    const dtype=navigator.gpu?"fp16":"q4";
     $("#progressText").textContent="Loading precision cutout model…";
     birefModelPromise=AutoModel.from_pretrained(modelId,{device,dtype});
     birefProcessorPromise=AutoProcessor.from_pretrained(modelId);
@@ -637,12 +637,113 @@ async function conservativeCloseupFallback(file){
   return await new Promise(res=>full.toBlob(res,"image/png",1));
 }
 
-async function chooseSafeCutout(file,mode,progress){
-  if(mode==="fast"){
-    const quick=await removeStable(file,"fast",progress);
-    return cleanCutoutEdges(quick);
+
+async function buildConservativeBackgroundMask(file){
+  // High-confidence fast path. Learns the outer background, then only removes
+  // pixels connected to the frame edge. It never deletes disconnected centre objects.
+  const bmp=await createImageBitmap(file);
+  const maxSide=360,s=Math.min(1,maxSide/Math.max(bmp.width,bmp.height));
+  const w=Math.max(64,Math.round(bmp.width*s)),h=Math.max(64,Math.round(bmp.height*s));
+  const c=document.createElement("canvas");c.width=w;c.height=h;
+  const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0,w,h);
+  const img=ctx.getImageData(0,0,w,h),d=img.data;
+
+  const edge=[];
+  const band=Math.max(2,Math.round(Math.min(w,h)*.025));
+  const pushPix=(x,y)=>{const o=(y*w+x)*4;edge.push([d[o],d[o+1],d[o+2]]);};
+  for(let x=0;x<w;x+=2){for(let y=0;y<band;y++)pushPix(x,y);}
+  for(let y=0;y<h;y+=2){for(let x=0;x<band;x++)pushPix(x,y);for(let x=w-band;x<w;x++)pushPix(x,y);}
+  if(edge.length<50)return null;
+
+  // Robust median background colour.
+  const med=k=>{const a=edge.map(v=>v[k]).sort((a,b)=>a-b);return a[(a.length/2)|0];};
+  const seed=[med(0),med(1),med(2)];
+  let spread=0;
+  for(const p of edge)spread+=Math.hypot(p[0]-seed[0],p[1]-seed[1],p[2]-seed[2]);
+  spread/=edge.length;
+
+  // Only trust easy, reasonably consistent backgrounds.
+  if(spread>82)return null;
+  const tol=Math.max(42,Math.min(105,spread*1.9+32));
+
+  const cand=new Uint8Array(w*h);
+  for(let i=0;i<w*h;i++){
+    const o=i*4;
+    const dist=Math.hypot(d[o]-seed[0],d[o+1]-seed[1],d[o+2]-seed[2]);
+    if(dist<tol)cand[i]=1;
   }
 
+  const bg=new Uint8Array(w*h),q=[];
+  const add=(x,y)=>{const i=y*w+x;if(cand[i]&&!bg[i]){bg[i]=1;q.push(i);}};
+  for(let x=0;x<w;x++){add(x,0);add(x,h-1);}
+  for(let y=0;y<h;y++){add(0,y);add(w-1,y);}
+  for(let qi=0;qi<q.length;qi++){
+    const i=q[qi],x=i%w,y=(i/w)|0;
+    if(x>0)add(x-1,y);if(x<w-1)add(x+1,y);if(y>0)add(x,y-1);if(y<h-1)add(x,y+1);
+  }
+
+  let count=0;for(const v of bg)count+=v;
+  const ratio=count/(w*h);
+  if(ratio<.04||ratio>.62)return null;
+  return {bmp,bg,w,h,ratio};
+}
+
+async function applyBackgroundMask(file,maskInfo){
+  const {bmp,bg,w,h}=maskInfo;
+  const full=document.createElement("canvas");full.width=bmp.width;full.height=bmp.height;
+  const ctx=full.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0);
+  const out=ctx.getImageData(0,0,full.width,full.height),d=out.data;
+  for(let y=0;y<full.height;y++){
+    const sy=Math.min(h-1,Math.floor(y*h/full.height));
+    for(let x=0;x<full.width;x++){
+      const sx=Math.min(w-1,Math.floor(x*w/full.width));
+      if(bg[sy*w+sx])d[(y*full.width+x)*4+3]=0;
+    }
+    if(y%180===0)await new Promise(r=>setTimeout(r,0));
+  }
+  ctx.putImageData(out,0,0);
+  return await new Promise(res=>full.toBlob(res,"image/png",1));
+}
+
+async function protectSubjectWithBackgroundMask(file,cutout,maskInfo){
+  if(!maskInfo)return cutout;
+  const [orig,fg]=await Promise.all([createImageBitmap(file),createImageBitmap(cutout)]);
+  const {bg,w,h}=maskInfo;
+  const c=document.createElement("canvas");c.width=orig.width;c.height=orig.height;
+  const ctx=c.getContext("2d",{willReadFrequently:true});
+  ctx.drawImage(orig,0,0);const oi=ctx.getImageData(0,0,c.width,c.height);
+  ctx.clearRect(0,0,c.width,c.height);ctx.drawImage(fg,0,0,c.width,c.height);const fi=ctx.getImageData(0,0,c.width,c.height);
+  const od=oi.data,fd=fi.data;
+  for(let y=0;y<c.height;y++){
+    const sy=Math.min(h-1,Math.floor(y*h/c.height));
+    for(let x=0;x<c.width;x++){
+      const sx=Math.min(w-1,Math.floor(x*w/c.width)),o=(y*c.width+x)*4;
+      // Anything not confidently background gets preserved from the original.
+      if(!bg[sy*w+sx] && fd[o+3]<220){
+        od[o+3]=Math.max(fd[o+3],235);
+      }else{
+        od[o+3]=fd[o+3];
+      }
+    }
+    if(y%180===0)await new Promise(r=>setTimeout(r,0));
+  }
+  ctx.putImageData(oi,0,0);
+  return await new Promise(res=>c.toBlob(res,"image/png",1));
+}
+
+async function chooseSafeCutout(file,mode,progress){
+  // 1) First inspect the border. Easy plain/grass/studio backgrounds can be removed
+  // much faster without a heavy AI pass.
+  let bgMask=null;
+  try{bgMask=await buildConservativeBackgroundMask(file);}catch(e){console.warn("Background analysis skipped",e);}
+
+  if(mode!=="best" && bgMask){
+    $("#progressText").textContent="Removing simple background…";
+    const fast=await applyBackgroundMask(file,bgMask);
+    return cleanCutoutEdges(fast);
+  }
+
+  // 2) Harder scenes use BiRefNet precision.
   $("#progressText").textContent="Finding the complete product…";
   let primary;
   try{
@@ -652,11 +753,14 @@ async function chooseSafeCutout(file,mode,progress){
     primary=await removeStable(file,"best",progress);
   }
 
-  const shape=await cutoutShapeStats(primary);
+  // 3) Subject protection: if edge analysis found a plausible background, never allow
+  // the AI to delete large non-background regions inside the product.
+  if(bgMask){
+    primary=await protectSubjectWithBackgroundMask(file,primary,bgMask);
+  }
 
-  // A close-up product filling the frame should never collapse to a tiny strip.
-  // If that happens, use a conservative edge-connected background removal instead.
-  if(shape.visible<0.30 || shape.largestShare<0.82){
+  const shape=await cutoutShapeStats(primary);
+  if(shape.visible<0.28 || shape.largestShare<0.80){
     $("#progressText").textContent="Protecting close-up product…";
     try{
       const safe=await conservativeCloseupFallback(file);
@@ -666,7 +770,6 @@ async function chooseSafeCutout(file,mode,progress){
       }
     }catch(e){console.warn("Close-up fallback skipped",e);}
   }
-
   return cleanCutoutEdges(primary);
 }
 
@@ -703,7 +806,7 @@ async function processRemovalQueue(queue,label){
   const mem=Number(navigator.deviceMemory||4);
   const cores=Number(navigator.hardwareConcurrency||4);
   const mobile=/iPad|iPhone|iPod|Android/i.test(navigator.userAgent);
-  let concurrency=mobile?2:Math.min(4,Math.max(2,Math.floor(cores/3)));
+  let concurrency=mobile?2:Math.min(3,Math.max(2,Math.floor(cores/4)));
   if(mem<=3)concurrency=1;
   else if(mem<=5)concurrency=Math.min(concurrency,2);
 
