@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "lint": "node --check src/main.js && node --check src/removal-worker.js && node --check src/mask-safety.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@imgly/background-removal": "1.7.0",

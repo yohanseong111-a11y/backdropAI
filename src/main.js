@@ -1,5 +1,6 @@
 import "./style.css";
 import "./editor.css";
+import {chooseSafeCleanup} from "./mask-safety.js";
 import JSZip from "jszip";
 import { removeBackground, preload } from "@imgly/background-removal";
 
@@ -153,6 +154,11 @@ app.innerHTML = `
       <label class="brush-row">Brush <input id="brushSize" type="range" min="8" max="180" value="54" /></label>
       <button id="undoEdit" class="ghost small-btn">Undo</button>
       <button id="redoEdit" class="ghost small-btn">Redo</button>
+      <div class="tool-group" aria-label="Editor zoom">
+        <button id="zoomOutEditor" class="tool" type="button" aria-label="Zoom out">−</button>
+        <button id="fitEditor" class="tool" type="button">Fit</button>
+        <button id="zoomInEditor" class="tool" type="button" aria-label="Zoom in">＋</button>
+      </div>
       <button id="smartRecover" class="ghost small-btn">Re-check subject</button>
     </div>
     <div class="editor-stage">
@@ -570,6 +576,58 @@ async function removeWithBiRefNet(file){
   return await new Promise(res=>c.toBlob(res,"image/png",1));
 }
 
+async function cleanupDisconnectedSpecks(blob){
+  const bmp=await createImageBitmap(blob),c=document.createElement("canvas");c.width=bmp.width;c.height=bmp.height;
+  const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0);bmp.close?.();
+  const image=ctx.getImageData(0,0,c.width,c.height),alpha=new Uint8Array(c.width*c.height);
+  for(let i=0;i<alpha.length;i++)alpha[i]=image.data[i*4+3];
+  const cleaned=removeTinyForegroundIslands(alpha,c.width,c.height);
+  const safe=chooseSafeCleanup(alpha,cleaned,c.width,c.height);
+  for(let i=0;i<safe.length;i++)image.data[i*4+3]=safe[i];
+  ctx.putImageData(image,0,0);
+  return new Promise((resolve,reject)=>c.toBlob(b=>b?resolve(b):reject(new Error("Could not create cleaned cutout.")),"image/png",1));
+}
+
+async function brightResidualRatio(blob){
+  const bmp=await createImageBitmap(blob),max=280,scale=Math.min(1,max/Math.max(bmp.width,bmp.height));
+  const c=document.createElement("canvas");c.width=Math.max(1,Math.round(bmp.width*scale));c.height=Math.max(1,Math.round(bmp.height*scale));
+  const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0,c.width,c.height);bmp.close?.();
+  const d=ctx.getImageData(0,0,c.width,c.height).data;let bright=0,visible=0;
+  for(let i=0;i<d.length;i+=4){
+    if(d[i+3]<128)continue;visible++;
+    const maxC=Math.max(d[i],d[i+1],d[i+2]),minC=Math.min(d[i],d[i+1],d[i+2]);
+    if(maxC>178&&maxC-minC<52)bright++;
+  }
+  return bright/Math.max(1,visible);
+}
+
+async function refineBrightBackground(baseBlob,aiBlob){
+  const [base,ai]=await Promise.all([createImageBitmap(baseBlob),createImageBitmap(aiBlob)]);
+  const c=document.createElement("canvas");c.width=base.width;c.height=base.height;const ctx=c.getContext("2d",{willReadFrequently:true});
+  ctx.drawImage(base,0,0);const out=ctx.getImageData(0,0,c.width,c.height);
+  ctx.clearRect(0,0,c.width,c.height);ctx.drawImage(ai,0,0,c.width,c.height);const aid=ctx.getImageData(0,0,c.width,c.height).data;
+  base.close?.();ai.close?.();
+  for(let i=0;i<c.width*c.height;i++){
+    const o=i*4,maxC=Math.max(out.data[o],out.data[o+1],out.data[o+2]),minC=Math.min(out.data[o],out.data[o+1],out.data[o+2]);
+    if(out.data[o+3]>=128&&maxC>178&&maxC-minC<52&&aid[o+3]<40)out.data[o+3]=0;
+  }
+  ctx.putImageData(out,0,0);
+  return new Promise((resolve,reject)=>c.toBlob(b=>b?resolve(b):reject(new Error("Could not refine bright background.")),"image/png",1));
+}
+
+function rgbToHsv(r,g,b){
+  r/=255;g/=255;b/=255;
+  const max=Math.max(r,g,b),min=Math.min(r,g,b),delta=max-min;
+  let hue=0;
+  if(delta){
+    if(max===r)hue=60*(((g-b)/delta)%6);
+    else if(max===g)hue=60*((b-r)/delta+2);
+    else hue=60*((r-g)/delta+4);
+  }
+  if(hue<0)hue+=360;
+  return [hue,max?delta/max:0,max];
+}
+
 async function conservativeCloseupFallback(file){
   // Only remove a dominant border background connected to the outer edge.
   // This is intentionally conservative: when uncertain, keep the product.
@@ -593,6 +651,8 @@ async function conservativeCloseupFallback(file){
   // Median RGB gives a robust background seed even with texture such as grass.
   const med=k=>{const a=samples.map(v=>v[k]).sort((a,b)=>a-b);return a[(a.length/2)|0];};
   const seed=[med(0),med(1),med(2)];
+  const [seedHue,seedSat]=rgbToHsv(seed[0],seed[1],seed[2]);
+  const greenDominantSeed=seed[1]>seed[2]*1.05&&seed[1]>seed[0]*1.15;
 
   let spread=0;
   for(const p of samples)spread+=Math.hypot(p[0]-seed[0],p[1]-seed[1],p[2]-seed[2]);
@@ -603,14 +663,22 @@ async function conservativeCloseupFallback(file){
   for(let i=0;i<w*h;i++){
     const o=i*4;
     const dist=Math.hypot(d[o]-seed[0],d[o+1]-seed[1],d[o+2]-seed[2]);
-    if(dist<tol)candidate[i]=1;
+    const [hue,sat]=rgbToHsv(d[o],d[o+1],d[o+2]);
+    let hueDistance=Math.abs(hue-seedHue);hueDistance=Math.min(hueDistance,360-hueDistance);
+    // Saturated backgrounds such as grass are separated by hue as well as
+    // colour distance, preventing cyan/blue garments from joining the flood.
+    const hueCompatible=seedSat<.16||(sat>.10&&hueDistance<44);
+    const channelCompatible=!greenDominantSeed||(d[o+1]>=d[o+2]*.98&&d[o+1]>=d[o]*1.05);
+    if(dist<tol&&hueCompatible&&channelCompatible)candidate[i]=1;
   }
 
-  // Flood only from top/upper-side edge seeds, never from the whole frame.
+  // Flood background-colour candidates from every frame edge. Hue gating above
+  // keeps edge-touching garments, while reaching floor/grass regions split by
+  // sleeves, phones or props.
   const bg=new Uint8Array(w*h),q=[];
   const push=(x,y)=>{const i=y*w+x;if(candidate[i]&&!bg[i]){bg[i]=1;q.push(i);}};
-  for(let x=0;x<w;x++)push(x,0);
-  for(let y=0;y<Math.round(h*.35);y++){push(0,y);push(w-1,y);}
+  for(let x=0;x<w;x++){push(x,0);push(x,h-1);}
+  for(let y=0;y<h;y++){push(0,y);push(w-1,y);}
   for(let qi=0;qi<q.length;qi++){
     const i=q[qi],x=i%w,y=(i/w)|0;
     if(x>0)push(x-1,y);if(x<w-1)push(x+1,y);if(y>0)push(x,y-1);if(y<h-1)push(x,y+1);
@@ -618,6 +686,7 @@ async function conservativeCloseupFallback(file){
 
   let bgCount=0;for(const v of bg)bgCount+=v;
   const ratio=bgCount/(w*h);
+  if(new URLSearchParams(location.search).has("debugMasks"))document.documentElement.dataset.backgroundRatio=String(ratio);
   if(ratio<.025||ratio>.48)return null;
 
   const full=document.createElement("canvas");full.width=bmp.width;full.height=bmp.height;
@@ -768,6 +837,10 @@ function getRemovalWorker(){
     if(msg.type==="progress"){
       if(msg.message)$("#progressText").textContent=msg.message;
       if(job?.onProgress)job.onProgress(msg);
+      return;
+    }
+    if(msg.type==="debug-mask"&&new URLSearchParams(location.search).has("debugMasks")){
+      debugMaskStage(msg.label,new Uint8Array(msg.buffer),msg.width,msg.height);
       return;
     }
     if(!job)return;
@@ -1473,6 +1546,33 @@ async function decodeImageForCanvas(file){
   }
 }
 
+function debugMaskStage(label,alpha,w,h){
+  if(!new URLSearchParams(location.search).has("debugMasks"))return;
+  let gallery=document.querySelector("#maskDebugGallery");
+  if(!gallery){
+    gallery=document.createElement("section");
+    gallery.id="maskDebugGallery";
+    gallery.style.cssText="position:relative;z-index:99999;background:#111;color:#fff;padding:20px;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px";
+    document.body.appendChild(gallery);
+  }
+  const canvas=document.createElement("canvas");
+  canvas.width=w;canvas.height=h;
+  canvas.style.cssText="width:100%;height:auto;background:#000";
+  canvas.dataset.maskStage=label;
+  const ctx=canvas.getContext("2d");
+  const rgba=new Uint8ClampedArray(w*h*4);
+  for(let i=0;i<alpha.length;i++){
+    const a=alpha[i],o=i*4;
+    rgba[o]=a;rgba[o+1]=a;rgba[o+2]=a;rgba[o+3]=255;
+  }
+  ctx.putImageData(new ImageData(rgba,w,h),0,0);
+  const figure=document.createElement("figure");
+  const caption=document.createElement("figcaption");
+  caption.textContent=label;
+  figure.append(canvas,caption);
+  gallery.appendChild(figure);
+}
+
 async function applyDualMaskToFile(file,primaryBuffer,safetyBuffer,maskWidth,maskHeight){
   if(!primaryBuffer||!maskWidth||!maskHeight){
     throw new Error("The AI returned an invalid mask.");
@@ -1522,6 +1622,8 @@ async function applyDualMaskToFile(file,primaryBuffer,safetyBuffer,maskWidth,mas
 
   const primary=scaleMask(primaryRaw);
   const safety=safetyRaw?scaleMask(safetyRaw):null;
+  debugMaskStage("01-primary-rmbg",primary,ow,oh);
+  if(safety)debugMaskStage("02-safety-isnet",safety,ow,oh);
 
   const outCanvas=document.createElement("canvas");
   outCanvas.width=ow;outCanvas.height=oh;
@@ -1531,57 +1633,20 @@ async function applyDualMaskToFile(file,primaryBuffer,safetyBuffer,maskWidth,mas
 
   const image=ctx.getImageData(0,0,ow,oh);
 
-  let alpha=combineForegroundMasks(primary,safety);
-
-  // Existing topology-based rescue.
-  alpha=rescueForegroundFromConsensus(
-    image.data,
-    alpha,
-    primary,
-    safety,
-    ow,
-    oh
-  );
-
-  // v16: for consistent backgrounds (like this green grass photo), restore
-  // every removed pixel that clearly does NOT match the learned background.
-  // This prevents the remover from deleting grey/navy jacket sections.
-  alpha=rescueNonBackgroundPixels(
-    image.data,
-    alpha,
-    primary,
-    safety,
-    ow,
-    oh
-  );
-
-  const backgroundOnlyCandidate=buildBackgroundOnlyCandidate(
-    image.data,
-    primary,
-    safety,
-    ow,
-    oh
-  );
-
-  alpha=combineWithBackgroundCandidate(
-    alpha,
-    backgroundOnlyCandidate,
-    primary,
-    safety,
-    ow,
-    oh
-  );
-
-  alpha=fillEnclosedAlphaHoles(alpha,ow,oh);
-
-  // Snapshot the product-protected mask before cleanup.
+  // Segmentation and cleanup are deliberately separate. BiRefNet owns the
+  // matte; cleanup may only remove genuinely tiny disconnected islands.
+  // Colour clustering and model unions were removed because both can turn
+  // uncertain navy/grey product pixels into background or restore grass.
+  let alpha=new Uint8Array(primary);
   const protectedAlpha=new Uint8Array(alpha);
+  debugMaskStage("03-protected-model-matte",protectedAlpha,ow,oh);
 
-  let cleanedAlpha=removeTinyForegroundIslands(alpha,ow,oh);
+  let cleanedAlpha=removeTinyForegroundIslands(protectedAlpha,ow,oh);
   cleanedAlpha=refineAlphaEdge(cleanedAlpha,ow,oh);
+  debugMaskStage("04-cleanup",cleanedAlpha,ow,oh);
 
   // Fail safe: never accept cleanup that removes too much of the protected item.
-  alpha=chooseSaferFinalAlpha(protectedAlpha,cleanedAlpha);
+  alpha=chooseSafeCleanup(protectedAlpha,cleanedAlpha,ow,oh);
   alpha=releaseSafetyCheck(protectedAlpha,alpha,ow,oh);
   const finalDiag=maskDiagnostics(alpha,ow,oh);
   const protectedDiag=maskDiagnostics(protectedAlpha,ow,oh);
@@ -1596,6 +1661,7 @@ async function applyDualMaskToFile(file,primaryBuffer,safetyBuffer,maskWidth,mas
   ){
     alpha=new Uint8Array(protectedAlpha);
   }
+  debugMaskStage("05-final",alpha,ow,oh);
 
   for(let i=0;i<ow*oh;i++){
     let a=alpha[i];
@@ -1668,7 +1734,7 @@ function removeWithBackshotEngine(file,onProgress,attempt=0){
       }else{
         reject(new Error("Background removal timed out twice. Try a smaller image or reload BackshotAI."));
       }
-    },120000);
+    },360000);
 
     removalPending.set(id,{resolve,reject,onProgress,timeout,file});
     try{worker.postMessage({type:"remove",id,file});}
@@ -1689,6 +1755,28 @@ async function chooseSafeCutout(file){
   }
   if(file.size>80*1024*1024){
     throw new Error("This image is larger than 80 MB. Please use a smaller photo.");
+  }
+
+  // Background-first segmentation is the preservation-biased path for
+  // consistent edge-connected scenes (grass, walls and floors). It removes
+  // only pixels connected to a learned border background and never asks a
+  // foreground model to decide whether a dark jacket panel should exist.
+  const backgroundFirst=await conservativeCloseupFallback(file);
+  if(backgroundFirst){
+    const [before,after,shape]=await Promise.all([alphaStats(file),alphaStats(backgroundFirst),cutoutShapeStats(backgroundFirst)]);
+    if(new URLSearchParams(location.search).has("debugMasks"))document.documentElement.dataset.backgroundDiag=JSON.stringify({before,after,shape});
+    if(after.strong>0.08 && after.strong<before.strong*0.94 && shape.largestShare>.95){
+      $("#progressText").textContent="Background-first mask complete.";
+      let clean=await cleanupDisconnectedSpecks(backgroundFirst);
+      // A bright low-saturation residual (for example a white rug under grass)
+      // is suspicious. Ask RMBG only about those pixels; its decisions can
+      // remove the residual but can never delete dark/blue product sections.
+      if(await brightResidualRatio(clean)>.018){
+        const evidence=await removeWithBackshotEngine(file);
+        clean=await refineBrightBackground(clean,evidence);
+      }
+      return clean;
+    }
   }
 
   const blob=await removeWithBackshotEngine(file,msg=>{
@@ -1787,7 +1875,9 @@ async function processRemovalQueue(queue,label){
   // Cap at four simultaneous photos on laptops/desktops.
   // Phones use two to avoid Safari memory crashes.
   const memory=Number(navigator.deviceMemory||4);
-  const concurrency=isMobile ? 1 : (memory>=8 && cores>=8 ? 2 : 1);
+  // One inference at a time per worker. Parallel ONNX sessions can exhaust
+  // Safari/WebAssembly memory and make every photo fail together.
+  const concurrency=1;
 
   for(let start=0;start<queue.length;start+=concurrency){
     const chunk=queue.slice(start,start+concurrency);
@@ -1861,7 +1951,7 @@ async function openEditor(id){
   const original=await imageFromURL(item.originalURL),cutout=await imageFromURL(item.cutoutURL),canvas=$("#editorCanvas"),max=1400,s=Math.min(1,max/Math.max(original.naturalWidth,original.naturalHeight));
   canvas.width=Math.round(original.naturalWidth*s);canvas.height=Math.round(original.naturalHeight*s);const ctx=canvas.getContext("2d",{willReadFrequently:true});ctx.clearRect(0,0,canvas.width,canvas.height);ctx.drawImage(cutout,0,0,canvas.width,canvas.height);
   const oc=document.createElement("canvas");oc.width=canvas.width;oc.height=canvas.height;const octx=oc.getContext("2d",{willReadFrequently:true});octx.drawImage(original,0,0,canvas.width,canvas.height);
-  state.editor={item,original,canvas,ctx,originalData:octx.getImageData(0,0,canvas.width,canvas.height),mode:"erase",history:[ctx.getImageData(0,0,canvas.width,canvas.height)],redo:[],drawing:false,last:null};
+  state.editor={item,original,canvas,ctx,originalData:octx.getImageData(0,0,canvas.width,canvas.height),mode:"erase",history:[ctx.getImageData(0,0,canvas.width,canvas.height)],redo:[],drawing:false,last:null,viewScale:1,fitScale:1,panX:0,panY:0,pointers:new Map(),pinch:null};
   $("#cutoutModal").classList.remove("hidden");
   requestAnimationFrame(()=>{ fitEditorCanvasToStage(); updateEditorUI(); setupEditorEvents(); });
 }
@@ -1870,15 +1960,40 @@ function fitEditorCanvasToStage(){
   const stage=$(".editor-stage"),canvas=state.editor.canvas;
   const pad=24,availableW=Math.max(1,stage.clientWidth-pad*2),availableH=Math.max(1,stage.clientHeight-pad*2);
   const fit=Math.min(availableW/canvas.width,availableH/canvas.height,1);
-  canvas.style.width=`${Math.max(1,Math.floor(canvas.width*fit))}px`;
-  canvas.style.height=`${Math.max(1,Math.floor(canvas.height*fit))}px`;
+  state.editor.fitScale=fit;
+  updateEditorTransform();
+}
+function updateEditorTransform(){
+  const e=state.editor;if(!e)return;
+  const scale=e.fitScale*e.viewScale;
+  e.canvas.style.width=`${Math.max(1,Math.floor(e.canvas.width*scale))}px`;
+  e.canvas.style.height=`${Math.max(1,Math.floor(e.canvas.height*scale))}px`;
+  e.canvas.style.transform=`translate3d(${e.panX}px,${e.panY}px,0)`;
+}
+function setEditorZoom(next){
+  const e=state.editor;if(!e)return;
+  e.viewScale=Math.max(1,Math.min(8,next));
+  if(e.viewScale===1){e.panX=0;e.panY=0;}
+  updateEditorTransform();
 }
 function updateEditorUI(){if(!state.editor)return;$("#eraseTool").classList.toggle("active",state.editor.mode==="erase");$("#restoreTool").classList.toggle("active",state.editor.mode==="restore");const assisted=$("#assistToggle").checked;$("#brushSize").disabled=assisted;$("#editorHint").textContent=assisted?`Assisted: tap a ${state.editor.mode==="erase"?"missed background area":"missing product area"} and BackshotAI follows that region.`:state.editor.mode==="erase"?"Manual: brush over unwanted areas.":"Manual: brush over missing parts to restore them.";$("#undoEdit").disabled=state.editor.history.length<=1;$("#redoEdit").disabled=!state.editor.redo.length;}
 function setupEditorEvents(){
-  const e=state.editor,c=e.canvas;
-  c.onpointerdown=ev=>{const p=pointFor(ev,c);c.setPointerCapture(ev.pointerId);if($("#assistToggle").checked){assistedTap(p);return;}e.drawing=true;e.last=p;paintAt(p);};
-  c.onpointermove=ev=>{moveBrushCursor(ev);if(!e.drawing||$("#assistToggle").checked)return;const p=pointFor(ev,c);paintLine(e.last,p);e.last=p;};
-  c.onpointerup=()=>{if(e.drawing){e.drawing=false;pushHistory();}};c.onpointercancel=()=>{e.drawing=false;};c.onpointerleave=()=>$("#brushCursor").classList.remove("show");c.onpointerenter=()=>$("#brushCursor").classList.add("show");
+  const e=state.editor,c=e.canvas,stage=$(".editor-stage");
+  stage.onwheel=ev=>{ev.preventDefault();setEditorZoom(e.viewScale*(ev.deltaY<0?1.12:.89));};
+  c.onpointerdown=ev=>{
+    c.setPointerCapture(ev.pointerId);e.pointers.set(ev.pointerId,{x:ev.clientX,y:ev.clientY});
+    if(e.pointers.size===2){const pts=[...e.pointers.values()];e.drawing=false;e.pinch={distance:Math.hypot(pts[1].x-pts[0].x,pts[1].y-pts[0].y),scale:e.viewScale,midX:(pts[0].x+pts[1].x)/2,midY:(pts[0].y+pts[1].y)/2,panX:e.panX,panY:e.panY};return;}
+    if(ev.button===1||ev.altKey){e.panning={x:ev.clientX,y:ev.clientY,panX:e.panX,panY:e.panY};return;}
+    const p=pointFor(ev,c);if($("#assistToggle").checked){assistedTap(p);return;}e.drawing=true;e.last=p;paintAt(p);
+  };
+  c.onpointermove=ev=>{
+    moveBrushCursor(ev);if(e.pointers.has(ev.pointerId))e.pointers.set(ev.pointerId,{x:ev.clientX,y:ev.clientY});
+    if(e.pointers.size===2&&e.pinch){const pts=[...e.pointers.values()],distance=Math.hypot(pts[1].x-pts[0].x,pts[1].y-pts[0].y),midX=(pts[0].x+pts[1].x)/2,midY=(pts[0].y+pts[1].y)/2;e.viewScale=Math.max(1,Math.min(8,e.pinch.scale*distance/Math.max(1,e.pinch.distance)));e.panX=e.pinch.panX+midX-e.pinch.midX;e.panY=e.pinch.panY+midY-e.pinch.midY;updateEditorTransform();return;}
+    if(e.panning){e.panX=e.panning.panX+ev.clientX-e.panning.x;e.panY=e.panning.panY+ev.clientY-e.panning.y;updateEditorTransform();return;}
+    if(!e.drawing||$("#assistToggle").checked)return;const p=pointFor(ev,c);paintLine(e.last,p);e.last=p;
+  };
+  const finish=ev=>{e.pointers.delete(ev.pointerId);e.pinch=null;e.panning=null;if(e.drawing){e.drawing=false;pushHistory();}};
+  c.onpointerup=finish;c.onpointercancel=finish;c.onpointerleave=()=>$("#brushCursor").classList.remove("show");c.onpointerenter=()=>$("#brushCursor").classList.add("show");
 }
 function pointFor(ev,c){const r=c.getBoundingClientRect();return{x:(ev.clientX-r.left)/r.width*c.width,y:(ev.clientY-r.top)/r.height*c.height};}
 function brushRadius(){return Number($("#brushSize").value)/2*(state.editor.canvas.width/state.editor.canvas.getBoundingClientRect().width);}
@@ -1898,7 +2013,9 @@ function assistedTap(p){
   }
   const seed=[sr/sc,sg/sc,sb/sc],seedLum=.299*seed[0]+.587*seed[1]+.114*seed[2];
   const visited=new Uint8Array(w*h),stack=[y0*w+x0],region=[];
-  const maxRegion=Math.round(w*h*.28),maxRadius=Math.max(70,Math.min(w,h)*.42);
+  const scale=w/Math.max(1,e.canvas.getBoundingClientRect().width);
+  const maxRadius=Math.max(12,ASSIST_LOCAL_RADIUS*scale);
+  const maxRegion=Math.ceil(Math.PI*maxRadius*maxRadius);
   const colourTol=e.mode==="erase"?82:72,lumTol=e.mode==="erase"?72:62;
 
   while(stack.length&&region.length<maxRegion){
@@ -1916,15 +2033,8 @@ function assistedTap(p){
     }
   }
   if(region.length<3){toast("Tap inside the area you want to change.");return;}
-  const expanded=new Set(region);
-  for(const i of region){
-    const x=i%w,y=(i/w)|0;
-    for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){
-      const nx=x+ox,ny=y+oy;if(nx>=0&&nx<w&&ny>=0&&ny<h)expanded.add(ny*w+nx);
-    }
-  }
-  if(e.mode==="erase"){for(const i of expanded)cd[i*4+3]=0;}
-  else{for(const i of expanded){const o=i*4;cd[o]=od[o];cd[o+1]=od[o+1];cd[o+2]=od[o+2];cd[o+3]=od[o+3];}}
+  if(e.mode==="erase"){for(const i of region)cd[i*4+3]=0;}
+  else{for(const i of region){const o=i*4;cd[o]=od[o];cd[o+1]=od[o+1];cd[o+2]=od[o+2];cd[o+3]=od[o+3];}}
   e.ctx.putImageData(cur,0,0);pushHistory();toast(`${e.mode==="erase"?"Removed":"Restored"} the selected area.`);
 }
 function pushHistory(){const e=state.editor;e.history.push(e.ctx.getImageData(0,0,e.canvas.width,e.canvas.height));if(e.history.length>18)e.history.shift();e.redo=[];updateEditorUI();}
@@ -1932,7 +2042,7 @@ function undo(){const e=state.editor;if(e.history.length<=1)return;const cur=e.h
 function redo(){const e=state.editor;if(!e.redo.length)return;const img=e.redo.pop();e.history.push(img);e.ctx.putImageData(img,0,0);updateEditorUI();}
 function moveBrushCursor(ev){const stage=$(".editor-stage").getBoundingClientRect(),size=$("#assistToggle").checked?28:Number($("#brushSize").value),el=$("#brushCursor");el.classList.add("show");el.style.width=`${size}px`;el.style.height=`${size}px`;el.style.left=`${ev.clientX-stage.left-size/2}px`;el.style.top=`${ev.clientY-stage.top-size/2}px`;}
 async function smartRecover(){const e=state.editor;if(!e)return;$("#smartRecover").disabled=true;$("#smartRecover").textContent="Checking…";try{const clean=await chooseSafeCutout(e.item.file),img=await imageFromURL(URL.createObjectURL(clean));e.ctx.save();e.ctx.globalCompositeOperation="source-over";e.ctx.drawImage(img,0,0,e.canvas.width,e.canvas.height);e.ctx.restore();pushHistory();toast("Safer high-quality subject pass merged.");}catch(err){toast("Re-check failed on this device.");}$("#smartRecover").disabled=false;$("#smartRecover").textContent="Re-check subject";}
-async function applyEditor(){const e=state.editor;if(!e)return;let blob=await new Promise(res=>e.canvas.toBlob(res,"image/png",1));blob=await cleanCutoutEdges(blob);e.item.cutoutBlob=blob;if(e.item.cutoutURL)URL.revokeObjectURL(e.item.cutoutURL);e.item.cutoutURL=URL.createObjectURL(blob);e.item.status="done";closeEditor();renderGallery();toast("Cutout updated.");}
+async function applyEditor(){const e=state.editor;if(!e)return;const blob=await new Promise(res=>e.canvas.toBlob(res,"image/png",1));e.item.cutoutBlob=blob;if(e.item.cutoutURL)URL.revokeObjectURL(e.item.cutoutURL);e.item.cutoutURL=URL.createObjectURL(blob);e.item.status="done";closeEditor();renderGallery();toast("Cutout updated.");}
 function closeEditor(){$("#cutoutModal").classList.add("hidden");state.editor=null;}
 
 /* ---------- Export ---------- */
@@ -2102,6 +2212,7 @@ $("#shadowOpacity").oninput=e=>applyShadowToSelected("opacity",Number(e.target.v
 $("#shadowBlur").oninput=e=>applyShadowToSelected("blur",Number(e.target.value));
 $("#shadowY").oninput=e=>applyShadowToSelected("offsetY",Number(e.target.value));
 $("#eraseTool").onclick=()=>{state.editor.mode="erase";updateEditorUI();};$("#restoreTool").onclick=()=>{state.editor.mode="restore";updateEditorUI();};$("#assistToggle").onchange=updateEditorUI;$("#undoEdit").onclick=undo;$("#redoEdit").onclick=redo;$("#smartRecover").onclick=smartRecover;$("#applyEdit").onclick=applyEditor;$("#closeEditor").onclick=closeEditor;$("#cutoutModal").onclick=e=>{if(e.target.id==="cutoutModal")closeEditor();};
+$("#zoomOutEditor").onclick=()=>setEditorZoom((state.editor?.viewScale||1)/1.25);$("#zoomInEditor").onclick=()=>setEditorZoom((state.editor?.viewScale||1)*1.25);$("#fitEditor").onclick=()=>setEditorZoom(1);
 let installPrompt=null;window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();installPrompt=e;$("#installBtn").classList.remove("hidden");});$("#installBtn").onclick=async()=>{if(!installPrompt){toast("On iPhone: Safari → Share → Add to Home Screen");return;}installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;$("#installBtn").classList.add("hidden");};
 window.addEventListener("resize",()=>{if(state.editor)requestAnimationFrame(fitEditorCanvasToStage);});
 if("serviceWorker" in navigator)window.addEventListener("load",()=>navigator.serviceWorker.register("./sw.js").catch(console.warn));

@@ -69,7 +69,7 @@
     linear-gradient(45deg,transparent 75%,#1b1b20 75%) 12px -12px/24px 24px,
     linear-gradient(-45deg,transparent 75%,#1b1b20 75%) -12px 0/24px 24px,#101014
 }
-#editorCanvas{display:block;touch-action:none;cursor:none;max-width:100%;max-height:100%;width:auto;height:auto;box-shadow:0 0 0 1px rgba(255,255,255,.12);object-fit:contain}
+#editorCanvas{display:block;touch-action:none;cursor:none;max-width:none;max-height:none;width:auto;height:auto;transform-origin:center;will-change:transform,width,height;box-shadow:0 0 0 1px rgba(255,255,255,.12);object-fit:contain}
 .brush-cursor{
   position:absolute;border:1.5px solid white;border-radius:50%;pointer-events:none;display:none;z-index:10;
   box-shadow:0 0 0 1px rgba(0,0,0,.7),0 0 10px rgba(0,0,0,.45)
