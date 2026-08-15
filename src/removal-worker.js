@@ -210,11 +210,11 @@ function analysePrimaryMask(alpha,w,h){
   // - many internal holes -> safety pass
   // - unusually fuzzy mask -> safety pass
   const suspicious =
-    visibleRatio<0.045 ||
-    largestShare<0.72 ||
-    componentCount>5 ||
-    holeRatio>0.52 ||
-    softRatio>0.12;
+    visibleRatio<0.08 ||
+    largestShare<0.90 ||
+    componentCount>2 ||
+    holeRatio>0.20 ||
+    softRatio>0.065;
 
   return {
     suspicious,

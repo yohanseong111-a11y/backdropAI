@@ -977,6 +977,309 @@ function rescueForegroundFromConsensus(rgb,alpha,primary,safety,w,h){
   return out;
 }
 
+
+function learnConfidentBackgroundModel(rgb,primary,safety,w,h){
+  const bins=new Map();
+  const total=w*h;
+  const stride=Math.max(1,Math.floor(Math.sqrt(total/200000)));
+  let confidentSamples=0;
+
+  const rgbToHSV=(r,g,b)=>{
+    r/=255;g/=255;b/=255;
+    const max=Math.max(r,g,b),min=Math.min(r,g,b),d=max-min;
+    let h=0;
+    if(d){
+      if(max===r)h=((g-b)/d)%6;
+      else if(max===g)h=(b-r)/d+2;
+      else h=(r-g)/d+4;
+      h*=60;
+      if(h<0)h+=360;
+    }
+    const s=max===0?0:d/max;
+    return [h,s,max];
+  };
+
+  for(let y=0;y<h;y+=stride){
+    for(let x=0;x<w;x+=stride){
+      const i=y*w+x;
+      const p=primary[i];
+      const s=safety?safety[i]:p;
+
+      // Learn only where both models are very confident it is background.
+      if(p>24||s>24)continue;
+
+      confidentSamples++;
+      const o=i*4;
+      const r=rgb[o],g=rgb[o+1],b=rgb[o+2];
+
+      // Slightly coarser quantisation groups textured grass/fabric-floor shades.
+      const key=`${r>>5},${g>>5},${b>>5}`;
+      let e=bins.get(key);
+      if(!e){
+        e={count:0,r:0,g:0,b:0};
+        bins.set(key,e);
+      }
+      e.count++;
+      e.r+=r;e.g+=g;e.b+=b;
+    }
+  }
+
+  if(confidentSamples<32||!bins.size)return null;
+
+  const ranked=[...bins.values()].sort((a,b)=>b.count-a.count);
+  const clusters=ranked.slice(0,18).map(e=>{
+    const r=e.r/e.count,g=e.g/e.count,b=e.b/e.count;
+    const hsv=rgbToHSV(r,g,b);
+    return {count:e.count,r,g,b,h:hsv[0],s:hsv[1],v:hsv[2]};
+  });
+
+  const covered=clusters.reduce((n,e)=>n+e.count,0);
+  const coverage=covered/confidentSamples;
+
+  // Textured backgrounds no longer need one dominant colour.
+  // Enough confident samples + broad cluster coverage is sufficient.
+  return {
+    clusters,
+    homogeneous:coverage>=0.48,
+    topShare:coverage,
+    confidentSamples
+  };
+}
+
+function rescueNonBackgroundPixels(rgb,alpha,primary,safety,w,h){
+  const model=learnConfidentBackgroundModel(rgb,primary,safety,w,h);
+  if(!model||!model.homogeneous)return new Uint8Array(alpha);
+
+  const out=new Uint8Array(alpha);
+  const total=w*h;
+
+  const rgbToHSV=(r,g,b)=>{
+    r/=255;g/=255;b/=255;
+    const max=Math.max(r,g,b),min=Math.min(r,g,b),d=max-min;
+    let h=0;
+    if(d){
+      if(max===r)h=((g-b)/d)%6;
+      else if(max===g)h=(b-r)/d+2;
+      else h=(r-g)/d+4;
+      h*=60;
+      if(h<0)h+=360;
+    }
+    const s=max===0?0:d/max;
+    return [h,s,max];
+  };
+
+  const bgScores=i=>{
+    const o=i*4;
+    const r=rgb[o],g=rgb[o+1],b=rgb[o+2];
+    const hsv=rgbToHSV(r,g,b);
+
+    let rgbD=999;
+    let hsvD=999;
+
+    for(const c of model.clusters){
+      rgbD=Math.min(rgbD,rgbDist(r,g,b,c.r,c.g,c.b));
+
+      let hd=Math.abs(hsv[0]-c.h);
+      hd=Math.min(hd,360-hd)/180;
+      const sd=Math.abs(hsv[1]-c.s);
+      const vd=Math.abs(hsv[2]-c.v);
+
+      // Hue matters most for saturated backgrounds such as grass.
+      // Saturation/value separate grey/navy garments from coloured floors.
+      const score=Math.sqrt(
+        (hd*1.45)**2 +
+        (sd*1.15)**2 +
+        (vd*0.65)**2
+      );
+      hsvD=Math.min(hsvD,score);
+    }
+
+    return {rgbD,hsvD};
+  };
+
+  for(let i=0;i<total;i++){
+    if(out[i]>=218)continue;
+
+    const p=primary[i];
+    const s=safety?safety[i]:p;
+    const {rgbD,hsvD}=bgScores(i);
+
+    // Strong disagreement with the learned background family means the pixel
+    // should not be deleted even when the segmentation model made a mistake.
+    const veryUnlikeBg=rgbD>=112 || hsvD>=0.72;
+    const unlikeBg=rgbD>=82 || hsvD>=0.52;
+    const someAI=Math.max(p,s)>=28;
+
+    if(veryUnlikeBg){
+      out[i]=Math.max(out[i],p,s,248);
+    }else if(unlikeBg&&someAI){
+      out[i]=Math.max(out[i],p,s,210);
+    }
+  }
+
+  // Reconnect narrow gaps inside rescued garment regions.
+  const copy=new Uint8Array(out);
+  for(let y=1;y<h-1;y++){
+    for(let x=1;x<w-1;x++){
+      const i=y*w+x;
+      if(copy[i]>=180)continue;
+
+      let strong=0;
+      if(copy[i-1]>=225)strong++;
+      if(copy[i+1]>=225)strong++;
+      if(copy[i-w]>=225)strong++;
+      if(copy[i+w]>=225)strong++;
+
+      if(strong>=3){
+        const {rgbD,hsvD}=bgScores(i);
+        if(rgbD>=70||hsvD>=0.44)out[i]=228;
+      }
+    }
+  }
+
+  return out;
+}
+
+
+function buildBackgroundOnlyCandidate(rgb,primary,safety,w,h){
+  const model=learnConfidentBackgroundModel(rgb,primary,safety,w,h);
+  if(!model||!model.homogeneous||!model.clusters?.length)return null;
+
+  const total=w*h;
+  const out=new Uint8Array(total);
+  const bgLikely=new Uint8Array(total);
+
+  const rgbToHSV=(r,g,b)=>{
+    r/=255;g/=255;b/=255;
+    const max=Math.max(r,g,b),min=Math.min(r,g,b),d=max-min;
+    let h=0;
+    if(d){
+      if(max===r)h=((g-b)/d)%6;
+      else if(max===g)h=(b-r)/d+2;
+      else h=(r-g)/d+4;
+      h*=60;
+      if(h<0)h+=360;
+    }
+    return [h,max===0?0:d/max,max];
+  };
+
+  const backgroundScore=i=>{
+    const o=i*4;
+    const r=rgb[o],g=rgb[o+1],b=rgb[o+2];
+    const hsv=rgbToHSV(r,g,b);
+
+    let rgbD=999,hsvD=999;
+    for(const c of model.clusters){
+      rgbD=Math.min(rgbD,rgbDist(r,g,b,c.r,c.g,c.b));
+
+      let hd=Math.abs(hsv[0]-c.h);
+      hd=Math.min(hd,360-hd)/180;
+      const sd=Math.abs(hsv[1]-c.s);
+      const vd=Math.abs(hsv[2]-c.v);
+
+      hsvD=Math.min(
+        hsvD,
+        Math.sqrt((hd*1.45)**2+(sd*1.10)**2+(vd*0.65)**2)
+      );
+    }
+    return {rgbD,hsvD};
+  };
+
+  for(let i=0;i<total;i++){
+    const p=primary[i];
+    const s=safety?safety[i]:p;
+    const {rgbD,hsvD}=backgroundScore(i);
+
+    const strongAIBackground=p<42 && s<42;
+    const looksLikeBackground=rgbD<76 && hsvD<0.46;
+    const moderateAIBackground=p<92 && s<92;
+    const veryBackgroundLike=rgbD<52 && hsvD<0.32;
+
+    if(
+      (strongAIBackground && looksLikeBackground) ||
+      (moderateAIBackground && veryBackgroundLike)
+    ){
+      bgLikely[i]=1;
+    }
+  }
+
+  for(let i=0;i<total;i++)out[i]=bgLikely[i]?0:255;
+
+  return removeTinyForegroundIslands(out,w,h);
+}
+
+function combineWithBackgroundCandidate(alpha,candidate,primary,safety,w,h){
+  if(!candidate)return new Uint8Array(alpha);
+
+  const total=w*h;
+  const out=new Uint8Array(alpha);
+
+  let aiStrong=0,candidateStrong=0;
+  for(let i=0;i<total;i++){
+    if(alpha[i]>=128)aiStrong++;
+    if(candidate[i]>=128)candidateStrong++;
+  }
+
+  if(candidateStrong/Math.max(1,total)>0.88)return out;
+
+  const candidateGain=candidateStrong/Math.max(1,aiStrong);
+  if(candidateGain<1.035)return out;
+
+  for(let i=0;i<total;i++){
+    if(candidate[i]<128)continue;
+
+    const p=primary[i];
+    const s=safety?safety[i]:p;
+
+    if(Math.max(p,s)>=52){
+      out[i]=Math.max(out[i],p,s,244);
+    }else{
+      out[i]=Math.max(out[i],220);
+    }
+  }
+
+  return out;
+}
+
+function maskDiagnostics(alpha,w,h){
+  const total=w*h;
+  let strong=0;
+  let minX=w,maxX=-1,minY=h,maxY=-1;
+
+  for(let i=0;i<total;i++){
+    if(alpha[i]<128)continue;
+    strong++;
+    const x=i%w,y=(i/w)|0;
+    if(x<minX)minX=x;if(x>maxX)maxX=x;
+    if(y<minY)minY=y;if(y>maxY)maxY=y;
+  }
+
+  return {
+    strong,
+    ratio:strong/Math.max(1,total),
+    width:maxX>=minX?(maxX-minX+1):0,
+    height:maxY>=minY?(maxY-minY+1):0
+  };
+}
+
+function releaseSafetyCheck(beforeCleanup,afterCleanup,w,h){
+  const before=maskDiagnostics(beforeCleanup,w,h);
+  const after=maskDiagnostics(afterCleanup,w,h);
+
+  if(!before.strong)return new Uint8Array(afterCleanup);
+
+  const areaRetention=after.strong/before.strong;
+  const widthRetention=before.width?after.width/before.width:1;
+  const heightRetention=before.height?after.height/before.height:1;
+
+  if(areaRetention<0.94 || widthRetention<0.92 || heightRetention<0.92){
+    console.warn("BackshotAI release safety rollback: product shrink detected");
+    return new Uint8Array(beforeCleanup);
+  }
+
+  return afterCleanup;
+}
+
 function fillEnclosedAlphaHoles(alpha,w,h){
   const total=w*h;
   const outsideBg=new Uint8Array(total);
@@ -1087,6 +1390,33 @@ function removeTinyForegroundIslands(alpha,w,h){
   return out;
 }
 
+
+function countStrongAlpha(alpha,threshold=128){
+  let n=0;
+  for(let i=0;i<alpha.length;i++){
+    if(alpha[i]>=threshold)n++;
+  }
+  return n;
+}
+
+function chooseSaferFinalAlpha(protectedAlpha,cleanedAlpha){
+  const protectedCount=countStrongAlpha(protectedAlpha,128);
+  const cleanedCount=countStrongAlpha(cleanedAlpha,128);
+
+  if(!protectedCount)return cleanedAlpha;
+
+  const retained=cleanedCount/protectedCount;
+
+  // Cleanup should never destroy a large portion of the already-protected
+  // product. If it does, prefer the protected version rather than show holes.
+  if(retained<0.91){
+    console.warn("BackshotAI safety rollback: cleanup removed too much foreground");
+    return new Uint8Array(protectedAlpha);
+  }
+
+  return cleanedAlpha;
+}
+
 function refineAlphaEdge(alpha,w,h){
   const out=new Uint8Array(alpha);
 
@@ -1119,13 +1449,39 @@ function refineAlphaEdge(alpha,w,h){
   return out;
 }
 
+
+async function decodeImageForCanvas(file){
+  if(typeof createImageBitmap==="function"){
+    try{
+      return {image:await createImageBitmap(file),close:true};
+    }catch(error){
+      console.warn("createImageBitmap failed; using image-element fallback",error);
+    }
+  }
+
+  const url=URL.createObjectURL(file);
+  try{
+    const image=await new Promise((resolve,reject)=>{
+      const img=new Image();
+      img.onload=()=>resolve(img);
+      img.onerror=()=>reject(new Error("The browser could not decode this image."));
+      img.src=url;
+    });
+    return {image,close:false};
+  }finally{
+    URL.revokeObjectURL(url);
+  }
+}
+
 async function applyDualMaskToFile(file,primaryBuffer,safetyBuffer,maskWidth,maskHeight){
   if(!primaryBuffer||!maskWidth||!maskHeight){
     throw new Error("The AI returned an invalid mask.");
   }
 
-  const bitmap=await createImageBitmap(file);
-  const ow=bitmap.width,oh=bitmap.height;
+  const decoded=await decodeImageForCanvas(file);
+  const bitmap=decoded.image;
+  const ow=bitmap.naturalWidth||bitmap.width;
+  const oh=bitmap.naturalHeight||bitmap.height;
 
   const primaryRaw=new Uint8Array(primaryBuffer);
   const safetyRaw=safetyBuffer?new Uint8Array(safetyBuffer):null;
@@ -1170,20 +1526,81 @@ async function applyDualMaskToFile(file,primaryBuffer,safetyBuffer,maskWidth,mas
   const outCanvas=document.createElement("canvas");
   outCanvas.width=ow;outCanvas.height=oh;
   const ctx=outCanvas.getContext("2d",{willReadFrequently:true});
-  ctx.drawImage(bitmap,0,0);
-  bitmap.close?.();
+  ctx.drawImage(bitmap,0,0,ow,oh);
+  if(decoded.close)bitmap.close?.();
 
   const image=ctx.getImageData(0,0,ow,oh);
 
   let alpha=combineForegroundMasks(primary,safety);
-  alpha=rescueForegroundFromConsensus(image.data,alpha,primary,safety,ow,oh);
+
+  // Existing topology-based rescue.
+  alpha=rescueForegroundFromConsensus(
+    image.data,
+    alpha,
+    primary,
+    safety,
+    ow,
+    oh
+  );
+
+  // v16: for consistent backgrounds (like this green grass photo), restore
+  // every removed pixel that clearly does NOT match the learned background.
+  // This prevents the remover from deleting grey/navy jacket sections.
+  alpha=rescueNonBackgroundPixels(
+    image.data,
+    alpha,
+    primary,
+    safety,
+    ow,
+    oh
+  );
+
+  const backgroundOnlyCandidate=buildBackgroundOnlyCandidate(
+    image.data,
+    primary,
+    safety,
+    ow,
+    oh
+  );
+
+  alpha=combineWithBackgroundCandidate(
+    alpha,
+    backgroundOnlyCandidate,
+    primary,
+    safety,
+    ow,
+    oh
+  );
+
   alpha=fillEnclosedAlphaHoles(alpha,ow,oh);
-  alpha=removeTinyForegroundIslands(alpha,ow,oh);
-  alpha=refineAlphaEdge(alpha,ow,oh);
+
+  // Snapshot the product-protected mask before cleanup.
+  const protectedAlpha=new Uint8Array(alpha);
+
+  let cleanedAlpha=removeTinyForegroundIslands(alpha,ow,oh);
+  cleanedAlpha=refineAlphaEdge(cleanedAlpha,ow,oh);
+
+  // Fail safe: never accept cleanup that removes too much of the protected item.
+  alpha=chooseSaferFinalAlpha(protectedAlpha,cleanedAlpha);
+  alpha=releaseSafetyCheck(protectedAlpha,alpha,ow,oh);
+  const finalDiag=maskDiagnostics(alpha,ow,oh);
+  const protectedDiag=maskDiagnostics(protectedAlpha,ow,oh);
+
+  if(
+    protectedDiag.strong &&
+    (
+      finalDiag.strong/protectedDiag.strong<0.94 ||
+      finalDiag.width<protectedDiag.width*0.92 ||
+      finalDiag.height<protectedDiag.height*0.92
+    )
+  ){
+    alpha=new Uint8Array(protectedAlpha);
+  }
+
   for(let i=0;i<ow*oh;i++){
     let a=alpha[i];
-    if(a<18)a=0;
-    else if(a>236)a=255;
+    if(a<14)a=0;
+    else if(a>226)a=255;
     image.data[i*4+3]=a;
   }
   ctx.putImageData(image,0,0);
@@ -1222,6 +1639,10 @@ function warmBackshotEngine(){
     }else if(msg.type==="ready"){
       worker.removeEventListener("message",handler);
       if(status)status.textContent=msg.acceleration==="fallback"?"AI Ready ✓ compatibility":"AI Ready ✓";
+    }else if(msg.type==="error"){
+      worker.removeEventListener("message",handler);
+      engineWarmStarted=false;
+      if(status)status.textContent="Loads on Remove";
     }
   };
   worker.addEventListener("message",handler);
@@ -1300,7 +1721,15 @@ async function removeOne(item,queueTotal){
   await nextFrame();
 
   try{
-    const blob=await chooseSafeCutout(item.file);
+    let blob;
+    try{
+      blob=await chooseSafeCutout(item.file);
+    }catch(firstError){
+      console.warn("First removal attempt failed; retrying once",firstError);
+      destroyRemovalWorker("Restarting AI engine for retry.");
+      await new Promise(resolve=>setTimeout(resolve,250));
+      blob=await chooseSafeCutout(item.file);
+    }
 
     if(!(blob instanceof Blob)||blob.size===0){
       throw new Error("The remover returned an empty image.");
@@ -1357,7 +1786,8 @@ async function processRemovalQueue(queue,label){
 
   // Cap at four simultaneous photos on laptops/desktops.
   // Phones use two to avoid Safari memory crashes.
-  const concurrency=isMobile ? 2 : Math.min(4,Math.max(2,Math.floor(cores/2)));
+  const memory=Number(navigator.deviceMemory||4);
+  const concurrency=isMobile ? 1 : (memory>=8 && cores>=8 ? 2 : 1);
 
   for(let start=0;start<queue.length;start+=concurrency){
     const chunk=queue.slice(start,start+concurrency);
