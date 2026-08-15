@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {analyzeMask,chooseSafeCleanup,insideBrushFootprint} from "../src/mask-safety.js";
+import {analyzeMask,chooseSafeCleanup,insideBrushFootprint,isHighConfidenceResidual} from "../src/mask-safety.js";
 
 test("rolls back sudden foreground loss",()=>{
   const protectedMask=new Uint8Array(100).fill(255),cleaned=new Uint8Array(protectedMask);
@@ -23,6 +23,14 @@ test("assisted edits cannot escape their local brush footprint",()=>{
   assert.equal(insideBrushFootprint(15,10,10,10,5),true);
   assert.equal(insideBrushFootprint(16,10,10,10,5),false);
   assert.equal(insideBrushFootprint(10,16,10,10,5),false);
+});
+
+test("flags grass and white floor residuals without flagging jacket colours",()=>{
+  assert.equal(isHighConfidenceResidual(32,108,54),true);
+  assert.equal(isHighConfidenceResidual(228,231,226),true);
+  assert.equal(isHighConfidenceResidual(28,48,67),false);
+  assert.equal(isHighConfidenceResidual(0,168,224),false);
+  assert.equal(isHighConfidenceResidual(240,118,35),false);
 });
 
 test("accepts cumulative speck removal while product bounds stay intact",()=>{

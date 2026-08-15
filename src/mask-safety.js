@@ -28,3 +28,10 @@ export function chooseSafeCleanup(protectedAlpha,cleanedAlpha,width,height){
 export function insideBrushFootprint(x,y,cx,cy,radius){
   return (x-cx)**2+(y-cy)**2<=radius**2;
 }
+
+export function isHighConfidenceResidual(r,g,b){
+  const max=Math.max(r,g,b),min=Math.min(r,g,b);
+  const grass=g>r*1.12&&g>b*1.06&&g-r>14&&g-b>8;
+  const neutralBright=max>174&&max-min<58;
+  return grass||neutralBright;
+}

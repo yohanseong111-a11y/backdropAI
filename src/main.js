@@ -1,6 +1,6 @@
 import "./style.css";
 import "./editor.css";
-import {chooseSafeCleanup} from "./mask-safety.js";
+import {chooseSafeCleanup,isHighConfidenceResidual} from "./mask-safety.js";
 import JSZip from "jszip";
 import { removeBackground, preload } from "@imgly/background-removal";
 
@@ -617,7 +617,7 @@ function removeGreenBoundaryFringe(rgba,alpha,w,h){
   for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){
     const i=y*w+x;if(alpha[i]<24)continue;
     let touchesBackground=false;
-    for(let oy=-2;oy<=2&&!touchesBackground;oy++)for(let ox=-2;ox<=2;ox++){
+    for(let oy=-4;oy<=4&&!touchesBackground;oy++)for(let ox=-4;ox<=4;ox++){
       const nx=x+ox,ny=y+oy;if(nx<0||ny<0||nx>=w||ny>=h)continue;
       if(alpha[ny*w+nx]<24){touchesBackground=true;break;}
     }
@@ -633,28 +633,29 @@ function removeGreenBoundaryFringe(rgba,alpha,w,h){
   return out;
 }
 
-async function brightResidualRatio(blob){
+async function suspiciousResidualRatio(blob){
   const bmp=await createImageBitmap(blob),max=280,scale=Math.min(1,max/Math.max(bmp.width,bmp.height));
   const c=document.createElement("canvas");c.width=Math.max(1,Math.round(bmp.width*scale));c.height=Math.max(1,Math.round(bmp.height*scale));
   const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0,c.width,c.height);bmp.close?.();
-  const d=ctx.getImageData(0,0,c.width,c.height).data;let bright=0,visible=0;
+  const d=ctx.getImageData(0,0,c.width,c.height).data;let suspicious=0,visible=0;
   for(let i=0;i<d.length;i+=4){
     if(d[i+3]<128)continue;visible++;
-    const maxC=Math.max(d[i],d[i+1],d[i+2]),minC=Math.min(d[i],d[i+1],d[i+2]);
-    if(maxC>178&&maxC-minC<52)bright++;
+    if(isHighConfidenceResidual(d[i],d[i+1],d[i+2]))suspicious++;
   }
-  return bright/Math.max(1,visible);
+  return suspicious/Math.max(1,visible);
 }
 
-async function refineBrightBackground(baseBlob,aiBlob){
+async function refineResidualBackground(baseBlob,aiBlob){
   const [base,ai]=await Promise.all([createImageBitmap(baseBlob),createImageBitmap(aiBlob)]);
   const c=document.createElement("canvas");c.width=base.width;c.height=base.height;const ctx=c.getContext("2d",{willReadFrequently:true});
   ctx.drawImage(base,0,0);const out=ctx.getImageData(0,0,c.width,c.height);
   ctx.clearRect(0,0,c.width,c.height);ctx.drawImage(ai,0,0,c.width,c.height);const aid=ctx.getImageData(0,0,c.width,c.height).data;
   base.close?.();ai.close?.();
   for(let i=0;i<c.width*c.height;i++){
-    const o=i*4,maxC=Math.max(out.data[o],out.data[o+1],out.data[o+2]),minC=Math.min(out.data[o],out.data[o+1],out.data[o+2]);
-    if(out.data[o+3]>=128&&maxC>178&&maxC-minC<52&&aid[o+3]<40)out.data[o+3]=0;
+    const o=i*4;
+    // Colour is only a suspicion signal. A second segmentation model must also
+    // call the pixel background before it can be deleted.
+    if(out.data[o+3]>=24&&isHighConfidenceResidual(out.data[o],out.data[o+1],out.data[o+2])&&aid[o+3]<48)out.data[o+3]=0;
   }
   ctx.putImageData(out,0,0);
   return new Promise((resolve,reject)=>c.toBlob(b=>b?resolve(b):reject(new Error("Could not refine bright background.")),"image/png",1));
@@ -1816,9 +1817,10 @@ async function chooseSafeCutout(file){
       // A bright low-saturation residual (for example a white rug under grass)
       // is suspicious. Ask RMBG only about those pixels; its decisions can
       // remove the residual but can never delete dark/blue product sections.
-      if(await brightResidualRatio(clean)>.018){
+      if(await suspiciousResidualRatio(clean)>.00035){
         const evidence=await removeWithBackshotEngine(file);
-        clean=await refineBrightBackground(clean,evidence);
+        clean=await refineResidualBackground(clean,evidence);
+        clean=await cleanupDisconnectedSpecks(clean);
       }
       return clean;
     }
@@ -2115,6 +2117,14 @@ async function applyEditor(){const e=state.editor;if(!e)return;const blob=await 
 function closeEditor(){$("#cutoutModal").classList.add("hidden");state.editor=null;}
 
 /* ---------- Export ---------- */
+function downloadBlob(blob,filename){
+  if(!(blob instanceof Blob)||!blob.size)throw new Error("The export was empty.");
+  const url=URL.createObjectURL(blob),link=document.createElement("a");
+  link.href=url;link.download=filename;link.style.display="none";
+  document.body.appendChild(link);link.click();
+  setTimeout(()=>link.remove(),1000);
+  setTimeout(()=>URL.revokeObjectURL(url),60000);
+}
 async function downloadItems(items, button, filenamePrefix){
   if(!items.length){toast("Select one or more photos first.");return;}
   const originalText=button.textContent;
@@ -2125,13 +2135,14 @@ async function downloadItems(items, button, filenamePrefix){
       const img=await imageFromURL(item.cutoutURL||item.originalURL),canvas=document.createElement("canvas");
       await drawComposite(canvas,item,{width:img.naturalWidth||img.width,height:img.naturalHeight||img.height});
       const transparent=backgroundFor(item).mode==="transparent",mime=transparent?"image/png":"image/jpeg",ext=transparent?"png":"jpg";
-      const blob=await new Promise(r=>canvas.toBlob(r,mime,transparent?undefined:.95));
+      const blob=await new Promise((resolve,reject)=>canvas.toBlob(b=>b?resolve(b):reject(new Error(`Could not export ${item.name}.`)),mime,transparent?undefined:.95));
       const name=(item.name.replace(/\.[^.]+$/,"")||`image-${counter}`).replace(/[^\w\- ]+/g,"").trim().replace(/\s+/g,"-");
       zip.file(`${name||`image-${counter}`}-edited.${ext}`,blob);counter++;
     }
     const out=await zip.generateAsync({type:"blob",compression:"DEFLATE"});
     downloadBlob(out,`${filenamePrefix}-${new Date().toISOString().slice(0,10)}.zip`);
-  }catch(e){console.error(e);toast("Couldn't create ZIP.");}
+    toast(`ZIP ready: ${items.length} photo${items.length===1?"":"s"}.`);
+  }catch(e){console.error(e);toast(`Couldn't create ZIP: ${e?.message||"unknown export error"}`);}
   button.disabled=false;button.textContent=originalText;
 }
 async function downloadSelected(){await downloadItems(selectedItems(),$("#downloadSelectedBtn"),"BackshotAI-selected");}
