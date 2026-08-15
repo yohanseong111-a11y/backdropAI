@@ -117,6 +117,115 @@ async function getImglyMask(file,id,width,height){
   return new Uint8Array(resized.data);
 }
 
+
+function analysePrimaryMask(alpha,w,h){
+  const total=w*h;
+  let strong=0;
+  let soft=0;
+  let minX=w,maxX=-1,minY=h,maxY=-1;
+
+  for(let i=0;i<total;i++){
+    const a=alpha[i];
+    if(a>=128){
+      strong++;
+      const x=i%w,y=(i/w)|0;
+      if(x<minX)minX=x;if(x>maxX)maxX=x;
+      if(y<minY)minY=y;if(y>maxY)maxY=y;
+    }else if(a>=24){
+      soft++;
+    }
+  }
+
+  const visibleRatio=strong/Math.max(1,total);
+  const softRatio=soft/Math.max(1,total);
+
+  if(maxX<minX||maxY<minY){
+    return {
+      suspicious:true,
+      reason:"no foreground",
+      visibleRatio,
+      componentCount:0,
+      holeRatio:1
+    };
+  }
+
+  // Count substantial foreground components.
+  const visited=new Uint8Array(total);
+  const queue=new Int32Array(total);
+  let componentCount=0;
+  let largest=0;
+
+  for(let start=0;start<total;start++){
+    if(visited[start]||alpha[start]<128)continue;
+
+    let head=0,tail=0,count=0;
+    queue[tail++]=start;
+    visited[start]=1;
+
+    while(head<tail){
+      const i=queue[head++];
+      count++;
+      const x=i%w,y=(i/w)|0;
+
+      const add=j=>{
+        if(j<0||j>=total||visited[j]||alpha[j]<128)return;
+        visited[j]=1;
+        queue[tail++]=j;
+      };
+
+      if(x>0)add(i-1);
+      if(x<w-1)add(i+1);
+      if(y>0)add(i-w);
+      if(y<h-1)add(i+w);
+    }
+
+    if(count>Math.max(40,total*0.00015)){
+      componentCount++;
+      if(count>largest)largest=count;
+    }
+  }
+
+  const largestShare=strong?largest/strong:0;
+
+  // Detect enclosed transparent holes inside the foreground bounding box.
+  // A large hole ratio is a strong signal that a jacket/body section was clipped.
+  const bw=maxX-minX+1,bh=maxY-minY+1;
+  const boxArea=Math.max(1,bw*bh);
+  let lowInside=0;
+  let samples=0;
+  const step=Math.max(1,Math.floor(Math.sqrt(boxArea/90000)));
+
+  for(let y=minY;y<=maxY;y+=step){
+    for(let x=minX;x<=maxX;x+=step){
+      samples++;
+      if(alpha[y*w+x]<32)lowInside++;
+    }
+  }
+
+  const holeRatio=samples?lowInside/samples:0;
+
+  // Conservative thresholds:
+  // - tiny/implausible subject -> safety pass
+  // - fragmented subject -> safety pass
+  // - many internal holes -> safety pass
+  // - unusually fuzzy mask -> safety pass
+  const suspicious =
+    visibleRatio<0.045 ||
+    largestShare<0.72 ||
+    componentCount>5 ||
+    holeRatio>0.52 ||
+    softRatio>0.12;
+
+  return {
+    suspicious,
+    visibleRatio,
+    softRatio,
+    componentCount,
+    largestShare,
+    holeRatio
+  };
+}
+
 async function getDualMask(file,id){
   self.postMessage({type:"progress",id,stage:"remove"});
 
@@ -132,8 +241,46 @@ async function getDualMask(file,id){
   }
 
   if(primary){
+    const quality=analysePrimaryMask(
+      primary.alpha,
+      primary.width,
+      primary.height
+    );
+
+    // Fast path: if RMBG already produced a structurally healthy mask,
+    // skip the second model entirely.
+    if(!quality.suspicious){
+      self.postMessage({
+        type:"progress",
+        id,
+        stage:"fast-path",
+        message:"Clean mask found — finishing…"
+      });
+
+      return {
+        width:primary.width,
+        height:primary.height,
+        primary:primary.alpha,
+        safety:null
+      };
+    }
+
+    // Safety model only runs on photos where the first mask looks unsafe.
     try{
-      const safety=await getImglyMask(file,id,primary.width,primary.height);
+      self.postMessage({
+        type:"progress",
+        id,
+        stage:"safety",
+        message:"Protecting missing product areas…"
+      });
+
+      const safety=await getImglyMask(
+        file,
+        id,
+        primary.width,
+        primary.height
+      );
+
       return {
         width:primary.width,
         height:primary.height,
@@ -151,9 +298,16 @@ async function getDualMask(file,id){
     }
   }
 
+  // Primary model failed entirely, so compatibility model becomes the primary.
   try{
     const original=await RawImage.fromBlob(file);
-    const safety=await getImglyMask(file,id,original.width,original.height);
+    const safety=await getImglyMask(
+      file,
+      id,
+      original.width,
+      original.height
+    );
+
     return {
       width:original.width,
       height:original.height,

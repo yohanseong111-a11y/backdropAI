@@ -837,6 +837,146 @@ function combineForegroundMasks(primary,safety){
   return out;
 }
 
+
+function rgbDist(r1,g1,b1,r2,g2,b2){
+  const dr=r1-r2,dg=g1-g2,db=b1-b2;
+  return Math.sqrt(dr*dr+dg*dg+db*db);
+}
+
+function buildConsensusBackgroundClusters(rgb,primary,safety,w,h){
+  const bins=new Map();
+  const total=w*h;
+  const stride=Math.max(1,Math.floor(Math.sqrt(total/160000)));
+
+  for(let y=0;y<h;y+=stride){
+    for(let x=0;x<w;x+=stride){
+      const i=y*w+x;
+      const p=primary[i];
+      const s=safety?safety[i]:p;
+      if(p>35||s>35)continue;
+
+      const o=i*4;
+      const r=rgb[o],g=rgb[o+1],b=rgb[o+2];
+      const key=`${r>>4},${g>>4},${b>>4}`;
+      let e=bins.get(key);
+      if(!e){
+        e={count:0,r:0,g:0,b:0};
+        bins.set(key,e);
+      }
+      e.count++;
+      e.r+=r;e.g+=g;e.b+=b;
+    }
+  }
+
+  return [...bins.values()]
+    .sort((a,b)=>b.count-a.count)
+    .slice(0,10)
+    .map(e=>({count:e.count,r:e.r/e.count,g:e.g/e.count,b:e.b/e.count}));
+}
+
+function rescueForegroundFromConsensus(rgb,alpha,primary,safety,w,h){
+  const total=w*h;
+  const clusters=buildConsensusBackgroundClusters(rgb,primary,safety,w,h);
+  if(!clusters.length)return new Uint8Array(alpha);
+
+  const out=new Uint8Array(alpha);
+  const definiteBg=new Uint8Array(total);
+
+  const bgDistance=i=>{
+    const o=i*4,r=rgb[o],g=rgb[o+1],b=rgb[o+2];
+    let d=999;
+    for(const c of clusters)d=Math.min(d,rgbDist(r,g,b,c.r,c.g,c.b));
+    return d;
+  };
+
+  for(let i=0;i<total;i++){
+    const p=primary[i],s=safety?safety[i]:p;
+    if(p<48 && s<48 && bgDistance(i)<70){
+      definiteBg[i]=1;
+      out[i]=0;
+    }
+  }
+
+  const visited=new Uint8Array(total);
+  const queue=new Int32Array(total);
+  const comps=[];
+
+  for(let start=0;start<total;start++){
+    if(visited[start]||alpha[start]<145)continue;
+    let head=0,tail=0;
+    queue[tail++]=start; visited[start]=1;
+    const pixels=[];
+
+    while(head<tail){
+      const i=queue[head++]; pixels.push(i);
+      const x=i%w,y=(i/w)|0;
+      const add=j=>{
+        if(j<0||j>=total||visited[j]||alpha[j]<145)return;
+        visited[j]=1; queue[tail++]=j;
+      };
+      if(x>0)add(i-1);
+      if(x<w-1)add(i+1);
+      if(y>0)add(i-w);
+      if(y<h-1)add(i+w);
+    }
+    comps.push(pixels);
+  }
+
+  if(!comps.length)return out;
+  comps.sort((a,b)=>b.length-a.length);
+
+  const rescued=new Uint8Array(total);
+  let head=0,tail=0;
+  const minSubstantial=Math.max(150,Math.round(total*0.0025));
+
+  for(const comp of comps){
+    if(comp!==comps[0] && comp.length<minSubstantial)continue;
+    for(const i of comp){
+      if(rescued[i])continue;
+      rescued[i]=1; queue[tail++]=i;
+      out[i]=Math.max(out[i],alpha[i]);
+    }
+  }
+
+  while(head<tail){
+    const i=queue[head++];
+    const x=i%w,y=(i/w)|0,io=i*4;
+
+    const tryRescue=j=>{
+      if(j<0||j>=total||rescued[j]||definiteBg[j])return;
+
+      const jo=j*4;
+      const local=rgbDist(
+        rgb[io],rgb[io+1],rgb[io+2],
+        rgb[jo],rgb[jo+1],rgb[jo+2]
+      );
+      const bgd=bgDistance(j);
+      const p=primary[j],s=safety?safety[j]:p;
+
+      const hasAIEvidence=Math.max(p,s)>=58;
+      const unlikeBackground=bgd>=92;
+      const locallyContinuous=local<=38 && bgd>=74;
+
+      if(!(hasAIEvidence||unlikeBackground||locallyContinuous))return;
+
+      rescued[j]=1; queue[tail++]=j;
+      const modelA=Math.max(p,s,alpha[j]);
+      out[j]=Math.max(modelA,(locallyContinuous||unlikeBackground)?238:165);
+    };
+
+    if(x>0)tryRescue(i-1);
+    if(x<w-1)tryRescue(i+1);
+    if(y>0)tryRescue(i-w);
+    if(y<h-1)tryRescue(i+w);
+  }
+
+  for(let i=0;i<total;i++){
+    if(definiteBg[i])out[i]=0;
+  }
+
+  return out;
+}
+
 function fillEnclosedAlphaHoles(alpha,w,h){
   const total=w*h;
   const outsideBg=new Uint8Array(total);
@@ -1027,11 +1167,6 @@ async function applyDualMaskToFile(file,primaryBuffer,safetyBuffer,maskWidth,mas
   const primary=scaleMask(primaryRaw);
   const safety=safetyRaw?scaleMask(safetyRaw):null;
 
-  let alpha=combineForegroundMasks(primary,safety);
-  alpha=fillEnclosedAlphaHoles(alpha,ow,oh);
-  alpha=removeTinyForegroundIslands(alpha,ow,oh);
-  alpha=refineAlphaEdge(alpha,ow,oh);
-
   const outCanvas=document.createElement("canvas");
   outCanvas.width=ow;outCanvas.height=oh;
   const ctx=outCanvas.getContext("2d",{willReadFrequently:true});
@@ -1039,10 +1174,16 @@ async function applyDualMaskToFile(file,primaryBuffer,safetyBuffer,maskWidth,mas
   bitmap.close?.();
 
   const image=ctx.getImageData(0,0,ow,oh);
+
+  let alpha=combineForegroundMasks(primary,safety);
+  alpha=rescueForegroundFromConsensus(image.data,alpha,primary,safety,ow,oh);
+  alpha=fillEnclosedAlphaHoles(alpha,ow,oh);
+  alpha=removeTinyForegroundIslands(alpha,ow,oh);
+  alpha=refineAlphaEdge(alpha,ow,oh);
   for(let i=0;i<ow*oh;i++){
     let a=alpha[i];
-    if(a<22)a=0;
-    else if(a>242)a=255;
+    if(a<18)a=0;
+    else if(a>236)a=255;
     image.data[i*4+3]=a;
   }
   ctx.putImageData(image,0,0);
@@ -1136,6 +1277,8 @@ async function chooseSafeCutout(file){
       $("#progressText").textContent="Backshot Engine: removing background…";
     }else if(msg.stage==="safety"){
       $("#progressText").textContent=msg.message||"Protecting product details…";
+    }else if(msg.stage==="fast-path"){
+      $("#progressText").textContent=msg.message||"Clean mask found — finishing…";
     }else if(msg.stage==="fallback"){
       $("#progressText").textContent=msg.message||"Switching removal engine…";
     }
@@ -1171,7 +1314,7 @@ async function removeOne(item,queueTotal){
     renderGallery();
 
     // Keep the reveal short; don't block the next batch item for a full second.
-    await new Promise(resolve=>setTimeout(resolve,420));
+    await new Promise(resolve=>setTimeout(resolve,180));
 
     item.status="done";
     item.error=null;
