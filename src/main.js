@@ -1,6 +1,6 @@
 import "./style.css";
 import "./editor.css";
-import {chooseSafeCleanup,isHighConfidenceResidual} from "./mask-safety.js";
+import {chooseSafeCleanup,isHighConfidenceResidual,isNeutralBorderResidual} from "./mask-safety.js";
 import JSZip from "jszip";
 import { removeBackground, preload } from "@imgly/background-removal";
 
@@ -682,7 +682,7 @@ async function refineResidualBackground(baseBlob,aiBlob,originalBlob){
     // Colour is only a suspicion signal. A second segmentation model must also
     // call the pixel background before it can be deleted.
     if(out.data[o+3]>=24&&isHighConfidenceResidual(out.data[o],out.data[o+1],out.data[o+2])&&aid[o+3]<48)out.data[o+3]=0;
-    else if(out.data[o+3]>=24&&aid[o+3]<32&&(bins.get(keyAt(o))||0)>=support)candidate[i]=1;
+    else if(out.data[o+3]>=24&&aid[o+3]<32&&isNeutralBorderResidual(source[o],source[o+1],source[o+2])&&(bins.get(keyAt(o))||0)>=support)candidate[i]=1;
   }
   // Neutral floors and walls can be too dark for a safe global colour rule.
   // Remove them only when their colour was learned from existing transparent
@@ -1954,12 +1954,10 @@ async function processRemovalQueue(queue,label){
   const isMobile=/iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const cores=Math.max(2,Number(navigator.hardwareConcurrency||4));
 
-  // Cap at four simultaneous photos on laptops/desktops.
-  // Phones use two to avoid Safari memory crashes.
   const memory=Number(navigator.deviceMemory||4);
-  // One inference at a time per worker. Parallel ONNX sessions can exhaust
-  // Safari/WebAssembly memory and make every photo fail together.
-  const concurrency=1;
+  // Two-at-once on capable desktops. Keep the single-photo path on mobile and
+  // lower-memory hardware to avoid Safari/WASM crashes and preserve UI speed.
+  const concurrency=!isMobile&&memory>=8&&cores>=8?2:1;
 
   for(let start=0;start<queue.length;start+=concurrency){
     const chunk=queue.slice(start,start+concurrency);

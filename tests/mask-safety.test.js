@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {analyzeMask,chooseSafeCleanup,insideBrushFootprint,isHighConfidenceResidual} from "../src/mask-safety.js";
+import {analyzeMask,chooseSafeCleanup,insideBrushFootprint,isHighConfidenceResidual,isNeutralBorderResidual} from "../src/mask-safety.js";
 
 test("rolls back sudden foreground loss",()=>{
   const protectedMask=new Uint8Array(100).fill(255),cleaned=new Uint8Array(protectedMask);
@@ -31,6 +31,14 @@ test("flags grass and white floor residuals without flagging jacket colours",()=
   assert.equal(isHighConfidenceResidual(28,48,67),false);
   assert.equal(isHighConfidenceResidual(0,168,224),false);
   assert.equal(isHighConfidenceResidual(240,118,35),false);
+});
+
+test("neutral border cleanup accepts floors but rejects dark navy jacket panels",()=>{
+  assert.equal(isNeutralBorderResidual(158,155,149),true);
+  assert.equal(isNeutralBorderResidual(224,226,220),true);
+  assert.equal(isNeutralBorderResidual(35,51,68),false);
+  assert.equal(isNeutralBorderResidual(61,70,79),false);
+  assert.equal(isNeutralBorderResidual(21,153,205),false);
 });
 
 test("accepts cumulative speck removal while product bounds stay intact",()=>{

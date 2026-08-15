@@ -35,3 +35,10 @@ export function isHighConfidenceResidual(r,g,b){
   const neutralBright=max>174&&max-min<58;
   return grass||neutralBright;
 }
+
+export function isNeutralBorderResidual(r,g,b){
+  const max=Math.max(r,g,b),min=Math.min(r,g,b);
+  // Mid/light neutral floor or wall only. Dark navy/grey garment panels must
+  // never enter the border-removal candidate, even if another model misses them.
+  return max>125&&max-min<48;
+}
