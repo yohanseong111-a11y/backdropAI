@@ -18,6 +18,7 @@ const state = {
   bgMode: "transparent",
   solidColor: "#ffffff",
   backgroundScope: "selected",
+  editScopes: {position:"selected",filters:"selected",shadow:"selected"},
   processing: false,
   completed: 0,
   failed: 0,
@@ -105,24 +106,29 @@ app.innerHTML = `
         </div>
       </div>
       <p class="selection-help">Tap photos individually or click-drag across the batch to select several. Edits and “Remove selected” only affect those photos.</p>
-      <fieldset id="selectedControls" disabled>
+      <div class="mini-title scope-title"><span>Position &amp; size</span><div class="tool-group scope-tools"><button class="tool active" data-edit-scope="position" data-scope="selected">Selected</button><button class="tool" data-edit-scope="position" data-scope="batch">Whole batch</button></div></div>
+      <fieldset id="positionControls" disabled>
         <label class="control-row"><span>Scale</span><input id="scaleRange" type="range" min="0.55" max="1.35" step="0.01" value="1" /></label>
         <label class="control-row"><span>Horizontal</span><input id="xRange" type="range" min="-30" max="30" step="1" value="0" /></label>
         <label class="control-row"><span>Vertical</span><input id="yRange" type="range" min="-30" max="30" step="1" value="0" /></label>
-
-        <div class="mini-title">Filters</div>
+      </fieldset>
+      <div class="mini-title scope-title"><span>Filters</span><div class="tool-group scope-tools"><button class="tool active" data-edit-scope="filters" data-scope="selected">Selected</button><button class="tool" data-edit-scope="filters" data-scope="batch">Whole batch</button></div></div>
+      <fieldset id="filterControls" disabled>
         <label class="control-row"><span>Brightness</span><input id="brightnessRange" type="range" min="50" max="150" step="1" value="100" /></label>
         <label class="control-row"><span>Contrast</span><input id="contrastRange" type="range" min="50" max="150" step="1" value="100" /></label>
         <label class="control-row"><span>Saturation</span><input id="saturationRange" type="range" min="0" max="200" step="1" value="100" /></label>
-        <button id="resetSelected" class="ghost reset-btn" type="button">Reset selected edits</button>
+        <button id="resetSelected" class="ghost reset-btn" type="button">Reset scoped edits</button>
       </fieldset>
 
       <div class="divider"></div>
       <div class="section-title">4. Shadow</div>
-      <label class="toggle-row"><span>Shadow</span><input id="shadowEnabled" type="checkbox" checked /></label>
-      <label class="control-row"><span>Strength</span><input id="shadowOpacity" type="range" min="0" max="0.5" step="0.01" value="0.22" /></label>
-      <label class="control-row"><span>Softness</span><input id="shadowBlur" type="range" min="0" max="70" step="1" value="24" /></label>
-      <label class="control-row"><span>Distance</span><input id="shadowY" type="range" min="-30" max="70" step="1" value="18" /></label>
+      <div class="background-scope-row"><span>Apply shadow to</span><div class="tool-group scope-tools"><button class="tool active" data-edit-scope="shadow" data-scope="selected">Selected</button><button class="tool" data-edit-scope="shadow" data-scope="batch">Whole batch</button></div></div>
+      <fieldset id="shadowControls" disabled>
+        <label class="toggle-row"><span>Shadow</span><input id="shadowEnabled" type="checkbox" checked /></label>
+        <label class="control-row"><span>Strength</span><input id="shadowOpacity" type="range" min="0" max="0.5" step="0.01" value="0.22" /></label>
+        <label class="control-row"><span>Softness</span><input id="shadowBlur" type="range" min="0" max="70" step="1" value="24" /></label>
+        <label class="control-row"><span>Distance</span><input id="shadowY" type="range" min="-30" max="70" step="1" value="18" /></label>
+      </fieldset>
 
       <div class="divider"></div>
       <button id="downloadSelectedBtn" class="primary success secondary-download">Download selected</button>
@@ -245,9 +251,16 @@ function statusText(item) {
 }
 function toggleSelected(id) {
   state.selected.has(id) ? state.selected.delete(id) : state.selected.add(id);
-  renderGallery(); updateSelectionUI();
+  updateSelectionClasses(); updateSelectionUI();
 }
 function selectedItems(){ return state.items.filter(i=>state.selected.has(i.id)); }
+function updateSelectionClasses(){
+  for(const card of gallery.querySelectorAll(".photo-card")){
+    const selected=state.selected.has(card.dataset.card);
+    card.classList.toggle("selected",selected);
+    const chip=card.querySelector(".select-chip");if(chip)chip.textContent=selected?"✓":"";
+  }
+}
 function renderGallery() {
   $("#batchCount").textContent = `${state.items.length} photo${state.items.length === 1 ? "" : "s"}`;
   gallery.innerHTML = state.items.map((item,index)=>`
@@ -284,7 +297,9 @@ function renderGallery() {
 function updateSelectionUI(){const ds=$("#downloadSelectedBtn");if(ds)ds.disabled=state.selected.size===0;
   const items=selectedItems(), first=items[0];
   $("#selectedCount").textContent=`${items.length} selected`;
-  $("#selectedControls").disabled=!items.length;
+  $("#positionControls").disabled=state.editScopes.position==="selected"&&!items.length;
+  $("#filterControls").disabled=state.editScopes.filters==="selected"&&!items.length;
+  $("#shadowControls").disabled=state.editScopes.shadow==="selected"&&!items.length;
   const clearSelected=$("#clearSelectedBackground");if(clearSelected)clearSelected.disabled=!items.length;
   if(first){
     const background=backgroundFor(first);
@@ -303,18 +318,23 @@ function updateSelectionUI(){const ds=$("#downloadSelectedBtn");if(ds)ds.disable
     $("#shadowEnabled").checked=shadowCfg.enabled; $("#shadowOpacity").value=shadowCfg.opacity; $("#shadowBlur").value=shadowCfg.blur; $("#shadowY").value=shadowCfg.offsetY;
   }
 }
-function applyToSelected(key,value){
-  const items=selectedItems(); if(!items.length){toast("Select one or more photos first.");return;}
-  for(const item of items)item.adj[key]=value;
-  renderAllPreviews();
+function editTargets(category){
+  const items=state.editScopes[category]==="batch"?state.items:selectedItems();
+  if(!items.length)toast(state.editScopes[category]==="batch"?"Add photos first.":"Select one or more photos first.");
+  return items;
 }
-function applyShadowToSelected(key,value){
-  const items=selectedItems(); if(!items.length){toast("Select one or more photos first.");return;}
+function applyScopedEdit(category,key,value){
+  const items=editTargets(category);if(!items.length)return;
+  for(const item of items)item.adj[key]=value;
+  schedulePreviewRender();
+}
+function applyScopedShadow(key,value){
+  const items=editTargets("shadow");if(!items.length)return;
   for(const item of items){
     item.adj.shadow ||= {enabled:true,opacity:.22,blur:24,offsetY:18};
     item.adj.shadow[key]=value;
   }
-  renderAllPreviews();
+  schedulePreviewRender();
 }
 
 function removalConfig(mode, progress, useWorker = true) {
@@ -640,23 +660,37 @@ async function suspiciousResidualRatio(blob){
   const d=ctx.getImageData(0,0,c.width,c.height).data;let suspicious=0,visible=0;
   for(let i=0;i<d.length;i+=4){
     if(d[i+3]<128)continue;visible++;
-    if(isHighConfidenceResidual(d[i],d[i+1],d[i+2]))suspicious++;
+    const pixel=i/4,x=pixel%c.width,y=(pixel/c.width)|0,max=Math.max(d[i],d[i+1],d[i+2]),min=Math.min(d[i],d[i+1],d[i+2]);
+    const neutralEdge=(y>c.height*.88||x<c.width*.05||x>c.width*.95)&&max>95&&max-min<52;
+    if(isHighConfidenceResidual(d[i],d[i+1],d[i+2])||neutralEdge)suspicious++;
   }
   return suspicious/Math.max(1,visible);
 }
 
-async function refineResidualBackground(baseBlob,aiBlob){
-  const [base,ai]=await Promise.all([createImageBitmap(baseBlob),createImageBitmap(aiBlob)]);
+async function refineResidualBackground(baseBlob,aiBlob,originalBlob){
+  const [base,ai,original]=await Promise.all([createImageBitmap(baseBlob),createImageBitmap(aiBlob),createImageBitmap(originalBlob)]);
   const c=document.createElement("canvas");c.width=base.width;c.height=base.height;const ctx=c.getContext("2d",{willReadFrequently:true});
   ctx.drawImage(base,0,0);const out=ctx.getImageData(0,0,c.width,c.height);
   ctx.clearRect(0,0,c.width,c.height);ctx.drawImage(ai,0,0,c.width,c.height);const aid=ctx.getImageData(0,0,c.width,c.height).data;
-  base.close?.();ai.close?.();
+  ctx.clearRect(0,0,c.width,c.height);ctx.drawImage(original,0,0,c.width,c.height);const source=ctx.getImageData(0,0,c.width,c.height).data;
+  base.close?.();ai.close?.();original.close?.();
+  const bins=new Map(),keyAt=o=>`${source[o]>>4},${source[o+1]>>4},${source[o+2]>>4}`;let transparent=0;
+  for(let i=0;i<c.width*c.height;i++){const o=i*4;if(out.data[o+3]<24){const key=keyAt(o);bins.set(key,(bins.get(key)||0)+1);transparent++;}}
+  const support=Math.max(6,Math.round(transparent*.00008)),candidate=new Uint8Array(c.width*c.height),borderResidual=new Uint8Array(c.width*c.height),queue=[];
   for(let i=0;i<c.width*c.height;i++){
     const o=i*4;
     // Colour is only a suspicion signal. A second segmentation model must also
     // call the pixel background before it can be deleted.
     if(out.data[o+3]>=24&&isHighConfidenceResidual(out.data[o],out.data[o+1],out.data[o+2])&&aid[o+3]<48)out.data[o+3]=0;
+    else if(out.data[o+3]>=24&&aid[o+3]<32&&(bins.get(keyAt(o))||0)>=support)candidate[i]=1;
   }
+  // Neutral floors and walls can be too dark for a safe global colour rule.
+  // Remove them only when their colour was learned from existing transparent
+  // background, the AI agrees, and the residual is connected to the frame.
+  const push=i=>{if(i>=0&&i<candidate.length&&candidate[i]&&!borderResidual[i]){borderResidual[i]=1;queue.push(i);}};
+  for(let x=0;x<c.width;x++){push(x);push((c.height-1)*c.width+x);}for(let y=0;y<c.height;y++){push(y*c.width);push(y*c.width+c.width-1);}
+  for(let head=0;head<queue.length;head++){const i=queue[head],x=i%c.width;if(x)push(i-1);if(x<c.width-1)push(i+1);if(i>=c.width)push(i-c.width);if(i<candidate.length-c.width)push(i+c.width);}
+  for(let i=0;i<borderResidual.length;i++)if(borderResidual[i])out.data[i*4+3]=0;
   ctx.putImageData(out,0,0);
   return new Promise((resolve,reject)=>c.toBlob(b=>b?resolve(b):reject(new Error("Could not refine bright background.")),"image/png",1));
 }
@@ -1819,7 +1853,7 @@ async function chooseSafeCutout(file){
       // remove the residual but can never delete dark/blue product sections.
       if(await suspiciousResidualRatio(clean)>.00035){
         const evidence=await removeWithBackshotEngine(file);
-        clean=await refineResidualBackground(clean,evidence);
+        clean=await refineResidualBackground(clean,evidence,file);
         clean=await cleanupDisconnectedSpecks(clean);
       }
       return clean;
@@ -1877,8 +1911,9 @@ async function removeOne(item,queueTotal){
     item.status="revealing";
     renderGallery();
 
-    // Keep the reveal short; don't block the next batch item for a full second.
-    await new Promise(resolve=>setTimeout(resolve,180));
+    // Let the compositor-driven wipe finish before replacing its DOM. Cutting
+    // this short caused the final frame to flash in larger batches.
+    await new Promise(resolve=>setTimeout(resolve,740));
 
     item.status="done";
     item.error=null;
@@ -2012,7 +2047,25 @@ async function drawComposite(canvas,item,exportSize=null){
   }
   ctx.drawImage(subject,x,y,dw,dh);ctx.restore();
 }
-async function renderAllPreviews(){for(const canvas of document.querySelectorAll(".preview-canvas")){const item=state.items[Number(canvas.dataset.index)];if(!item)continue;try{const img=await imageFromURL(item.cutoutURL||item.originalURL),ratio=(img.naturalHeight||img.height)/(img.naturalWidth||img.width),w=Math.max(260,canvas.parentElement.clientWidth*2);await drawComposite(canvas,item,{width:Math.round(w),height:Math.round(w*ratio)});}catch{}}}
+let previewRenderFrame=0,previewRenderGeneration=0;
+function schedulePreviewRender(){
+  cancelAnimationFrame(previewRenderFrame);
+  previewRenderFrame=requestAnimationFrame(()=>renderAllPreviews());
+}
+async function renderAllPreviews(){
+  const generation=++previewRenderGeneration;
+  await Promise.all([...document.querySelectorAll(".preview-canvas")].map(async canvas=>{
+    const item=state.items[Number(canvas.dataset.index)];if(!item)return;
+    try{
+      const img=await imageFromURL(item.cutoutURL||item.originalURL),ratio=(img.naturalHeight||img.height)/(img.naturalWidth||img.width),w=Math.max(260,canvas.parentElement.clientWidth*2);
+      const buffer=document.createElement("canvas");
+      await drawComposite(buffer,item,{width:Math.round(w),height:Math.round(w*ratio)});
+      if(generation!==previewRenderGeneration||!canvas.isConnected)return;
+      if(canvas.width!==buffer.width)canvas.width=buffer.width;if(canvas.height!==buffer.height)canvas.height=buffer.height;
+      const ctx=canvas.getContext("2d");ctx.clearRect(0,0,canvas.width,canvas.height);ctx.drawImage(buffer,0,0);
+    }catch(error){console.warn("Preview render skipped",error);}
+  }));
+}
 
 /* ---------- Cutout editor ---------- */
 const ASSIST_LOCAL_RADIUS=96;
@@ -2170,8 +2223,8 @@ const tutorialSteps=[
     visual:"▧"
   },
   {
-    title:"Adjust selected photos",
-    text:"Scale, move, brighten, change contrast or saturation. These changes only affect the selected photos.",
+    title:"Adjust selected photos or the batch",
+    text:"Position, filters and shadows each have their own Selected or Whole batch switch, so every category follows the scope you choose.",
     visual:"↔"
   },
   {
@@ -2270,10 +2323,21 @@ $("#clearBackground").onclick=()=>{
   if(state.backgroundScope==="selected"){$("#clearSelectedBackground").click();return;}
   if(state.backgroundURL)URL.revokeObjectURL(state.backgroundURL);state.backgroundURL=null;state.backgroundName="";backgroundInput.value="";$("#backgroundPreview").classList.add("hidden");state.bgMode="transparent";for(const item of state.items)replaceItemBackground(item,null);document.querySelectorAll(".seg").forEach(b=>b.classList.toggle("active",b.dataset.bg==="transparent"));renderAllPreviews();
 };
-$("#selectAll").onclick=()=>{state.selected=new Set(state.items.map(i=>i.id));renderGallery();updateSelectionUI();};$("#selectNone").onclick=()=>{state.selected.clear();renderGallery();updateSelectionUI();};
-$("#scaleRange").oninput=e=>applyToSelected("scale",Number(e.target.value));$("#xRange").oninput=e=>applyToSelected("offsetX",Number(e.target.value));$("#yRange").oninput=e=>applyToSelected("offsetY",Number(e.target.value));$("#brightnessRange").oninput=e=>applyToSelected("brightness",Number(e.target.value));$("#contrastRange").oninput=e=>applyToSelected("contrast",Number(e.target.value));$("#saturationRange").oninput=e=>applyToSelected("saturation",Number(e.target.value));
+$("#selectAll").onclick=()=>{state.selected=new Set(state.items.map(i=>i.id));updateSelectionClasses();updateSelectionUI();};$("#selectNone").onclick=()=>{state.selected.clear();updateSelectionClasses();updateSelectionUI();};
+document.querySelectorAll("[data-edit-scope]").forEach(button=>button.onclick=()=>{
+  const category=button.dataset.editScope;state.editScopes[category]=button.dataset.scope;
+  document.querySelectorAll(`[data-edit-scope="${category}"]`).forEach(peer=>peer.classList.toggle("active",peer===button));
+  updateSelectionUI();
+});
+$("#scaleRange").oninput=e=>applyScopedEdit("position","scale",Number(e.target.value));$("#xRange").oninput=e=>applyScopedEdit("position","offsetX",Number(e.target.value));$("#yRange").oninput=e=>applyScopedEdit("position","offsetY",Number(e.target.value));$("#brightnessRange").oninput=e=>applyScopedEdit("filters","brightness",Number(e.target.value));$("#contrastRange").oninput=e=>applyScopedEdit("filters","contrast",Number(e.target.value));$("#saturationRange").oninput=e=>applyScopedEdit("filters","saturation",Number(e.target.value));
 
-$("#resetSelected").onclick=()=>{for(const i of selectedItems())i.adj=DEFAULT_ADJ();updateSelectionUI();renderAllPreviews();};
+$("#resetSelected").onclick=()=>{
+  const positionTargets=editTargets("position"),filterTargets=editTargets("filters"),shadowTargets=editTargets("shadow");
+  for(const item of positionTargets){item.adj.scale=1;item.adj.offsetX=0;item.adj.offsetY=0;}
+  for(const item of filterTargets){item.adj.brightness=100;item.adj.contrast=100;item.adj.saturation=100;}
+  for(const item of shadowTargets)item.adj.shadow=DEFAULT_ADJ().shadow;
+  updateSelectionUI();schedulePreviewRender();
+};
 
 const dragSelectBox=$("#dragSelectBox");
 
@@ -2291,7 +2355,7 @@ function applyDragSelection(rect){
     const hit=!(r.right<rect.left||r.left>rect.right||r.bottom<rect.top||r.top>rect.bottom);
     if(hit){const id=card.dataset.card;if(id&&!state.selected.has(id)){state.selected.add(id);hits++;}}
   }
-  if(hits){renderGallery();updateSelectionUI();}
+  if(hits){updateSelectionClasses();updateSelectionUI();}
 }
 gallery.addEventListener("pointerdown",e=>{
   if(e.target.closest("button"))return;
@@ -2324,10 +2388,10 @@ function finishDragSelection(e){
 gallery.addEventListener("pointerup",finishDragSelection);
 gallery.addEventListener("pointercancel",()=>{state.dragSelecting=false;state.dragMoved=false;dragSelectBox.classList.add("hidden");});
 
-$("#shadowEnabled").onchange=e=>applyShadowToSelected("enabled",e.target.checked);
-$("#shadowOpacity").oninput=e=>applyShadowToSelected("opacity",Number(e.target.value));
-$("#shadowBlur").oninput=e=>applyShadowToSelected("blur",Number(e.target.value));
-$("#shadowY").oninput=e=>applyShadowToSelected("offsetY",Number(e.target.value));
+$("#shadowEnabled").onchange=e=>applyScopedShadow("enabled",e.target.checked);
+$("#shadowOpacity").oninput=e=>applyScopedShadow("opacity",Number(e.target.value));
+$("#shadowBlur").oninput=e=>applyScopedShadow("blur",Number(e.target.value));
+$("#shadowY").oninput=e=>applyScopedShadow("offsetY",Number(e.target.value));
 $("#eraseTool").onclick=()=>{state.editor.mode="erase";updateEditorUI();};$("#restoreTool").onclick=()=>{state.editor.mode="restore";updateEditorUI();};$("#assistToggle").onchange=updateEditorUI;$("#undoEdit").onclick=undo;$("#redoEdit").onclick=redo;$("#smartRecover").onclick=smartRecover;$("#applyEdit").onclick=applyEditor;$("#closeEditor").onclick=closeEditor;$("#cutoutModal").onclick=e=>{if(e.target.id==="cutoutModal")closeEditor();};
 $("#zoomOutEditor").onclick=()=>setEditorZoom((state.editor?.viewScale||1)/1.25);$("#zoomInEditor").onclick=()=>setEditorZoom((state.editor?.viewScale||1)*1.25);$("#fitEditor").onclick=()=>setEditorZoom(1);
 let installPrompt=null;window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();installPrompt=e;$("#installBtn").classList.remove("hidden");});$("#installBtn").onclick=async()=>{if(!installPrompt){toast("On iPhone: Safari → Share → Add to Home Screen");return;}installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;$("#installBtn").classList.add("hidden");};
