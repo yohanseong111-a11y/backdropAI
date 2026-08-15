@@ -17,6 +17,7 @@ const state = {
   backgroundName: "",
   bgMode: "transparent",
   solidColor: "#ffffff",
+  backgroundScope: "selected",
   processing: false,
   completed: 0,
   failed: 0,
@@ -68,6 +69,13 @@ app.innerHTML = `
 
       <div class="divider"></div>
       <div class="section-title">2. New background</div>
+      <div class="background-scope-row">
+        <span>Apply background to</span>
+        <div class="tool-group">
+          <button id="backgroundScopeSelected" class="tool active" type="button">Selected</button>
+          <button id="backgroundScopeBatch" class="tool" type="button">Whole batch</button>
+        </div>
+      </div>
       <div class="segmented">
         <button data-bg="transparent" class="seg active">Transparent</button>
         <button data-bg="solid" class="seg">Colour</button>
@@ -85,6 +93,8 @@ app.innerHTML = `
         <div><strong>Current background</strong><span id="backgroundPreviewName"></span></div>
         <button id="clearBackground" class="icon-btn mini" type="button">×</button>
       </div>
+      <button id="clearSelectedBackground" class="ghost reset-btn" type="button">Remove replacement from selected</button>
+      <p class="privacy-note">Keeps the existing cutout intact so you can try another colour or image.</p>
 
       <div class="divider"></div>
       <div class="selection-head">
@@ -213,6 +223,7 @@ function escapeHtml(str) { return str.replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&
 function cleanupItem(item) {
   if (item.originalURL) URL.revokeObjectURL(item.originalURL);
   if (item.cutoutURL) URL.revokeObjectURL(item.cutoutURL);
+  if (item.background?.url) URL.revokeObjectURL(item.background.url);
 }
 function addFiles(fileList) {
   const files = Array.from(fileList || []).filter(f => f.type.startsWith("image/"));
@@ -220,7 +231,7 @@ function addFiles(fileList) {
     state.items.push({
       id: crypto.randomUUID(), name: file.name, file,
       originalURL: URL.createObjectURL(file), cutoutBlob: null, cutoutURL: null,
-      status: "waiting", error: null, adj: DEFAULT_ADJ()
+      status: "waiting", error: null, adj: DEFAULT_ADJ(), background: null
     });
   }
   if (files.length) {
@@ -274,7 +285,18 @@ function updateSelectionUI(){const ds=$("#downloadSelectedBtn");if(ds)ds.disable
   const items=selectedItems(), first=items[0];
   $("#selectedCount").textContent=`${items.length} selected`;
   $("#selectedControls").disabled=!items.length;
+  const clearSelected=$("#clearSelectedBackground");if(clearSelected)clearSelected.disabled=!items.length;
   if(first){
+    const background=backgroundFor(first);
+    document.querySelectorAll(".seg").forEach(button=>button.classList.toggle("active",button.dataset.bg===background.mode));
+    $("#solidControls").classList.toggle("hidden",background.mode!=="solid");
+    $("#backgroundPicker").classList.toggle("hidden",background.mode!=="image");
+    if(background.mode==="solid")$("#solidColor").value=background.color||state.solidColor;
+    if(background.mode==="image"&&background.url){
+      $("#backgroundPreviewImage").src=background.url;
+      $("#backgroundPreviewName").textContent=background.name||"Selected background";
+      $("#backgroundPreview").classList.remove("hidden");
+    }else $("#backgroundPreview").classList.add("hidden");
     $("#scaleRange").value=first.adj.scale; $("#xRange").value=first.adj.offsetX; $("#yRange").value=first.adj.offsetY;
     $("#brightnessRange").value=first.adj.brightness; $("#contrastRange").value=first.adj.contrast; $("#saturationRange").value=first.adj.saturation;
     const shadowCfg=first.adj.shadow||{enabled:true,opacity:.22,blur:24,offsetY:18};
@@ -581,11 +603,34 @@ async function cleanupDisconnectedSpecks(blob){
   const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0);bmp.close?.();
   const image=ctx.getImageData(0,0,c.width,c.height),alpha=new Uint8Array(c.width*c.height);
   for(let i=0;i<alpha.length;i++)alpha[i]=image.data[i*4+3];
-  const cleaned=removeTinyForegroundIslands(alpha,c.width,c.height);
+  let cleaned=removeTinyForegroundIslands(alpha,c.width,c.height);
+  cleaned=removeGreenBoundaryFringe(image.data,cleaned,c.width,c.height);
+  cleaned=refineAlphaEdge(cleaned,c.width,c.height);
   const safe=chooseSafeCleanup(alpha,cleaned,c.width,c.height);
   for(let i=0;i<safe.length;i++)image.data[i*4+3]=safe[i];
   ctx.putImageData(image,0,0);
   return new Promise((resolve,reject)=>c.toBlob(b=>b?resolve(b):reject(new Error("Could not create cleaned cutout.")),"image/png",1));
+}
+
+function removeGreenBoundaryFringe(rgba,alpha,w,h){
+  const out=new Uint8Array(alpha),nearBackground=new Uint8Array(w*h);
+  for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){
+    const i=y*w+x;if(alpha[i]<24)continue;
+    let touchesBackground=false;
+    for(let oy=-2;oy<=2&&!touchesBackground;oy++)for(let ox=-2;ox<=2;ox++){
+      const nx=x+ox,ny=y+oy;if(nx<0||ny<0||nx>=w||ny>=h)continue;
+      if(alpha[ny*w+nx]<24){touchesBackground=true;break;}
+    }
+    if(touchesBackground)nearBackground[i]=1;
+  }
+  for(let i=0;i<out.length;i++){
+    if(!nearBackground[i])continue;
+    const o=i*4,r=rgba[o],g=rgba[o+1],b=rgba[o+2];
+    // Remove only unmistakably green fringe pixels in a two-pixel boundary.
+    // Navy, grey, cyan, white phone bezels and orange tags cannot match this.
+    if(g>r*1.10&&g>b*1.04&&g-r>12)out[i]=0;
+  }
+  return out;
 }
 
 async function brightResidualRatio(blob){
@@ -1927,10 +1972,34 @@ function updateProgress(total=state.items.length){
 
 async function imageFromURL(url){return new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>resolve(img);img.onerror=reject;img.src=url;});}
 function drawCover(ctx,img,w,h){const iw=img.naturalWidth||img.width,ih=img.naturalHeight||img.height,s=Math.max(w/iw,h/ih),dw=iw*s,dh=ih*s;ctx.drawImage(img,(w-dw)/2,(h-dh)/2,dw,dh);}
+function backgroundFor(item){
+  return item.background||{mode:state.bgMode,color:state.solidColor,url:state.backgroundURL,name:state.backgroundName||""};
+}
+function replaceItemBackground(item,next){
+  if(item.background?.url)URL.revokeObjectURL(item.background.url);
+  item.background=next;
+}
+function backgroundTargets(){
+  if(state.backgroundScope==="batch")return state.items;
+  const items=selectedItems();
+  if(!items.length)toast("Select one or more photos first, or choose Whole batch.");
+  return items;
+}
+function applyBackgroundMode(mode){
+  const targets=backgroundTargets();if(!targets.length)return false;
+  if(state.backgroundScope==="batch"){
+    state.bgMode=mode;
+    for(const item of state.items)replaceItemBackground(item,null);
+  }else{
+    for(const item of targets)replaceItemBackground(item,{mode,color:state.solidColor,url:null,name:""});
+  }
+  renderAllPreviews();return true;
+}
 async function drawComposite(canvas,item,exportSize=null){
   const sourceURL=item.cutoutURL||item.originalURL;if(!sourceURL)return;const subject=await imageFromURL(sourceURL),sw=subject.naturalWidth||subject.width,sh=subject.naturalHeight||subject.height;
   const tw=exportSize?.width||sw,th=exportSize?.height||sh;canvas.width=tw;canvas.height=th;const ctx=canvas.getContext("2d");ctx.clearRect(0,0,tw,th);
-  if(state.bgMode==="solid"){ctx.fillStyle=state.solidColor;ctx.fillRect(0,0,tw,th);}else if(state.bgMode==="image"&&state.backgroundURL){drawCover(ctx,await imageFromURL(state.backgroundURL),tw,th);}
+  const background=backgroundFor(item);
+  if(background.mode==="solid"){ctx.fillStyle=background.color||"#ffffff";ctx.fillRect(0,0,tw,th);}else if(background.mode==="image"&&background.url){drawCover(ctx,await imageFromURL(background.url),tw,th);}
   const a=item.adj||DEFAULT_ADJ(),dw=tw*a.scale,dh=th*a.scale,x=(tw-dw)/2+tw*(a.offsetX/100),y=(th-dh)/2+th*(a.offsetY/100);
   ctx.save();ctx.filter=`brightness(${a.brightness}%) contrast(${a.contrast}%) saturate(${a.saturation}%)`;
   const shadowCfg=a.shadow||{enabled:true,opacity:.22,blur:24,offsetY:18};
@@ -2055,7 +2124,7 @@ async function downloadItems(items, button, filenamePrefix){
     for(const item of items){
       const img=await imageFromURL(item.cutoutURL||item.originalURL),canvas=document.createElement("canvas");
       await drawComposite(canvas,item,{width:img.naturalWidth||img.width,height:img.naturalHeight||img.height});
-      const transparent=state.bgMode==="transparent",mime=transparent?"image/png":"image/jpeg",ext=transparent?"png":"jpg";
+      const transparent=backgroundFor(item).mode==="transparent",mime=transparent?"image/png":"image/jpeg",ext=transparent?"png":"jpg";
       const blob=await new Promise(r=>canvas.toBlob(r,mime,transparent?undefined:.95));
       const name=(item.name.replace(/\.[^.]+$/,"")||`image-${counter}`).replace(/[^\w\- ]+/g,"").trim().replace(/\s+/g,"-");
       zip.file(`${name||`image-${counter}`}-edited.${ext}`,blob);counter++;
@@ -2149,10 +2218,47 @@ $("#removeSelectedBtn").onclick=removeSelectedBackgrounds;
 $("#removeAllBtn").onclick=removeAllBackgrounds;
 $("#downloadSelectedBtn").onclick=downloadSelected;$("#downloadAllBtn").onclick=downloadAll;
 $("#clearBtn").onclick=()=>{for(const i of state.items)cleanupItem(i);state.items=[];state.selected.clear();workspace.classList.add("hidden");gallery.innerHTML="";updateSelectionUI();};
-document.querySelectorAll(".seg").forEach(btn=>btn.onclick=()=>{state.bgMode=btn.dataset.bg;document.querySelectorAll(".seg").forEach(b=>b.classList.toggle("active",b===btn));$("#solidControls").classList.toggle("hidden",state.bgMode!=="solid");$("#backgroundPicker").classList.toggle("hidden",state.bgMode!=="image");renderAllPreviews();});
-$("#solidColor").oninput=e=>{state.solidColor=e.target.value;renderAllPreviews();};
-backgroundInput.onchange=e=>{const f=e.target.files?.[0];if(!f)return;if(state.backgroundURL)URL.revokeObjectURL(state.backgroundURL);state.backgroundURL=URL.createObjectURL(f);state.backgroundName=f.name;state.bgMode="image";$("#backgroundPreviewImage").src=state.backgroundURL;$("#backgroundPreviewName").textContent=f.name;$("#backgroundPreview").classList.remove("hidden");document.querySelectorAll(".seg").forEach(b=>b.classList.toggle("active",b.dataset.bg==="image"));renderAllPreviews();toast("Background applied to the whole batch.");};
-$("#clearBackground").onclick=()=>{if(state.backgroundURL)URL.revokeObjectURL(state.backgroundURL);state.backgroundURL=null;state.backgroundName="";backgroundInput.value="";$("#backgroundPreview").classList.add("hidden");state.bgMode="transparent";document.querySelectorAll(".seg").forEach(b=>b.classList.toggle("active",b.dataset.bg==="transparent"));renderAllPreviews();};
+function setBackgroundScope(scope){
+  state.backgroundScope=scope;
+  $("#backgroundScopeSelected").classList.toggle("active",scope==="selected");
+  $("#backgroundScopeBatch").classList.toggle("active",scope==="batch");
+}
+$("#backgroundScopeSelected").onclick=()=>setBackgroundScope("selected");
+$("#backgroundScopeBatch").onclick=()=>setBackgroundScope("batch");
+document.querySelectorAll(".seg").forEach(btn=>btn.onclick=()=>{
+  const mode=btn.dataset.bg;
+  document.querySelectorAll(".seg").forEach(b=>b.classList.toggle("active",b===btn));
+  $("#solidControls").classList.toggle("hidden",mode!=="solid");
+  $("#backgroundPicker").classList.toggle("hidden",mode!=="image");
+  if(mode!=="image"&&applyBackgroundMode(mode))toast(`${mode==="transparent"?"Replacement removed from":"Background applied to"} ${state.backgroundScope==="batch"?"the whole batch":"selected photos"}.`);
+});
+$("#solidColor").oninput=e=>{
+  state.solidColor=e.target.value;const targets=backgroundTargets();if(!targets.length)return;
+  if(state.backgroundScope==="batch"){
+    state.bgMode="solid";for(const item of state.items)replaceItemBackground(item,null);
+  }else for(const item of targets)replaceItemBackground(item,{mode:"solid",color:state.solidColor,url:null,name:""});
+  renderAllPreviews();
+};
+backgroundInput.onchange=e=>{
+  const f=e.target.files?.[0];if(!f)return;const targets=backgroundTargets();if(!targets.length){backgroundInput.value="";return;}
+  if(state.backgroundScope==="batch"){
+    if(state.backgroundURL)URL.revokeObjectURL(state.backgroundURL);
+    state.backgroundURL=URL.createObjectURL(f);state.backgroundName=f.name;state.bgMode="image";
+    for(const item of state.items)replaceItemBackground(item,null);
+    $("#backgroundPreviewImage").src=state.backgroundURL;
+  }else{
+    for(const item of targets)replaceItemBackground(item,{mode:"image",color:state.solidColor,url:URL.createObjectURL(f),name:f.name});
+    $("#backgroundPreviewImage").src=targets[0].background.url;
+  }
+  $("#backgroundPreviewName").textContent=f.name;$("#backgroundPreview").classList.remove("hidden");
+  document.querySelectorAll(".seg").forEach(b=>b.classList.toggle("active",b.dataset.bg==="image"));renderAllPreviews();
+  toast(`New background applied to ${state.backgroundScope==="batch"?"the whole batch":"selected photos"}.`);
+};
+$("#clearSelectedBackground").onclick=()=>{const items=selectedItems();if(!items.length){toast("Select one or more photos first.");return;}for(const item of items)replaceItemBackground(item,{mode:"transparent",color:state.solidColor,url:null,name:""});renderAllPreviews();toast("Replacement background removed from selected photos.");};
+$("#clearBackground").onclick=()=>{
+  if(state.backgroundScope==="selected"){$("#clearSelectedBackground").click();return;}
+  if(state.backgroundURL)URL.revokeObjectURL(state.backgroundURL);state.backgroundURL=null;state.backgroundName="";backgroundInput.value="";$("#backgroundPreview").classList.add("hidden");state.bgMode="transparent";for(const item of state.items)replaceItemBackground(item,null);document.querySelectorAll(".seg").forEach(b=>b.classList.toggle("active",b.dataset.bg==="transparent"));renderAllPreviews();
+};
 $("#selectAll").onclick=()=>{state.selected=new Set(state.items.map(i=>i.id));renderGallery();updateSelectionUI();};$("#selectNone").onclick=()=>{state.selected.clear();renderGallery();updateSelectionUI();};
 $("#scaleRange").oninput=e=>applyToSelected("scale",Number(e.target.value));$("#xRange").oninput=e=>applyToSelected("offsetX",Number(e.target.value));$("#yRange").oninput=e=>applyToSelected("offsetY",Number(e.target.value));$("#brightnessRange").oninput=e=>applyToSelected("brightness",Number(e.target.value));$("#contrastRange").oninput=e=>applyToSelected("contrast",Number(e.target.value));$("#saturationRange").oninput=e=>applyToSelected("saturation",Number(e.target.value));
 

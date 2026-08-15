@@ -4,6 +4,7 @@
   display:flex;align-items:center;justify-content:space-between;gap:10px;
   margin:0 0 12px;font-size:12px;color:#aaaab2
 }
+.background-scope-row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 9px;color:#aaaab2;font-size:11px}.background-scope-row .tool{padding:6px 9px;font-size:10px}
 .quality-row select{
   min-width:150px;background:#09090b;color:#f3f3f5;border:1px solid rgba(255,255,255,.1);
   border-radius:10px;padding:8px 9px;outline:none

@@ -24,3 +24,9 @@ test("assisted edits cannot escape their local brush footprint",()=>{
   assert.equal(insideBrushFootprint(16,10,10,10,5),false);
   assert.equal(insideBrushFootprint(10,16,10,10,5),false);
 });
+
+test("accepts cumulative speck removal while product bounds stay intact",()=>{
+  const protectedMask=new Uint8Array(100).fill(255),cleaned=new Uint8Array(protectedMask);
+  for(const i of [11,13,15,17,22,24,26,28,31,33,35,37])cleaned[i]=0;
+  assert.equal(chooseSafeCleanup(protectedMask,cleaned,10,10),cleaned);
+});

@@ -11,7 +11,10 @@ export function analyzeMask(alpha,width,height,threshold=128){
 export function cleanupIsSafe(protectedAlpha,cleanedAlpha,width,height){
   const before=analyzeMask(protectedAlpha,width,height),after=analyzeMask(cleanedAlpha,width,height);
   if(!before.area)return true;
-  return after.area/before.area>=0.97 &&
+  // Component cleanup is allowed to remove many *individually tiny* islands.
+  // Bounding-box retention protects the real product; requiring 97% total
+  // area retention caused thousands of grass specks to be restored together.
+  return after.area/before.area>=0.85 &&
     (!before.width||after.width/before.width>=0.95) &&
     (!before.height||after.height/before.height>=0.95);
 }
