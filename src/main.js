@@ -633,15 +633,20 @@ async function cleanupDisconnectedSpecks(blob){
 }
 
 function removeGreenBoundaryFringe(rgba,alpha,w,h){
-  const out=new Uint8Array(alpha),nearBackground=new Uint8Array(w*h);
-  for(let y=1;y<h-1;y++)for(let x=1;x<w-1;x++){
-    const i=y*w+x;if(alpha[i]<24)continue;
-    let touchesBackground=false;
-    for(let oy=-4;oy<=4&&!touchesBackground;oy++)for(let ox=-4;ox<=4;ox++){
-      const nx=x+ox,ny=y+oy;if(nx<0||ny<0||nx>=w||ny>=h)continue;
-      if(alpha[ny*w+nx]<24){touchesBackground=true;break;}
+  const out=new Uint8Array(alpha),nearBackground=new Uint8Array(w*h),frontier=new Uint8Array(w*h);
+  for(let i=0;i<alpha.length;i++)if(alpha[i]<24){nearBackground[i]=1;frontier[i]=1;}
+  // Linear-time distance expansion replaces the previous per-pixel 9×9 scan.
+  // Sixteen source pixels reaches the upscaled fringe left by the low-resolution
+  // border flood while remaining colour-gated, so blue/navy product pixels stay.
+  let current=frontier;
+  for(let step=0;step<16;step++){
+    const next=new Uint8Array(w*h);
+    for(let i=0;i<current.length;i++)if(current[i]){
+      const x=i%w;
+      const add=j=>{if(j>=0&&j<nearBackground.length&&!nearBackground[j]){nearBackground[j]=1;next[j]=1;}};
+      if(x)add(i-1);if(x<w-1)add(i+1);if(i>=w)add(i-w);if(i<current.length-w)add(i+w);
     }
-    if(touchesBackground)nearBackground[i]=1;
+    current=next;
   }
   for(let i=0;i<out.length;i++){
     if(!nearBackground[i])continue;
@@ -657,12 +662,19 @@ async function suspiciousResidualRatio(blob){
   const bmp=await createImageBitmap(blob),max=280,scale=Math.min(1,max/Math.max(bmp.width,bmp.height));
   const c=document.createElement("canvas");c.width=Math.max(1,Math.round(bmp.width*scale));c.height=Math.max(1,Math.round(bmp.height*scale));
   const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0,c.width,c.height);bmp.close?.();
-  const d=ctx.getImageData(0,0,c.width,c.height).data;let suspicious=0,visible=0;
+  const d=ctx.getImageData(0,0,c.width,c.height).data,alpha=new Uint8Array(c.width*c.height);let suspicious=0,visible=0;
+  for(let i=0;i<alpha.length;i++)alpha[i]=d[i*4+3];
   for(let i=0;i<d.length;i+=4){
     if(d[i+3]<128)continue;visible++;
     const pixel=i/4,x=pixel%c.width,y=(pixel/c.width)|0,max=Math.max(d[i],d[i+1],d[i+2]),min=Math.min(d[i],d[i+1],d[i+2]);
     const neutralEdge=(y>c.height*.88||x<c.width*.05||x>c.width*.95)&&max>95&&max-min<52;
-    if(isHighConfidenceResidual(d[i],d[i+1],d[i+2])||neutralEdge)suspicious++;
+    if(!isHighConfidenceResidual(d[i],d[i+1],d[i+2])&&!neutralEdge)continue;
+    let touchesTransparency=false;
+    for(let oy=-2;oy<=2&&!touchesTransparency;oy++)for(let ox=-2;ox<=2;ox++){
+      const nx=x+ox,ny=y+oy;if(nx<0||ny<0||nx>=c.width||ny>=c.height)continue;
+      if(alpha[ny*c.width+nx]<24){touchesTransparency=true;break;}
+    }
+    if(touchesTransparency)suspicious++;
   }
   return suspicious/Math.max(1,visible);
 }
@@ -683,6 +695,23 @@ async function refineResidualBackground(baseBlob,aiBlob,originalBlob){
     // call the pixel background before it can be deleted.
     if(out.data[o+3]>=24&&isHighConfidenceResidual(out.data[o],out.data[o+1],out.data[o+2])&&aid[o+3]<48)out.data[o+3]=0;
     else if(out.data[o+3]>=24&&aid[o+3]<32&&isNeutralBorderResidual(source[o],source[o+1],source[o+2])&&(bins.get(keyAt(o))||0)>=support)candidate[i]=1;
+  }
+  // Matting pass for the thin halo attached to the product boundary. Unlike
+  // component cleanup, this can reach background-coloured pixels connected to
+  // the jacket, but only when the original colour was learned from already
+  // transparent background and the segmentation model also calls it background.
+  const alphaBeforeEdge=new Uint8Array(c.width*c.height);
+  for(let i=0;i<alphaBeforeEdge.length;i++)alphaBeforeEdge[i]=out.data[i*4+3];
+  for(let y=1;y<c.height-1;y++)for(let x=1;x<c.width-1;x++){
+    const i=y*c.width+x,o=i*4;if(alphaBeforeEdge[i]<24||aid[o+3]>=28)continue;
+    const backgroundColour=isHighConfidenceResidual(source[o],source[o+1],source[o+2])||isNeutralBorderResidual(source[o],source[o+1],source[o+2]);
+    if(!backgroundColour||(bins.get(keyAt(o))||0)<support)continue;
+    let nearTransparent=false;
+    for(let oy=-3;oy<=3&&!nearTransparent;oy++)for(let ox=-3;ox<=3;ox++){
+      const nx=x+ox,ny=y+oy;if(nx<0||ny<0||nx>=c.width||ny>=c.height)continue;
+      if(alphaBeforeEdge[ny*c.width+nx]<20){nearTransparent=true;break;}
+    }
+    if(nearTransparent)out.data[o+3]=0;
   }
   // Neutral floors and walls can be too dark for a safe global colour rule.
   // Remove them only when their colour was learned from existing transparent
@@ -2163,8 +2192,35 @@ function pushHistory(){const e=state.editor;e.history.push(e.ctx.getImageData(0,
 function undo(){const e=state.editor;if(e.history.length<=1)return;const cur=e.history.pop();e.redo.push(cur);e.ctx.putImageData(e.history[e.history.length-1],0,0);updateEditorUI();}
 function redo(){const e=state.editor;if(!e.redo.length)return;const img=e.redo.pop();e.history.push(img);e.ctx.putImageData(img,0,0);updateEditorUI();}
 function moveBrushCursor(ev){const stage=$(".editor-stage").getBoundingClientRect(),size=$("#assistToggle").checked?28:Number($("#brushSize").value),el=$("#brushCursor");el.classList.add("show");el.style.width=`${size}px`;el.style.height=`${size}px`;el.style.left=`${ev.clientX-stage.left-size/2}px`;el.style.top=`${ev.clientY-stage.top-size/2}px`;}
-async function smartRecover(){const e=state.editor;if(!e)return;$("#smartRecover").disabled=true;$("#smartRecover").textContent="Checking…";try{const clean=await chooseSafeCutout(e.item.file),img=await imageFromURL(URL.createObjectURL(clean));e.ctx.save();e.ctx.globalCompositeOperation="source-over";e.ctx.drawImage(img,0,0,e.canvas.width,e.canvas.height);e.ctx.restore();pushHistory();toast("Safer high-quality subject pass merged.");}catch(err){toast("Re-check failed on this device.");}$("#smartRecover").disabled=false;$("#smartRecover").textContent="Re-check subject";}
-async function applyEditor(){const e=state.editor;if(!e)return;const blob=await new Promise(res=>e.canvas.toBlob(res,"image/png",1));e.item.cutoutBlob=blob;if(e.item.cutoutURL)URL.revokeObjectURL(e.item.cutoutURL);e.item.cutoutURL=URL.createObjectURL(blob);e.item.status="done";closeEditor();renderGallery();toast("Cutout updated.");}
+async function smartRecover(){
+  const e=state.editor;if(!e)return;
+  const button=$("#smartRecover");let recoverURL="";
+  button.disabled=true;button.textContent="Checking…";
+  try{
+    const clean=await chooseSafeCutout(e.item.file);
+    recoverURL=URL.createObjectURL(clean);
+    const img=await imageFromURL(recoverURL);
+    e.ctx.save();e.ctx.globalCompositeOperation="source-over";e.ctx.drawImage(img,0,0,e.canvas.width,e.canvas.height);e.ctx.restore();
+    pushHistory();toast("Safer high-quality subject pass merged.");
+  }catch(err){
+    console.error("Subject re-check failed",err);
+    toast(`Re-check failed: ${err?.message||"this device could not complete it."}`);
+  }finally{
+    if(recoverURL)URL.revokeObjectURL(recoverURL);
+    button.disabled=false;button.textContent="Re-check subject";
+  }
+}
+async function applyEditor(){
+  const e=state.editor;if(!e)return;
+  try{
+    const blob=await new Promise((resolve,reject)=>e.canvas.toBlob(value=>value?resolve(value):reject(new Error("The edited image could not be encoded.")),"image/png",1));
+    e.item.cutoutBlob=blob;if(e.item.cutoutURL)URL.revokeObjectURL(e.item.cutoutURL);e.item.cutoutURL=URL.createObjectURL(blob);e.item.status="done";
+    closeEditor();renderGallery();toast("Cutout updated.");
+  }catch(err){
+    console.error("Cutout editor export failed",err);
+    toast(`Could not save the edit: ${err?.message||"unknown error"}`);
+  }
+}
 function closeEditor(){$("#cutoutModal").classList.add("hidden");state.editor=null;}
 
 /* ---------- Export ---------- */

@@ -2,7 +2,11 @@ import {AutoModel,AutoProcessor,RawImage} from "@huggingface/transformers";
 
 const PRIMARY_MODEL_ID="onnx-community/BiRefNet_lite";
 const FALLBACK_MODEL_ID="briaai/RMBG-1.4";
-const RMBG_PROCESSOR_CONFIG={do_normalize:true,do_pad:false,do_rescale:true,do_resize:true,image_mean:[0.5,0.5,0.5],image_std:[1,1,1],resample:2,rescale_factor:1/255,size:{width:1024,height:1024}};
+// Run segmentation at 512px, then upscale only the alpha matte to the original
+// dimensions. Original RGB and export resolution are never resized. This cuts
+// inference work to roughly one quarter of a 1024px pass; the full-resolution
+// edge-matting stage in main.js restores boundary precision.
+const RMBG_PROCESSOR_CONFIG={do_normalize:true,do_pad:false,do_rescale:true,do_resize:true,image_mean:[0.5,0.5,0.5],image_std:[1,1,1],resample:2,rescale_factor:1/255,size:{width:512,height:512}};
 let primaryPromise=null,primaryProcessorPromise=null,fallbackPromise=null,fallbackProcessorPromise=null;
 
 const progressFor=(id,engine)=>info=>{if(Number.isFinite(info?.progress))self.postMessage({type:"progress",id,stage:"load",engine,progress:Number(info.progress)});};
@@ -17,7 +21,9 @@ async function loadPrimary(id){
 }
 
 async function loadFallback(id){
-  fallbackPromise??=AutoModel.from_pretrained(FALLBACK_MODEL_ID,{config:{model_type:"custom"},progress_callback:progressFor(id,"RMBG")});
+  // Explicit q8 selects the model's 44 MB quantized graph on WASM instead of
+  // the 176 MB fp32 graph. This is the fastest broadly compatible browser path.
+  fallbackPromise??=AutoModel.from_pretrained(FALLBACK_MODEL_ID,{config:{model_type:"custom"},dtype:"q8",progress_callback:progressFor(id,"RMBG")});
   fallbackProcessorPromise??=AutoProcessor.from_pretrained(FALLBACK_MODEL_ID,{config:RMBG_PROCESSOR_CONFIG});
   try{return await Promise.all([fallbackPromise,fallbackProcessorPromise]);}
   catch(error){fallbackPromise=null;fallbackProcessorPromise=null;throw error;}
