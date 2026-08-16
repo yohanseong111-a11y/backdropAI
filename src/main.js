@@ -1904,7 +1904,12 @@ async function chooseSafeCutout(file){
   });
 
   if(!(blob instanceof Blob)||!blob.size)throw new Error("The remover returned an empty result.");
-  return blob;
+  // Every route must finish through the same preservation-biased cleanup.
+  // Previously only the background-first jacket route removed disconnected
+  // grass specks and green boundary fringe, so otherwise similar batch items
+  // could leave the engine with visibly different edge quality.
+  $("#progressText").textContent="Backshot Engine: cleaning edges…";
+  return await cleanupDisconnectedSpecks(blob);
 }
 
 
