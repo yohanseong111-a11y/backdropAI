@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "node scripts/prepare-models.mjs && vite build",
     "preview": "vite preview",
     "lint": "node --check src/main.js && node --check src/removal-worker.js && node --check src/mask-safety.js",
     "test": "node --test"

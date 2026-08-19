@@ -4,7 +4,9 @@ import {AutoModel,AutoProcessor,RawImage,env} from "@huggingface/transformers";
 // often allow the app's github.io URL but block Hugging Face model downloads.
 // The Pages workflow installs these files into dist/models during deployment.
 env.allowLocalModels=true;
-env.allowRemoteModels=false;
+// Local/same-origin is attempted first. Remote access remains an emergency
+// recovery path for an incomplete deployment instead of making every photo fail.
+env.allowRemoteModels=true;
 env.useBrowserCache=true;
 env.localModelPath=new URL("../models/",self.location.href).href;
 
