@@ -629,21 +629,24 @@ async function cleanupDisconnectedSpecks(blob,originalBlob=null){
   const safe=chooseSafeCleanup(alpha,cleaned,c.width,c.height);
   for(let i=0;i<safe.length;i++)image.data[i*4+3]=safe[i];
   if(originalBlob){
-    const original=await createImageBitmap(originalBlob),sourceCanvas=document.createElement("canvas");
-    sourceCanvas.width=c.width;sourceCanvas.height=c.height;
-    const sourceCtx=sourceCanvas.getContext("2d",{willReadFrequently:true});sourceCtx.drawImage(original,0,0,c.width,c.height);original.close?.();
-    decontaminateMatteBoundary(image.data,sourceCtx.getImageData(0,0,c.width,c.height).data,safe,c.width,c.height);
+    // Reuse the existing canvas instead of allocating a second full-resolution
+    // canvas. This materially lowers peak memory for large phone photos.
+    const original=await createImageBitmap(originalBlob);
+    ctx.clearRect(0,0,c.width,c.height);ctx.drawImage(original,0,0,c.width,c.height);original.close?.();
+    const source=ctx.getImageData(0,0,c.width,c.height).data;
+    await decontaminateMatteBoundary(image.data,source,safe,c.width,c.height);
   }
   ctx.putImageData(image,0,0);
   return new Promise((resolve,reject)=>c.toBlob(b=>b?resolve(b):reject(new Error("Could not create cleaned cutout.")),"image/png",1));
 }
 
-function decontaminateMatteBoundary(rgba,source,alpha,w,h){
+async function decontaminateMatteBoundary(rgba,source,alpha,w,h){
   // Source edge pixels are commonly a blend C=aF+(1-a)B. Recover F using
   // nearby pixels the matte already proved are background. Only partial-alpha
   // boundary RGB is corrected; opaque product pixels and the alpha shape stay.
   const radius=4;
-  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+  for(let y=0;y<h;y++){
+    for(let x=0;x<w;x++){
     const i=y*w+x,a=alpha[i];if(a<=24||a>=252)continue;
     let br=0,bg=0,bb=0,count=0;
     for(let oy=-radius;oy<=radius;oy++)for(let ox=-radius;ox<=radius;ox++){
@@ -658,6 +661,10 @@ function decontaminateMatteBoundary(rgba,source,alpha,w,h){
     rgba[o]=recoverForegroundChannel(source[o],br,a);
     rgba[o+1]=recoverForegroundChannel(source[o+1],bg,a);
     rgba[o+2]=recoverForegroundChannel(source[o+2],bb,a);
+    }
+    // Prevent long full-resolution edge passes from starving scrolling,
+    // progress animation and mobile browser watchdogs.
+    if(y&&y%128===0)await new Promise(resolve=>setTimeout(resolve,0));
   }
 }
 
@@ -2375,7 +2382,14 @@ $("#dragGuideGotIt").onclick=()=>{
 $("#removeSelectedBtn").onclick=removeSelectedBackgrounds;
 $("#removeAllBtn").onclick=removeAllBackgrounds;
 $("#downloadSelectedBtn").onclick=downloadSelected;$("#downloadAllBtn").onclick=downloadAll;
-$("#clearBtn").onclick=()=>{for(const i of state.items)cleanupItem(i);state.items=[];state.selected.clear();workspace.classList.add("hidden");gallery.innerHTML="";updateSelectionUI();};
+$("#clearBtn").onclick=()=>{
+  for(const i of state.items)cleanupItem(i);
+  if(state.backgroundURL)URL.revokeObjectURL(state.backgroundURL);
+  state.items=[];state.selected.clear();state.backgroundURL=null;state.backgroundName="";state.bgMode="transparent";
+  backgroundInput.value="";$("#backgroundPreview").classList.add("hidden");
+  document.querySelectorAll(".seg").forEach(button=>button.classList.toggle("active",button.dataset.bg==="transparent"));
+  workspace.classList.add("hidden");gallery.innerHTML="";updateSelectionUI();
+};
 function setBackgroundScope(scope){
   state.backgroundScope=scope;
   $("#backgroundScopeSelected").classList.toggle("active",scope==="selected");
@@ -2549,12 +2563,17 @@ function enableScrollChaining(el){
 enableScrollChaining(document.querySelector(".controls"));
 enableScrollChaining(document.querySelector(".gallery-shell"));
 
-// Prepare/cache the AI model after the page becomes idle.
-// This never processes a photo; removal still starts only from the Remove buttons.
-if("requestIdleCallback" in window){
-  requestIdleCallback(()=>warmBackshotEngine(),{timeout:1800});
+// Preload only where the device/network has comfortable headroom. Constrained
+// devices load on demand so merely opening a shared link cannot crash the tab.
+const connection=navigator.connection||navigator.mozConnection||navigator.webkitConnection;
+const memory=Number(navigator.deviceMemory||0),cores=Number(navigator.hardwareConcurrency||0);
+const mobile=/iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+const constrained=mobile||(memory>0&&memory<6)||(cores>0&&cores<6)||connection?.saveData||/2g/.test(connection?.effectiveType||"");
+if(!constrained){
+  if("requestIdleCallback" in window)requestIdleCallback(()=>warmBackshotEngine(),{timeout:1800});
+  else setTimeout(()=>warmBackshotEngine(),1200);
 }else{
-  setTimeout(()=>warmBackshotEngine(),1200);
+  const status=$("#engineStatus");if(status)status.textContent="Ready on Remove";
 }
 
 

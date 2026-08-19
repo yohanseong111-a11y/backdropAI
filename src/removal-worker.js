@@ -1,4 +1,12 @@
-import {AutoModel,AutoProcessor,RawImage} from "@huggingface/transformers";
+import {AutoModel,AutoProcessor,RawImage,env} from "@huggingface/transformers";
+
+// Load models from the deployed GitHub Pages origin. School/corporate filters
+// often allow the app's github.io URL but block Hugging Face model downloads.
+// The Pages workflow installs these files into dist/models during deployment.
+env.allowLocalModels=true;
+env.allowRemoteModels=false;
+env.useBrowserCache=true;
+env.localModelPath=new URL("../models/",self.location.href).href;
 
 const PRIMARY_MODEL_ID="onnx-community/BiRefNet_lite";
 const FALLBACK_MODEL_ID="briaai/RMBG-1.4";
@@ -9,6 +17,15 @@ const FALLBACK_MODEL_ID="briaai/RMBG-1.4";
 const RMBG_PROCESSOR_CONFIG={do_normalize:true,do_pad:false,do_rescale:true,do_resize:true,image_mean:[0.5,0.5,0.5],image_std:[1,1,1],resample:2,rescale_factor:1/255,size:{width:512,height:512}};
 let primaryPromise=null,primaryProcessorPromise=null,fallbackPromise=null,fallbackProcessorPromise=null;
 let fallbackDevice="wasm",webGPUDisabled=false;
+
+function canUseStableWebGPU(){
+  const memory=Number(self.navigator?.deviceMemory||0);
+  const cores=Number(self.navigator?.hardwareConcurrency||0);
+  const mobile=/iPhone|iPad|iPod|Android/i.test(self.navigator?.userAgent||"");
+  // FP16 is fast but considerably heavier. Restrict it to machines with
+  // enough headroom; shared/school Chromebooks stay on the stable q8 path.
+  return !mobile&&memory>=8&&cores>=8&&!!self.navigator?.gpu;
+}
 
 const progressFor=(id,engine)=>info=>{if(Number.isFinite(info?.progress))self.postMessage({type:"progress",id,stage:"load",engine,progress:Number(info.progress)});};
 
@@ -25,7 +42,7 @@ async function loadFallback(id){
   // Prefer GPU inference where ONNX WebGPU is available. The quantized WASM
   // graph remains the reliable low-memory fallback for Safari and mobile.
   fallbackPromise??=(async()=>{
-    if(!webGPUDisabled&&self.navigator?.gpu){
+    if(!webGPUDisabled&&canUseStableWebGPU()){
       try{
         const model=await AutoModel.from_pretrained(FALLBACK_MODEL_ID,{config:{model_type:"custom"},device:"webgpu",dtype:"fp16",progress_callback:progressFor(id,"RMBG")});
         fallbackDevice="webgpu";return model;
@@ -39,7 +56,10 @@ async function loadFallback(id){
   })();
   fallbackProcessorPromise??=AutoProcessor.from_pretrained(FALLBACK_MODEL_ID,{config:RMBG_PROCESSOR_CONFIG});
   try{return await Promise.all([fallbackPromise,fallbackProcessorPromise]);}
-  catch(error){fallbackPromise=null;fallbackProcessorPromise=null;throw error;}
+  catch(error){
+    fallbackPromise=null;fallbackProcessorPromise=null;
+    throw new Error(`The AI model could not load from this site. Check that the latest GitHub Pages deployment completed, then reload. ${error?.message||error}`);
+  }
 }
 
 async function tensorToAlpha(tensor,width,height,applySigmoid=false){
