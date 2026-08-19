@@ -12,18 +12,22 @@ env.localModelPath=new URL("../models/",self.location.href).href;
 
 const PRIMARY_MODEL_ID="onnx-community/BiRefNet_lite";
 const FALLBACK_MODEL_ID="briaai/RMBG-1.4";
-// Run segmentation at 512px, then upscale only the alpha matte to the original
-// dimensions. Original RGB and export resolution are never resized. This cuts
-// inference work to roughly one quarter of a 1024px pass; the full-resolution
-// edge-matting stage in main.js restores boundary precision.
-const RMBG_PROCESSOR_CONFIG={do_normalize:true,do_pad:false,do_rescale:true,do_resize:true,image_mean:[0.5,0.5,0.5],image_std:[1,1,1],resample:2,rescale_factor:1/255,size:{width:512,height:512}};
+// Phones use 320px inference to reduce compute and memory by about 61% versus
+// 512px. Only the alpha mask is smaller; main.js applies it to original RGB at
+// the original dimensions with high-quality interpolation.
+const WORKER_UA=self.navigator?.userAgent||"";
+const IS_MOBILE=self.navigator?.userAgentData?.mobile===true||
+  /iPhone|iPad|iPod|Android/i.test(WORKER_UA)||
+  (/Macintosh/i.test(WORKER_UA)&&Number(self.navigator?.maxTouchPoints||0)>1);
+const INFERENCE_SIZE=IS_MOBILE?320:512;
+const RMBG_PROCESSOR_CONFIG={do_normalize:true,do_pad:false,do_rescale:true,do_resize:true,image_mean:[0.5,0.5,0.5],image_std:[1,1,1],resample:2,rescale_factor:1/255,size:{width:INFERENCE_SIZE,height:INFERENCE_SIZE}};
 let primaryPromise=null,primaryProcessorPromise=null,fallbackPromise=null,fallbackProcessorPromise=null;
 let fallbackDevice="wasm",webGPUDisabled=false;
 
 function canUseStableWebGPU(){
   const memory=Number(self.navigator?.deviceMemory||0);
   const cores=Number(self.navigator?.hardwareConcurrency||0);
-  const mobile=/iPhone|iPad|iPod|Android/i.test(self.navigator?.userAgent||"");
+  const mobile=IS_MOBILE;
   // FP16 is fast but considerably heavier. Restrict it to machines with
   // enough headroom; shared/school Chromebooks stay on the stable q8 path.
   return !mobile&&memory>=8&&cores>=8&&!!self.navigator?.gpu;
@@ -64,14 +68,16 @@ async function loadFallback(id){
   }
 }
 
-async function tensorToAlpha(tensor,width,height,applySigmoid=false){
+async function tensorToAlpha(tensor,applySigmoid=false){
   const converted=applySigmoid?tensor.sigmoid():tensor;
-  const mask=await RawImage.fromTensor(converted.mul(255).to("uint8")).resize(width,height);
-  const pixels=width*height,src=mask.data instanceof Uint8Array?mask.data:new Uint8Array(mask.data);
-  if(src.length===pixels)return new Uint8Array(src);
+  // Keep the native inference mask compact. Expanding it to a 12–48 MP phone
+  // image here previously duplicated large buffers and could reload the tab.
+  const mask=await RawImage.fromTensor(converted.mul(255).to("uint8"));
+  const pixels=mask.width*mask.height,src=mask.data instanceof Uint8Array?mask.data:new Uint8Array(mask.data);
+  if(src.length===pixels)return {alpha:new Uint8Array(src),width:mask.width,height:mask.height};
   const channels=Math.max(1,Math.floor(src.length/pixels)),alpha=new Uint8Array(pixels);
   for(let i=0;i<pixels;i++)alpha[i]=src[i*channels];
-  return alpha;
+  return {alpha,width:mask.width,height:mask.height};
 }
 
 async function existingAlpha(image){
@@ -86,7 +92,7 @@ async function getPrimaryMask(id,image){
   const processed=await processor(image),input=processed.pixel_values||processed.input_image;
   const result=await model({input_image:input}),tensor=result.output_image?.[0]||result.output?.[0];
   if(!tensor)throw new Error("BiRefNet returned no matte.");
-  return tensorToAlpha(tensor,image.width,image.height,true);
+  return tensorToAlpha(tensor,true);
 }
 
 async function getFallbackMask(id,image){
@@ -102,7 +108,7 @@ async function getFallbackMask(id,image){
   }
   const {output}=result;
   if(!output?.[0])throw new Error("RMBG returned no matte.");
-  return tensorToAlpha(output[0],image.width,image.height,false);
+  return tensorToAlpha(output[0],false);
 }
 
 function diagnostics(alpha,w,h){
@@ -122,9 +128,9 @@ function diagnostics(alpha,w,h){
 async function remove(file,id){
   const image=await RawImage.fromBlob(file),preserved=await existingAlpha(image);
   if(preserved){self.postMessage({type:"progress",id,stage:"fast-path",message:"Existing transparency preserved."});return {alpha:preserved,width:image.width,height:image.height,engine:"existing-alpha"};}
-  const alpha=await getFallbackMask(id,image),quality=diagnostics(alpha,image.width,image.height);
+  const mask=await getFallbackMask(id,image),quality=diagnostics(mask.alpha,mask.width,mask.height);
   if(quality.ratio<0.01||quality.ratio>0.985)throw new Error("The compatibility model returned an unsafe matte.");
-  return {alpha,width:image.width,height:image.height,engine:"rmbg",quality};
+  return {alpha:mask.alpha,width:mask.width,height:mask.height,engine:"rmbg",quality};
 }
 
 self.onmessage=async event=>{

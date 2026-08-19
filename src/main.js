@@ -1741,65 +1741,25 @@ async function applyDualMaskToFile(file,primaryBuffer,safetyBuffer,maskWidth,mas
     throw new Error("The AI mask size did not match the image.");
   }
 
-  const scaleMask=raw=>{
-    if(maskWidth===ow&&maskHeight===oh){
-      return new Uint8Array(raw);
-    }
+  debugMaskStage("01-primary-rmbg",primaryRaw,maskWidth,maskHeight);
+  if(safetyRaw)debugMaskStage("02-safety-isnet",safetyRaw,maskWidth,maskHeight);
 
-    const maskCanvas=document.createElement("canvas");
-    maskCanvas.width=maskWidth;maskCanvas.height=maskHeight;
-    const mctx=maskCanvas.getContext("2d",{willReadFrequently:true});
-
-    const rgba=new Uint8ClampedArray(maskWidth*maskHeight*4);
-    for(let i=0;i<raw.length;i++){
-      const a=raw[i],o=i*4;
-      rgba[o]=a;rgba[o+1]=a;rgba[o+2]=a;rgba[o+3]=255;
-    }
-    mctx.putImageData(new ImageData(rgba,maskWidth,maskHeight),0,0);
-
-    const scaled=document.createElement("canvas");
-    scaled.width=ow;scaled.height=oh;
-    const sctx=scaled.getContext("2d",{willReadFrequently:true});
-    sctx.imageSmoothingEnabled=true;
-    sctx.imageSmoothingQuality="high";
-    sctx.drawImage(maskCanvas,0,0,ow,oh);
-
-    const rgbaScaled=sctx.getImageData(0,0,ow,oh).data;
-    const out=new Uint8Array(ow*oh);
-    for(let i=0;i<ow*oh;i++)out[i]=rgbaScaled[i*4];
-    return out;
-  };
-
-  const primary=scaleMask(primaryRaw);
-  const safety=safetyRaw?scaleMask(safetyRaw):null;
-  debugMaskStage("01-primary-rmbg",primary,ow,oh);
-  if(safety)debugMaskStage("02-safety-isnet",safety,ow,oh);
-
-  const outCanvas=document.createElement("canvas");
-  outCanvas.width=ow;outCanvas.height=oh;
-  const ctx=outCanvas.getContext("2d",{willReadFrequently:true});
-  ctx.drawImage(bitmap,0,0,ow,oh);
-  if(decoded.close)bitmap.close?.();
-
-  const image=ctx.getImageData(0,0,ow,oh);
-
-  // Segmentation and cleanup are deliberately separate. BiRefNet owns the
-  // matte; cleanup may only remove genuinely tiny disconnected islands.
-  // Colour clustering and model unions were removed because both can turn
-  // uncertain navy/grey product pixels into background or restore grass.
-  let alpha=new Uint8Array(primary);
+  // Clean and validate the compact inference mask before upscaling. The old
+  // path created multiple full-resolution alpha/RGBA arrays, which could exceed
+  // mobile browser memory and cause the tab to refresh.
+  let alpha=new Uint8Array(primaryRaw);
   const protectedAlpha=new Uint8Array(alpha);
-  debugMaskStage("03-protected-model-matte",protectedAlpha,ow,oh);
+  debugMaskStage("03-protected-model-matte",protectedAlpha,maskWidth,maskHeight);
 
-  let cleanedAlpha=removeTinyForegroundIslands(protectedAlpha,ow,oh);
-  cleanedAlpha=refineAlphaEdge(cleanedAlpha,ow,oh);
-  debugMaskStage("04-cleanup",cleanedAlpha,ow,oh);
+  let cleanedAlpha=removeTinyForegroundIslands(protectedAlpha,maskWidth,maskHeight);
+  cleanedAlpha=refineAlphaEdge(cleanedAlpha,maskWidth,maskHeight);
+  debugMaskStage("04-cleanup",cleanedAlpha,maskWidth,maskHeight);
 
   // Fail safe: never accept cleanup that removes too much of the protected item.
-  alpha=chooseSafeCleanup(protectedAlpha,cleanedAlpha,ow,oh);
-  alpha=releaseSafetyCheck(protectedAlpha,alpha,ow,oh);
-  const finalDiag=maskDiagnostics(alpha,ow,oh);
-  const protectedDiag=maskDiagnostics(protectedAlpha,ow,oh);
+  alpha=chooseSafeCleanup(protectedAlpha,cleanedAlpha,maskWidth,maskHeight);
+  alpha=releaseSafetyCheck(protectedAlpha,alpha,maskWidth,maskHeight);
+  const finalDiag=maskDiagnostics(alpha,maskWidth,maskHeight);
+  const protectedDiag=maskDiagnostics(protectedAlpha,maskWidth,maskHeight);
 
   if(
     protectedDiag.strong &&
@@ -1811,15 +1771,22 @@ async function applyDualMaskToFile(file,primaryBuffer,safetyBuffer,maskWidth,mas
   ){
     alpha=new Uint8Array(protectedAlpha);
   }
-  debugMaskStage("05-final",alpha,ow,oh);
+  debugMaskStage("05-final",alpha,maskWidth,maskHeight);
 
-  for(let i=0;i<ow*oh;i++){
+  const maskCanvas=document.createElement("canvas");maskCanvas.width=maskWidth;maskCanvas.height=maskHeight;
+  const maskCtx=maskCanvas.getContext("2d"),rgba=new Uint8ClampedArray(alpha.length*4);
+  for(let i=0;i<alpha.length;i++){
     let a=alpha[i];
     if(a<14)a=0;
     else if(a>226)a=255;
-    image.data[i*4+3]=a;
+    const o=i*4;rgba[o]=rgba[o+1]=rgba[o+2]=255;rgba[o+3]=a;
   }
-  ctx.putImageData(image,0,0);
+  maskCtx.putImageData(new ImageData(rgba,maskWidth,maskHeight),0,0);
+
+  const outCanvas=document.createElement("canvas");outCanvas.width=ow;outCanvas.height=oh;
+  const ctx=outCanvas.getContext("2d");ctx.drawImage(bitmap,0,0,ow,oh);if(decoded.close)bitmap.close?.();
+  ctx.save();ctx.globalCompositeOperation="destination-in";ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality="high";
+  ctx.drawImage(maskCanvas,0,0,ow,oh);ctx.restore();
 
   return new Promise((resolve,reject)=>{
     outCanvas.toBlob(
@@ -2565,7 +2532,9 @@ enableScrollChaining(document.querySelector(".gallery-shell"));
 // devices load on demand so merely opening a shared link cannot crash the tab.
 const connection=navigator.connection||navigator.mozConnection||navigator.webkitConnection;
 const memory=Number(navigator.deviceMemory||0),cores=Number(navigator.hardwareConcurrency||0);
-const mobile=/iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+const mobile=navigator.userAgentData?.mobile===true||
+  /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)||
+  (/Macintosh/i.test(navigator.userAgent)&&Number(navigator.maxTouchPoints||0)>1);
 const constrained=mobile||(memory>0&&memory<6)||(cores>0&&cores<6)||connection?.saveData||/2g/.test(connection?.effectiveType||"");
 if(!constrained){
   if("requestIdleCallback" in window)requestIdleCallback(()=>warmBackshotEngine(),{timeout:1800});

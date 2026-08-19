@@ -27,3 +27,13 @@ test("heavy GPU and preload paths are gated away from constrained devices",async
   assert.match(main,/memory>0&&memory<6/);
   assert.match(main,/if\(!constrained\)/);
 });
+
+test("phones use compact inference masks instead of allocating full-resolution worker masks",async()=>{
+  const worker=await readFile(new URL("../src/removal-worker.js",import.meta.url),"utf8");
+  assert.match(worker,/const INFERENCE_SIZE=IS_MOBILE\?320:512/);
+  assert.match(worker,/RawImage\.fromTensor\(converted\.mul\(255\)\.to\("uint8"\)\)/);
+  assert.doesNotMatch(worker,/fromTensor\([^\n]+\)\.resize\(width,height\)/);
+  assert.match(worker,/width:mask\.width,height:mask\.height/);
+  assert.match(worker,/Macintosh.*maxTouchPoints/s);
+  assert.match(worker,/userAgentData\?\.mobile===true/);
+});

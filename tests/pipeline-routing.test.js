@@ -25,3 +25,12 @@ test("batch inference cannot overlap one ONNX session and always releases UI sta
   assert.match(queue,/finally\{/);
   assert.match(queue,/state\.processing=false/);
 });
+
+test("mobile mask application cleans compact alpha and composites it only once",async()=>{
+  const source=await readFile(new URL("../src/main.js",import.meta.url),"utf8");
+  const apply=source.slice(source.indexOf("async function applyDualMaskToFile"),source.indexOf("function warmBackshotEngine"));
+  assert.match(apply,/removeTinyForegroundIslands\(protectedAlpha,maskWidth,maskHeight\)/);
+  assert.match(apply,/globalCompositeOperation="destination-in"/);
+  assert.doesNotMatch(apply,/scaled\.width=ow/);
+  assert.doesNotMatch(apply,/getImageData\(0,0,ow,oh\)/);
+});
