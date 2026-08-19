@@ -671,11 +671,10 @@ async function decontaminateMatteBoundary(rgba,source,alpha,w,h){
 function removeGreenBoundaryFringe(rgba,alpha,w,h){
   const out=new Uint8Array(alpha),nearBackground=new Uint8Array(w*h),frontier=new Uint8Array(w*h);
   for(let i=0;i<alpha.length;i++)if(alpha[i]<24){nearBackground[i]=1;frontier[i]=1;}
-  // Linear-time distance expansion replaces the previous per-pixel 9×9 scan.
-  // Sixteen source pixels reaches the upscaled fringe left by the low-resolution
-  // border flood while remaining colour-gated, so blue/navy product pixels stay.
+  // Only inspect the immediate soft matte. Earlier versions searched sixteen
+  // pixels inward and could mistake green-tinted navy fabric for grass.
   let current=frontier;
-  for(let step=0;step<16;step++){
+  for(let step=0;step<4;step++){
     const next=new Uint8Array(w*h);
     for(let i=0;i<current.length;i++)if(current[i]){
       const x=i%w;
@@ -685,7 +684,8 @@ function removeGreenBoundaryFringe(rgba,alpha,w,h){
     current=next;
   }
   for(let i=0;i<out.length;i++){
-    if(!nearBackground[i])continue;
+    // Never delete an opaque or confident product pixel based on colour.
+    if(!nearBackground[i]||alpha[i]>=176)continue;
     const o=i*4,r=rgba[o],g=rgba[o+1],b=rgba[o+2];
     // Remove only unmistakably green fringe pixels in a two-pixel boundary.
     // Navy, grey, cyan, white phone bezels and orange tags cannot match this.
@@ -777,7 +777,7 @@ async function conservativeCloseupFallback(file){
   // Only remove a dominant border background connected to the outer edge.
   // This is intentionally conservative: when uncertain, keep the product.
   const bmp=await createImageBitmap(file);
-  const maxSide=420,s=Math.min(1,maxSide/Math.max(bmp.width,bmp.height));
+  const maxSide=720,s=Math.min(1,maxSide/Math.max(bmp.width,bmp.height));
   const w=Math.max(64,Math.round(bmp.width*s)),h=Math.max(64,Math.round(bmp.height*s));
   const c=document.createElement("canvas");c.width=w;c.height=h;
   const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0,w,h);
@@ -813,8 +813,10 @@ async function conservativeCloseupFallback(file){
     // Saturated backgrounds such as grass are separated by hue as well as
     // colour distance, preventing cyan/blue garments from joining the flood.
     const hueCompatible=seedSat<.16||(sat>.10&&hueDistance<44);
-    const channelCompatible=!greenDominantSeed||(d[o+1]>=d[o+2]*.98&&d[o+1]>=d[o]*1.05);
-    if(dist<tol&&hueCompatible&&channelCompatible)candidate[i]=1;
+    const grassLike=d[o+1]>d[o]*1.10&&d[o+1]>d[o+2]*1.035&&hueDistance<34;
+    // For a grass seed, broad RGB distance is not sufficient: dark navy can
+    // be numerically close to shadowed grass. Require green hue dominance.
+    if(dist<tol&&hueCompatible&&(!greenDominantSeed||grassLike))candidate[i]=1;
   }
 
   // Flood background-colour candidates from every frame edge. Hue gating above
@@ -834,19 +836,16 @@ async function conservativeCloseupFallback(file){
   if(new URLSearchParams(location.search).has("debugMasks"))document.documentElement.dataset.backgroundRatio=String(ratio);
   if(ratio<.025||ratio>.48)return null;
 
-  const full=document.createElement("canvas");full.width=bmp.width;full.height=bmp.height;
-  const fctx=full.getContext("2d",{willReadFrequently:true});fctx.drawImage(bmp,0,0);
-  const out=fctx.getImageData(0,0,full.width,full.height),od=out.data;
-
-  for(let y=0;y<full.height;y++){
-    const sy=Math.min(h-1,Math.floor(y*h/full.height));
-    for(let x=0;x<full.width;x++){
-      const sx=Math.min(w-1,Math.floor(x*w/full.width));
-      if(bg[sy*w+sx])od[(y*full.width+x)*4+3]=0;
-    }
-    if(y%180===0)await new Promise(r=>setTimeout(r,0));
+  const maskCanvas=document.createElement("canvas");maskCanvas.width=w;maskCanvas.height=h;
+  const maskCtx=maskCanvas.getContext("2d"),maskImage=maskCtx.createImageData(w,h);
+  for(let i=0;i<bg.length;i++){
+    const o=i*4;maskImage.data[o]=maskImage.data[o+1]=maskImage.data[o+2]=255;maskImage.data[o+3]=bg[i]?0:255;
   }
-  fctx.putImageData(out,0,0);
+  maskCtx.putImageData(maskImage,0,0);
+  const full=document.createElement("canvas");full.width=bmp.width;full.height=bmp.height;
+  const fctx=full.getContext("2d");fctx.drawImage(bmp,0,0);
+  fctx.save();fctx.globalCompositeOperation="destination-in";fctx.imageSmoothingEnabled=true;fctx.imageSmoothingQuality="high";
+  fctx.drawImage(maskCanvas,0,0,full.width,full.height);fctx.restore();
   return await new Promise(res=>full.toBlob(res,"image/png",1));
 }
 
@@ -2027,25 +2026,24 @@ async function processRemovalQueue(queue,label){
   $("#progressWrap").classList.remove("hidden");
   updateProgress(queue.length);
 
-  const isMobile=/iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
-  const cores=Math.max(2,Number(navigator.hardwareConcurrency||4));
-
-  const memory=Number(navigator.deviceMemory||4);
-  // Two-at-once on capable desktops. Keep the single-photo path on mobile and
-  // lower-memory hardware to avoid Safari/WASM crashes and preserve UI speed.
-  const concurrency=!isMobile&&memory>=8&&cores>=8?2:1;
-
-  for(let start=0;start<queue.length;start+=concurrency){
-    const chunk=queue.slice(start,start+concurrency);
-    await Promise.all(chunk.map(item=>removeOne(item,queue.length)));
-    // Yield to scrolling/zooming/animations between chunks.
-    await new Promise(resolve=>requestAnimationFrame(()=>setTimeout(resolve,0)));
+  // A single worker owns one ONNX session. Concurrent run() calls can contend
+  // for the same session, and restarting one failed job would reject its peer.
+  // Serial inference is more reliable and often just as fast on one GPU/CPU;
+  // decoding, animation and edge cleanup still yield to the interface.
+  try{
+    for(const item of queue){
+      await removeOne(item,queue.length);
+      await new Promise(resolve=>requestAnimationFrame(()=>setTimeout(resolve,0)));
+    }
+  }catch(error){
+    console.error("Removal queue stopped unexpectedly",error);
+    toast(`Removal queue stopped: ${error?.message||"unknown error"}`);
+  }finally{
+    state.processing=false;
+    $("#removeSelectedBtn").disabled=false;
+    $("#removeAllBtn").disabled=false;
+    updateProgress(queue.length);
   }
-
-  state.processing=false;
-  $("#removeSelectedBtn").disabled=false;
-  $("#removeAllBtn").disabled=false;
-  updateProgress(queue.length);
 
   toast(
     state.failed
