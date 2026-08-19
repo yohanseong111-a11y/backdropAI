@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {analyzeMask,chooseSafeCleanup,insideBrushFootprint,isHighConfidenceResidual,isNeutralBorderResidual} from "../src/mask-safety.js";
+import {analyzeMask,chooseSafeCleanup,insideBrushFootprint,isHighConfidenceResidual,isNeutralBorderResidual,isGreenFringePixel,recoverForegroundChannel} from "../src/mask-safety.js";
 
 test("rolls back sudden foreground loss",()=>{
   const protectedMask=new Uint8Array(100).fill(255),cleaned=new Uint8Array(protectedMask);
@@ -39,6 +39,20 @@ test("neutral border cleanup accepts floors but rejects dark navy jacket panels"
   assert.equal(isNeutralBorderResidual(35,51,68),false);
   assert.equal(isNeutralBorderResidual(61,70,79),false);
   assert.equal(isNeutralBorderResidual(21,153,205),false);
+});
+
+test("green fringe cleanup catches mixed grass edges without deleting jacket colours",()=>{
+  assert.equal(isGreenFringePixel(28,91,83),true);
+  assert.equal(isGreenFringePixel(42,112,105),true);
+  assert.equal(isGreenFringePixel(8,170,225),false);
+  assert.equal(isGreenFringePixel(35,51,68),false);
+});
+
+test("matte decontamination reconstructs foreground colour from background spill",()=>{
+  const alpha=128;
+  assert.ok(Math.abs(recoverForegroundChannel(30,20,alpha)-40)<=1);
+  assert.ok(Math.abs(recoverForegroundChannel(100,140,alpha)-60)<=1);
+  assert.ok(Math.abs(recoverForegroundChannel(55,30,alpha)-80)<=1);
 });
 
 test("accepts cumulative speck removal while product bounds stay intact",()=>{

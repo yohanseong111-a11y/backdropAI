@@ -42,3 +42,14 @@ export function isNeutralBorderResidual(r,g,b){
   // never enter the border-removal candidate, even if another model misses them.
   return max>125&&max-min<48;
 }
+
+export function isGreenFringePixel(r,g,b){
+  // Includes grass mixed with a dark antialiased garment edge. Cyan fabric has
+  // substantially more blue than green, while navy has too little green excess.
+  return g>r*1.07&&g-r>10&&g-b>-12;
+}
+
+export function recoverForegroundChannel(composite,background,alpha){
+  const coverage=Math.max(1/255,Math.min(1,alpha/255));
+  return Math.max(0,Math.min(255,Math.round((composite-(1-coverage)*background)/coverage)));
+}

@@ -8,6 +8,7 @@ const FALLBACK_MODEL_ID="briaai/RMBG-1.4";
 // edge-matting stage in main.js restores boundary precision.
 const RMBG_PROCESSOR_CONFIG={do_normalize:true,do_pad:false,do_rescale:true,do_resize:true,image_mean:[0.5,0.5,0.5],image_std:[1,1,1],resample:2,rescale_factor:1/255,size:{width:512,height:512}};
 let primaryPromise=null,primaryProcessorPromise=null,fallbackPromise=null,fallbackProcessorPromise=null;
+let fallbackDevice="wasm",webGPUDisabled=false;
 
 const progressFor=(id,engine)=>info=>{if(Number.isFinite(info?.progress))self.postMessage({type:"progress",id,stage:"load",engine,progress:Number(info.progress)});};
 
@@ -21,9 +22,21 @@ async function loadPrimary(id){
 }
 
 async function loadFallback(id){
-  // Explicit q8 selects the model's 44 MB quantized graph on WASM instead of
-  // the 176 MB fp32 graph. This is the fastest broadly compatible browser path.
-  fallbackPromise??=AutoModel.from_pretrained(FALLBACK_MODEL_ID,{config:{model_type:"custom"},dtype:"q8",progress_callback:progressFor(id,"RMBG")});
+  // Prefer GPU inference where ONNX WebGPU is available. The quantized WASM
+  // graph remains the reliable low-memory fallback for Safari and mobile.
+  fallbackPromise??=(async()=>{
+    if(!webGPUDisabled&&self.navigator?.gpu){
+      try{
+        const model=await AutoModel.from_pretrained(FALLBACK_MODEL_ID,{config:{model_type:"custom"},device:"webgpu",dtype:"fp16",progress_callback:progressFor(id,"RMBG")});
+        fallbackDevice="webgpu";return model;
+      }catch(error){
+        console.warn("WebGPU model unavailable; using quantized WASM",error);
+        webGPUDisabled=true;
+      }
+    }
+    fallbackDevice="wasm";
+    return AutoModel.from_pretrained(FALLBACK_MODEL_ID,{config:{model_type:"custom"},device:"wasm",dtype:"q8",progress_callback:progressFor(id,"RMBG")});
+  })();
   fallbackProcessorPromise??=AutoProcessor.from_pretrained(FALLBACK_MODEL_ID,{config:RMBG_PROCESSOR_CONFIG});
   try{return await Promise.all([fallbackPromise,fallbackProcessorPromise]);}
   catch(error){fallbackPromise=null;fallbackProcessorPromise=null;throw error;}
@@ -56,7 +69,16 @@ async function getPrimaryMask(id,image){
 
 async function getFallbackMask(id,image){
   self.postMessage({type:"progress",id,stage:"fallback",message:"Using compatibility model…"});
-  const [model,processor]=await loadFallback(id),{pixel_values}=await processor(image),{output}=await model({input:pixel_values});
+  let [model,processor]=await loadFallback(id),{pixel_values}=await processor(image),result;
+  try{result=await model({input:pixel_values});}
+  catch(error){
+    if(fallbackDevice!=="webgpu")throw error;
+    console.warn("WebGPU inference failed; retrying with quantized WASM",error);
+    webGPUDisabled=true;fallbackPromise=null;
+    [model,processor]=await loadFallback(id);
+    result=await model({input:pixel_values});
+  }
+  const {output}=result;
   if(!output?.[0])throw new Error("RMBG returned no matte.");
   return tensorToAlpha(output[0],image.width,image.height,false);
 }
@@ -86,7 +108,7 @@ async function remove(file,id){
 self.onmessage=async event=>{
   const {type,id,file}=event.data||{};
   if(type==="warm"){
-    try{await loadFallback(id);self.postMessage({type:"ready",id,acceleration:"wasm"});}
+    try{await loadFallback(id);self.postMessage({type:"ready",id,acceleration:fallbackDevice});}
     catch(error){console.warn("Model warmup skipped",error);self.postMessage({type:"ready",id,acceleration:"fallback"});}
     return;
   }

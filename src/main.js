@@ -1,6 +1,6 @@
 import "./style.css";
 import "./editor.css";
-import {chooseSafeCleanup,isHighConfidenceResidual,isNeutralBorderResidual} from "./mask-safety.js";
+import {chooseSafeCleanup,isHighConfidenceResidual,isNeutralBorderResidual,isGreenFringePixel,recoverForegroundChannel} from "./mask-safety.js";
 import JSZip from "jszip";
 import { removeBackground, preload } from "@imgly/background-removal";
 
@@ -618,7 +618,7 @@ async function removeWithBiRefNet(file){
   return await new Promise(res=>c.toBlob(res,"image/png",1));
 }
 
-async function cleanupDisconnectedSpecks(blob){
+async function cleanupDisconnectedSpecks(blob,originalBlob=null){
   const bmp=await createImageBitmap(blob),c=document.createElement("canvas");c.width=bmp.width;c.height=bmp.height;
   const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0);bmp.close?.();
   const image=ctx.getImageData(0,0,c.width,c.height),alpha=new Uint8Array(c.width*c.height);
@@ -628,8 +628,37 @@ async function cleanupDisconnectedSpecks(blob){
   cleaned=refineAlphaEdge(cleaned,c.width,c.height);
   const safe=chooseSafeCleanup(alpha,cleaned,c.width,c.height);
   for(let i=0;i<safe.length;i++)image.data[i*4+3]=safe[i];
+  if(originalBlob){
+    const original=await createImageBitmap(originalBlob),sourceCanvas=document.createElement("canvas");
+    sourceCanvas.width=c.width;sourceCanvas.height=c.height;
+    const sourceCtx=sourceCanvas.getContext("2d",{willReadFrequently:true});sourceCtx.drawImage(original,0,0,c.width,c.height);original.close?.();
+    decontaminateMatteBoundary(image.data,sourceCtx.getImageData(0,0,c.width,c.height).data,safe,c.width,c.height);
+  }
   ctx.putImageData(image,0,0);
   return new Promise((resolve,reject)=>c.toBlob(b=>b?resolve(b):reject(new Error("Could not create cleaned cutout.")),"image/png",1));
+}
+
+function decontaminateMatteBoundary(rgba,source,alpha,w,h){
+  // Source edge pixels are commonly a blend C=aF+(1-a)B. Recover F using
+  // nearby pixels the matte already proved are background. Only partial-alpha
+  // boundary RGB is corrected; opaque product pixels and the alpha shape stay.
+  const radius=4;
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+    const i=y*w+x,a=alpha[i];if(a<=24||a>=252)continue;
+    let br=0,bg=0,bb=0,count=0;
+    for(let oy=-radius;oy<=radius;oy++)for(let ox=-radius;ox<=radius;ox++){
+      if(ox*ox+oy*oy>radius*radius)continue;
+      const nx=x+ox,ny=y+oy;if(nx<0||ny<0||nx>=w||ny>=h)continue;
+      const ni=ny*w+nx;if(alpha[ni]>=24)continue;
+      const no=ni*4;br+=source[no];bg+=source[no+1];bb+=source[no+2];count++;
+    }
+    if(!count)continue;
+    br/=count;bg/=count;bb/=count;
+    const o=i*4;
+    rgba[o]=recoverForegroundChannel(source[o],br,a);
+    rgba[o+1]=recoverForegroundChannel(source[o+1],bg,a);
+    rgba[o+2]=recoverForegroundChannel(source[o+2],bb,a);
+  }
 }
 
 function removeGreenBoundaryFringe(rgba,alpha,w,h){
@@ -653,7 +682,7 @@ function removeGreenBoundaryFringe(rgba,alpha,w,h){
     const o=i*4,r=rgba[o],g=rgba[o+1],b=rgba[o+2];
     // Remove only unmistakably green fringe pixels in a two-pixel boundary.
     // Navy, grey, cyan, white phone bezels and orange tags cannot match this.
-    if(g>r*1.10&&g>b*1.04&&g-r>12)out[i]=0;
+    if(isGreenFringePixel(r,g,b))out[i]=0;
   }
   return out;
 }
@@ -1607,24 +1636,30 @@ function refineAlphaEdge(alpha,w,h){
       const i=y*w+x;
       const a=alpha[i];
 
-      if(a<26){
+      if(a<36){
         out[i]=0;
         continue;
       }
 
-      if(a>238){
+      if(a>248){
         out[i]=255;
         continue;
       }
 
-      let sum=0;
+      let sum=0,touchesClear=false;
       for(let oy=-1;oy<=1;oy++){
         for(let ox=-1;ox<=1;ox++){
-          sum+=alpha[(y+oy)*w+x+ox];
+          const nearby=alpha[(y+oy)*w+x+ox];
+          sum+=nearby;
+          if(nearby<24)touchesClear=true;
         }
       }
       const avg=sum/9;
-      out[i]=Math.max(0,Math.min(255,Math.round(a*0.78+avg*0.22)));
+      let smooth=a*.72+avg*.28;
+      // A small matte choke removes the coloured antialias fringe without
+      // moving the strong product silhouette or modifying its RGB pixels.
+      if(touchesClear&&smooth<150)smooth*=.68;
+      out[i]=Math.max(0,Math.min(255,Math.round(smooth)));
     }
   }
 
@@ -1813,7 +1848,7 @@ function warmBackshotEngine(){
       status.textContent=`Loading ${Math.round(msg.progress||0)}%`;
     }else if(msg.type==="ready"){
       worker.removeEventListener("message",handler);
-      if(status)status.textContent=msg.acceleration==="fallback"?"AI Ready ✓ compatibility":"AI Ready ✓";
+      if(status)status.textContent=msg.acceleration==="webgpu"?"AI Ready ✓ GPU":msg.acceleration==="fallback"?"AI Ready ✓ compatibility":"AI Ready ✓";
     }else if(msg.type==="error"){
       worker.removeEventListener("message",handler);
       engineWarmStarted=false;
@@ -1876,14 +1911,14 @@ async function chooseSafeCutout(file){
     if(new URLSearchParams(location.search).has("debugMasks"))document.documentElement.dataset.backgroundDiag=JSON.stringify({before,after,shape});
     if(after.strong>0.08 && after.strong<before.strong*0.94 && shape.largestShare>.95){
       $("#progressText").textContent="Background-first mask complete.";
-      let clean=await cleanupDisconnectedSpecks(backgroundFirst);
+      let clean=await cleanupDisconnectedSpecks(backgroundFirst,file);
       // A bright low-saturation residual (for example a white rug under grass)
       // is suspicious. Ask RMBG only about those pixels; its decisions can
       // remove the residual but can never delete dark/blue product sections.
       if(await suspiciousResidualRatio(clean)>.00035){
         const evidence=await removeWithBackshotEngine(file);
         clean=await refineResidualBackground(clean,evidence,file);
-        clean=await cleanupDisconnectedSpecks(clean);
+        clean=await cleanupDisconnectedSpecks(clean,file);
       }
       return clean;
     }
@@ -1909,7 +1944,7 @@ async function chooseSafeCutout(file){
   // grass specks and green boundary fringe, so otherwise similar batch items
   // could leave the engine with visibly different edge quality.
   $("#progressText").textContent="Backshot Engine: cleaning edges…";
-  return await cleanupDisconnectedSpecks(blob);
+  return await cleanupDisconnectedSpecks(blob,file);
 }
 
 
