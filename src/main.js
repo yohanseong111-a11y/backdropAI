@@ -56,8 +56,13 @@ app.innerHTML = `
       <div class="section-title">1. Background removal</div>
       <div class="quality-row">
         <span>Removal mode</span>
-        <div class="single-mode-badge">Backshot Engine <span id="engineStatus">Starting…</span></div>
+        <select id="qualityMode" aria-label="Background removal quality">
+          <option value="auto">Automatic</option>
+          <option value="fast">Fast Mobile</option>
+          <option value="best">Best Quality</option>
+        </select>
       </div>
+      <div class="single-mode-badge">Backshot Engine <span id="engineStatus">Starting…</span></div>
       <div class="remove-button-stack">
         <button id="removeSelectedBtn" class="primary">Remove selected backgrounds</button>
         <button id="removeAllBtn" class="ghost remove-all-btn">Remove all backgrounds</button>
@@ -1837,7 +1842,7 @@ function warmBackshotEngine(){
   }
 }
 
-function removeWithBackshotEngine(file,onProgress,attempt=0){
+function removeWithBackshotEngine(file,onProgress,attempt=0,profile=state.quality){
   return new Promise((resolve,reject)=>{
     let worker;
     try{worker=getRemovalWorker();}catch(error){reject(error);return;}
@@ -1847,19 +1852,19 @@ function removeWithBackshotEngine(file,onProgress,attempt=0){
       removalPending.delete(id);
       destroyRemovalWorker("The AI remover timed out and was restarted.");
       if(attempt<1){
-        removeWithBackshotEngine(file,onProgress,attempt+1).then(resolve,reject);
+        removeWithBackshotEngine(file,onProgress,attempt+1,profile).then(resolve,reject);
       }else{
         reject(new Error("Background removal timed out twice. Try a smaller image or reload BackshotAI."));
       }
     },360000);
 
     removalPending.set(id,{resolve,reject,onProgress,timeout,file});
-    try{worker.postMessage({type:"remove",id,file});}
+    try{worker.postMessage({type:"remove",id,file,profile});}
     catch(error){
       clearTimeout(timeout);
       removalPending.delete(id);
       destroyRemovalWorker("The browser could not send the image to the AI worker.");
-      if(attempt<1)removeWithBackshotEngine(file,onProgress,attempt+1).then(resolve,reject);
+      if(attempt<1)removeWithBackshotEngine(file,onProgress,attempt+1,profile).then(resolve,reject);
       else reject(error);
     }
   });
@@ -1917,7 +1922,21 @@ async function chooseSafeCutout(file){
   // grass specks and green boundary fringe, so otherwise similar batch items
   // could leave the engine with visibly different edge quality.
   $("#progressText").textContent="Backshot Engine: cleaning edges…";
-  return await cleanupDisconnectedSpecks(blob,file);
+  let clean=await cleanupDisconnectedSpecks(blob,file);
+
+  // Fast Mobile normally finishes after its low-memory 256px pass. If the
+  // finished cutout still contains background-coloured pixels beside
+  // transparency, rerun only that difficult photo at the safer 320px mobile
+  // resolution and use it solely as evidence for residual cleanup. The merge
+  // remains preservation-biased, so the refinement cannot erase opaque jacket
+  // panels, logos, phones or tags.
+  if(state.quality==="fast"&&await suspiciousResidualRatio(clean)>.00025){
+    $("#progressText").textContent="Fast Mobile: refining a difficult edge…";
+    const evidence=await removeWithBackshotEngine(file,undefined,0,"auto");
+    clean=await refineResidualBackground(clean,evidence,file);
+    clean=await cleanupDisconnectedSpecks(clean,file);
+  }
+  return clean;
 }
 
 
@@ -1990,6 +2009,7 @@ async function processRemovalQueue(queue,label){
 
   $("#removeSelectedBtn").disabled=true;
   $("#removeAllBtn").disabled=true;
+  $("#qualityMode").disabled=true;
   $("#progressWrap").classList.remove("hidden");
   updateProgress(queue.length);
 
@@ -2009,6 +2029,7 @@ async function processRemovalQueue(queue,label){
     state.processing=false;
     $("#removeSelectedBtn").disabled=false;
     $("#removeAllBtn").disabled=false;
+    $("#qualityMode").disabled=false;
     updateProgress(queue.length);
   }
 
@@ -2346,6 +2367,14 @@ $("#dragGuideGotIt").onclick=()=>{
 
 $("#removeSelectedBtn").onclick=removeSelectedBackgrounds;
 $("#removeAllBtn").onclick=removeAllBackgrounds;
+$("#qualityMode").value=state.quality;
+$("#qualityMode").onchange=e=>{
+  state.quality=e.target.value;
+  destroyRemovalWorker("Removal mode changed.");
+  const status=$("#engineStatus");
+  if(status)status.textContent=state.quality==="fast"?"Fast mode ready":state.quality==="best"?"Best mode ready":"Ready on Remove";
+  toast(state.quality==="fast"?"Fast Mobile uses less memory and is quicker.":state.quality==="best"?"Best Quality uses a larger precision mask.":"Automatic mode selected.");
+};
 $("#downloadSelectedBtn").onclick=downloadSelected;$("#downloadAllBtn").onclick=downloadAll;
 $("#clearBtn").onclick=()=>{
   for(const i of state.items)cleanupItem(i);

@@ -19,9 +19,10 @@ const WORKER_UA=self.navigator?.userAgent||"";
 const IS_MOBILE=self.navigator?.userAgentData?.mobile===true||
   /iPhone|iPad|iPod|Android/i.test(WORKER_UA)||
   (/Macintosh/i.test(WORKER_UA)&&Number(self.navigator?.maxTouchPoints||0)>1);
-const INFERENCE_SIZE=IS_MOBILE?320:512;
-const RMBG_PROCESSOR_CONFIG={do_normalize:true,do_pad:false,do_rescale:true,do_resize:true,image_mean:[0.5,0.5,0.5],image_std:[1,1,1],resample:2,rescale_factor:1/255,size:{width:INFERENCE_SIZE,height:INFERENCE_SIZE}};
-let primaryPromise=null,primaryProcessorPromise=null,fallbackPromise=null,fallbackProcessorPromise=null;
+const inferenceSizeFor=profile=>profile==="fast"?256:profile==="best"?512:(IS_MOBILE?320:512);
+const processorConfig=size=>({do_normalize:true,do_pad:false,do_rescale:true,do_resize:true,image_mean:[0.5,0.5,0.5],image_std:[1,1,1],resample:2,rescale_factor:1/255,size:{width:size,height:size}});
+let primaryPromise=null,primaryProcessorPromise=null,fallbackPromise=null;
+const fallbackProcessorPromises=new Map();
 let fallbackDevice="wasm",webGPUDisabled=false;
 
 function canUseStableWebGPU(){
@@ -44,7 +45,7 @@ async function loadPrimary(id){
   catch(error){primaryPromise=null;primaryProcessorPromise=null;throw error;}
 }
 
-async function loadFallback(id){
+async function loadFallback(id,profile="auto"){
   // Prefer GPU inference where ONNX WebGPU is available. The quantized WASM
   // graph remains the reliable low-memory fallback for Safari and mobile.
   fallbackPromise??=(async()=>{
@@ -60,10 +61,11 @@ async function loadFallback(id){
     fallbackDevice="wasm";
     return AutoModel.from_pretrained(FALLBACK_MODEL_ID,{config:{model_type:"custom"},device:"wasm",dtype:"q8",progress_callback:progressFor(id,"RMBG")});
   })();
-  fallbackProcessorPromise??=AutoProcessor.from_pretrained(FALLBACK_MODEL_ID,{config:RMBG_PROCESSOR_CONFIG});
-  try{return await Promise.all([fallbackPromise,fallbackProcessorPromise]);}
+  const size=inferenceSizeFor(profile);
+  if(!fallbackProcessorPromises.has(size))fallbackProcessorPromises.set(size,AutoProcessor.from_pretrained(FALLBACK_MODEL_ID,{config:processorConfig(size)}));
+  try{return await Promise.all([fallbackPromise,fallbackProcessorPromises.get(size)]);}
   catch(error){
-    fallbackPromise=null;fallbackProcessorPromise=null;
+    fallbackPromise=null;fallbackProcessorPromises.delete(size);
     throw new Error(`The AI model could not load from this site. Check that the latest GitHub Pages deployment completed, then reload. ${error?.message||error}`);
   }
 }
@@ -95,15 +97,15 @@ async function getPrimaryMask(id,image){
   return tensorToAlpha(tensor,true);
 }
 
-async function getFallbackMask(id,image){
+async function getFallbackMask(id,image,profile){
   self.postMessage({type:"progress",id,stage:"fallback",message:"Using compatibility model…"});
-  let [model,processor]=await loadFallback(id),{pixel_values}=await processor(image),result;
+  let [model,processor]=await loadFallback(id,profile),{pixel_values}=await processor(image),result;
   try{result=await model({input:pixel_values});}
   catch(error){
     if(fallbackDevice!=="webgpu")throw error;
     console.warn("WebGPU inference failed; retrying with quantized WASM",error);
     webGPUDisabled=true;fallbackPromise=null;
-    [model,processor]=await loadFallback(id);
+    [model,processor]=await loadFallback(id,profile);
     result=await model({input:pixel_values});
   }
   const {output}=result;
@@ -125,16 +127,16 @@ function diagnostics(alpha,w,h){
   return {ratio,softRatio:soft/Math.max(1,total),components,largestShare:strong?largest/strong:0,holeRatio:samples?holes/samples:0,width:maxX>=minX?maxX-minX+1:0,height:maxY>=minY?maxY-minY+1:0,suspicious:ratio<0.025||ratio>0.96||(strong&&largest/strong<0.82)||components>8};
 }
 
-async function remove(file,id){
+async function remove(file,id,profile="auto"){
   const image=await RawImage.fromBlob(file),preserved=await existingAlpha(image);
   if(preserved){self.postMessage({type:"progress",id,stage:"fast-path",message:"Existing transparency preserved."});return {alpha:preserved,width:image.width,height:image.height,engine:"existing-alpha"};}
-  const mask=await getFallbackMask(id,image),quality=diagnostics(mask.alpha,mask.width,mask.height);
+  const mask=await getFallbackMask(id,image,profile),quality=diagnostics(mask.alpha,mask.width,mask.height);
   if(quality.ratio<0.01||quality.ratio>0.985)throw new Error("The compatibility model returned an unsafe matte.");
   return {alpha:mask.alpha,width:mask.width,height:mask.height,engine:"rmbg",quality};
 }
 
 self.onmessage=async event=>{
-  const {type,id,file}=event.data||{};
+  const {type,id,file,profile="auto"}=event.data||{};
   if(type==="warm"){
     try{await loadFallback(id);self.postMessage({type:"ready",id,acceleration:fallbackDevice});}
     catch(error){console.warn("Model warmup skipped",error);self.postMessage({type:"ready",id,acceleration:"fallback"});}
@@ -142,7 +144,7 @@ self.onmessage=async event=>{
   }
   if(type!=="remove"||!file)return;
   try{
-    const result=await remove(file,id);
+    const result=await remove(file,id,profile);
     self.postMessage({type:"dual-mask",id,width:result.width,height:result.height,primaryBuffer:result.alpha.buffer,safetyBuffer:null,engine:result.engine,quality:result.quality},[result.alpha.buffer]);
   }catch(error){self.postMessage({type:"error",id,error:error?.message||String(error)});}
 };
