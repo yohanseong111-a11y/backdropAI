@@ -1,45 +1,66 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {readFile} from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 
-test("the general AI route receives the same final speck cleanup as the background-first route",async()=>{
-  const source=await readFile(new URL("../src/main.js",import.meta.url),"utf8");
-  const generalRoute=source.slice(source.indexOf("async function chooseSafeCutout"),source.indexOf("function nextFrame"));
-  assert.match(generalRoute,/let clean=await cleanupDisconnectedSpecks\(blob,file\)/);
-  assert.match(generalRoute,/return clean/);
+const source = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
+const section = (from, to) => source.slice(source.indexOf(from), source.indexOf(to));
+
+test("segmentation is the primary route and the colour flood is only a fallback", () => {
+  const route = section("async function chooseSafeCutout", "function nextFrame");
+  assert.match(route, /removeWithBackshotEngine\(file/);
+  const fallbackIndex = route.indexOf("conservativeCloseupFallback");
+  const catchIndex = route.indexOf("catch(aiError)");
+  assert.ok(catchIndex > 0 && fallbackIndex > catchIndex, "the colour fallback must only run after the model fails");
 });
 
-test("grass cleanup cannot erase confident jacket pixels and uses a smooth high-resolution matte",async()=>{
-  const source=await readFile(new URL("../src/main.js",import.meta.url),"utf8");
-  assert.match(source,/alpha\[i\]>=176/);
-  assert.match(source,/const grassLike=.*hueDistance<34/);
-  assert.match(source,/const maxSide=720/);
-  assert.match(source,/globalCompositeOperation="destination-in"/);
-  assert.match(source,/imageSmoothingQuality="high"/);
+test("every cutout goes through the same refinement before it is composited", () => {
+  const apply = section("async function applyDualMaskToFile", "function warmBackshotEngine");
+  assert.match(apply, /resampleAlpha\(rawAlpha,maskWidth,maskHeight/);
+  assert.match(apply, /refineForegroundAlpha\(/);
+  assert.match(apply, /globalCompositeOperation="destination-in"/);
+  assert.match(apply, /imageSmoothingQuality="high"/);
+  // The refined mask is applied to the original at its own size: no crop, no stretch.
+  assert.match(apply, /outCanvas\.width=fullWidth;outCanvas\.height=fullHeight/);
 });
 
-test("batch inference cannot overlap one ONNX session and always releases UI state",async()=>{
-  const source=await readFile(new URL("../src/main.js",import.meta.url),"utf8");
-  const queue=source.slice(source.indexOf("async function processRemovalQueue"),source.indexOf("async function removeSelectedBackgrounds"));
-  assert.match(queue,/for\(const item of queue\)/);
-  assert.doesNotMatch(queue,/Promise\.all\(chunk\.map/);
-  assert.match(queue,/finally\{/);
-  assert.match(queue,/state\.processing=false/);
+test("refinement runs at a bounded working resolution instead of full resolution", () => {
+  assert.match(source, /const REFINE_MAX_SIDE\s*=\s*\{/);
+  assert.match(source, /function refineWorkingSize\(width,height,profile\)/);
+  const apply = section("async function applyDualMaskToFile", "function warmBackshotEngine");
+  assert.match(apply, /refineWorkingSize\(fullWidth,fullHeight,profile\)/);
+  assert.doesNotMatch(apply, /getImageData\(0,0,fullWidth,fullHeight\)/);
 });
 
-test("mobile mask application cleans compact alpha and composites it only once",async()=>{
-  const source=await readFile(new URL("../src/main.js",import.meta.url),"utf8");
-  const apply=source.slice(source.indexOf("async function applyDualMaskToFile"),source.indexOf("function warmBackshotEngine"));
-  assert.match(apply,/removeTinyForegroundIslands\(protectedAlpha,maskWidth,maskHeight\)/);
-  assert.match(apply,/globalCompositeOperation="destination-in"/);
-  assert.doesNotMatch(apply,/scaled\.width=ow/);
-  assert.doesNotMatch(apply,/getImageData\(0,0,ow,oh\)/);
+test("edge decontamination is streamed in strips so large photos cannot exhaust memory", () => {
+  const strips = section("async function decontaminateEdgesInStrips", "function refineWorkingSize");
+  assert.match(strips, /for\(let y=0;y<height;y\+=stripHeight\)/);
+  assert.match(strips, /ctx\.putImageData\(composed,0,y\)/);
 });
 
-test("Fast Mobile adaptively refines only suspicious residual edges",async()=>{
-  const source=await readFile(new URL("../src/main.js",import.meta.url),"utf8");
-  const route=source.slice(source.indexOf("async function chooseSafeCutout"),source.indexOf("function nextFrame"));
-  assert.match(route,/state\.quality==="fast"&&await suspiciousResidualRatio\(clean\)>\.00025/);
-  assert.match(route,/removeWithBackshotEngine\(file,undefined,0,"auto"\)/);
-  assert.match(route,/refineResidualBackground\(clean,evidence,file\)/);
+test("batch inference cannot overlap one ONNX session and always releases UI state", () => {
+  const queue = section("async function processRemovalQueue", "async function removeSelectedBackgrounds");
+  assert.match(queue, /for\(const item of queue\)/);
+  assert.doesNotMatch(queue, /Promise\.all\(chunk\.map/);
+  assert.match(queue, /finally\{/);
+  assert.match(queue, /state\.processing=false/);
+  // Photos that already have a cutout are never processed again.
+  assert.match(queue, /filter\(item=>item&&!item\.cutoutBlob\)/);
+});
+
+test("remove selected and remove all read different sets of photos", () => {
+  const selected = section("async function removeSelectedBackgrounds", "async function removeAllBackgrounds");
+  const all = section("async function removeAllBackgrounds", "function updateProgress");
+  assert.match(selected, /selectedItems\(\)/);
+  assert.doesNotMatch(selected, /processRemovalQueue\(state\.items/);
+  assert.match(all, /processRemovalQueue\(state\.items/);
+  assert.doesNotMatch(all, /selectedItems\(\)/);
+});
+
+test("exports only ever contain finished cutouts", () => {
+  const download = section("async function downloadItems", "async function downloadSelected");
+  assert.match(download, /const items=processedItems\(candidates\)/);
+  assert.match(source, /function isProcessed\(item\)\{ return item\.status === "done" && !!item\.cutoutBlob; \}/);
+  const render = section("async function renderExport", "async function downloadItems");
+  assert.match(render, /imageFromURL\(item\.cutoutURL\)/);
+  assert.doesNotMatch(render, /item\.originalURL/);
 });

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {analyzeMask,chooseSafeCleanup,insideBrushFootprint,isHighConfidenceResidual,isNeutralBorderResidual,isGreenFringePixel,recoverForegroundChannel} from "../src/mask-safety.js";
+import {analyzeMask,chooseSafeCleanup,insideBrushFootprint,recoverForegroundChannel} from "../src/mask-safety.js";
 
 test("rolls back sudden foreground loss",()=>{
   const protectedMask=new Uint8Array(100).fill(255),cleaned=new Uint8Array(protectedMask);
@@ -23,29 +23,6 @@ test("assisted edits cannot escape their local brush footprint",()=>{
   assert.equal(insideBrushFootprint(15,10,10,10,5),true);
   assert.equal(insideBrushFootprint(16,10,10,10,5),false);
   assert.equal(insideBrushFootprint(10,16,10,10,5),false);
-});
-
-test("flags grass and white floor residuals without flagging jacket colours",()=>{
-  assert.equal(isHighConfidenceResidual(32,108,54),true);
-  assert.equal(isHighConfidenceResidual(228,231,226),true);
-  assert.equal(isHighConfidenceResidual(28,48,67),false);
-  assert.equal(isHighConfidenceResidual(0,168,224),false);
-  assert.equal(isHighConfidenceResidual(240,118,35),false);
-});
-
-test("neutral border cleanup accepts floors but rejects dark navy jacket panels",()=>{
-  assert.equal(isNeutralBorderResidual(158,155,149),true);
-  assert.equal(isNeutralBorderResidual(224,226,220),true);
-  assert.equal(isNeutralBorderResidual(35,51,68),false);
-  assert.equal(isNeutralBorderResidual(61,70,79),false);
-  assert.equal(isNeutralBorderResidual(21,153,205),false);
-});
-
-test("green fringe cleanup catches mixed grass edges without deleting jacket colours",()=>{
-  assert.equal(isGreenFringePixel(28,91,83),true);
-  assert.equal(isGreenFringePixel(42,112,105),true);
-  assert.equal(isGreenFringePixel(8,170,225),false);
-  assert.equal(isGreenFringePixel(35,51,68),false);
 });
 
 test("matte decontamination reconstructs foreground colour from background spill",()=>{
