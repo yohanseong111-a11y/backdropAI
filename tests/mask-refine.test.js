@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   boxMean,
+  guidedFilter,
   guidedFilterColour,
   colourChannels,
   colourEdgeStrength,
@@ -11,6 +12,10 @@ import {
   reclaimConnectedBackground,
   fillSubjectHoles,
   removeTinyForegroundIslands,
+  colourRatioEdgeRefine,
+  featherAlphaBand,
+  alphaBounds,
+  largestComponentBounds,
   shapeSurvived,
   refineForegroundAlpha
 } from "../src/mask-refine.js";
@@ -59,6 +64,24 @@ test("the colour guide separates two colours of the same brightness", () => {
 
   const edges = colourEdgeStrength(colourChannels(rgb, width, height), width, height);
   assert.ok(edges[4 * width + 12] > 0.05, "the colour boundary must register as an edge");
+});
+
+test("the luma guide is a usable fallback on a brightness edge", () => {
+  // Used when the working resolution is too large for the colour guide's buffers.
+  const width = 24;
+  const height = 8;
+  const luma = new Float32Array(width * height);
+  const soft = new Float32Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      luma[i] = x < 12 ? 0.2 : 0.8;
+      soft[i] = Math.min(1, Math.max(0, (20 - x) / 16));
+    }
+  }
+  const guided = guidedFilter(luma, soft, width, height, 4, 1e-5);
+  assert.ok(guided[4 * width + 6] > 0.8);
+  assert.ok(guided[4 * width + 17] < 0.35);
 });
 
 test("alpha resampling interpolates instead of duplicating pixels", () => {
@@ -185,6 +208,49 @@ test("tiny islands go, the main subject stays", () => {
   const cleaned = removeTinyForegroundIslands(alpha, width, height);
   assert.equal(cleaned[2 * width + 2], 0);
   assert.equal(cleaned[20 * width + 20], 255);
+});
+
+test("colour ratio refinement pushes edge pixels toward the colour they match", () => {
+  const width = 6;
+  const height = 1;
+  const alpha = Uint8Array.from([0, 60, 128, 128, 200, 255]);
+  const distances = {
+    toForeground: Float32Array.from([200, 200, 200, 5, 5, 5]),
+    toBackground: Float32Array.from([5, 5, 5, 200, 200, 200]),
+    backgroundTrust: new Float32Array(width).fill(1)
+  };
+  const refined = colourRatioEdgeRefine(alpha, distances, width, height);
+  assert.ok(refined[1] < alpha[1], "a background-coloured edge pixel should fade");
+  assert.ok(refined[2] < alpha[2]);
+  assert.ok(refined[3] > alpha[3], "a subject-coloured edge pixel should firm up");
+  assert.equal(refined[0], alpha[0], "fully transparent pixels are left alone");
+  assert.equal(refined[5], alpha[5], "fully opaque pixels are left alone");
+});
+
+test("feathering softens the band without moving solid pixels", () => {
+  const width = 5;
+  const height = 5;
+  const alpha = new Uint8Array(width * height);
+  alpha[2 * width + 2] = 120;
+  alpha[2 * width + 3] = 255;
+  const feathered = featherAlphaBand(alpha, width, height);
+  assert.ok(feathered[2 * width + 2] < 120, "a lone mid-alpha pixel is pulled toward its neighbours");
+  assert.equal(feathered[2 * width + 3], 255, "opaque pixels are untouched");
+  assert.equal(feathered[0], 0, "transparent pixels are untouched");
+});
+
+test("component bounds ignore a stray fragment that whole-mask bounds would follow", () => {
+  const width = 40;
+  const height = 40;
+  const alpha = new Uint8Array(width * height);
+  for (let y = 14; y < 30; y++) for (let x = 14; x < 30; x++) alpha[y * width + x] = 255;
+  const withFragment = new Uint8Array(alpha);
+  withFragment[1 * width + 1] = 255;
+
+  assert.ok(alphaBounds(withFragment, width, height).width > alphaBounds(alpha, width, height).width);
+  assert.deepEqual(largestComponentBounds(withFragment, width, height), largestComponentBounds(alpha, width, height));
+  // Removing only the fragment must therefore read as "shape intact".
+  assert.equal(shapeSurvived(withFragment, alpha, width, height, { minArea: 0.95, minSpan: 0.95 }), true);
 });
 
 test("shape survival protects the subject extent but tolerates background removal", () => {

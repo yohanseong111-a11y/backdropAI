@@ -14,7 +14,7 @@
 
 const UNKNOWN_DISTANCE = 999;
 
-export function buildIntegral(src, width, height, out) {
+function buildIntegral(src, width, height, out) {
   const stride = width + 1;
   out.fill(0, 0, stride);
   for (let y = 0; y < height; y++) {
@@ -213,7 +213,7 @@ export function resampleAlpha(alpha, sourceWidth, sourceHeight, width, height) {
   return out;
 }
 
-export function luminanceField(rgb, width, height) {
+function luminanceField(rgb, width, height) {
   const out = new Float32Array(width * height);
   for (let i = 0; i < out.length; i++) {
     const o = i * 4;

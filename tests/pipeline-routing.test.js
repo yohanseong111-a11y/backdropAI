@@ -56,6 +56,14 @@ test("remove selected and remove all read different sets of photos", () => {
   assert.doesNotMatch(all, /selectedItems\(\)/);
 });
 
+test("two photos sharing a filename get separate entries in the ZIP", () => {
+  const naming = section("function exportNameFor", "async function renderExport");
+  assert.match(naming, /while\(taken\.has\(name\)\)/);
+  const download = section("async function downloadItems", "async function downloadSelected");
+  assert.match(download, /const taken=new Set\(\)/);
+  assert.match(download, /exportNameFor\(item,counter,taken\)/);
+});
+
 test("exports only ever contain finished cutouts", () => {
   const download = section("async function downloadItems", "async function downloadSelected");
   assert.match(download, /const items=processedItems\(candidates\)/);

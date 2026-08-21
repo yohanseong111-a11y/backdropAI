@@ -173,7 +173,7 @@ app.innerHTML = `
 <div id="cutoutModal" class="modal hidden">
   <div class="modal-card">
     <div class="modal-head">
-      <div><strong>Edit cutout</strong><span>Assisted tap or manual brush. Works with mouse and touch.</span></div>
+      <div><strong>Edit cutout</strong><span>AI Assist target or manual brush. Works with mouse and touch.</span></div>
       <button id="closeEditor" class="icon-btn">×</button>
     </div>
     <div class="editor-toolbar">
@@ -764,6 +764,9 @@ async function applyDualMaskToFile(file,primaryBuffer,safetyBuffer,maskWidth,mas
   workCtx.imageSmoothingEnabled=true;workCtx.imageSmoothingQuality="high";
   workCtx.drawImage(bitmap,0,0,work.width,work.height);
   const workRGB=workCtx.getImageData(0,0,work.width,work.height).data;
+  // Release the backing store now: refinement and the full-resolution composite
+  // both still have to fit in memory on a phone.
+  workCanvas.width=0;workCanvas.height=0;
 
   const upscaled=resampleAlpha(rawAlpha,maskWidth,maskHeight,work.width,work.height);
   debugMaskStage("02-upscaled",upscaled,work.width,work.height);
@@ -1314,9 +1317,15 @@ function downloadBlob(blob,filename){
   setTimeout(()=>link.remove(),1000);
   setTimeout(()=>URL.revokeObjectURL(url),60000);
 }
-function exportNameFor(item,index){
-  const base=(item.name.replace(/\.[^.]+$/,"")||`image-${index}`).replace(/[^\w\- ]+/g,"").trim().replace(/\s+/g,"-");
-  return base||`image-${index}`;
+function exportNameFor(item,index,taken){
+  const base=(item.name.replace(/\.[^.]+$/,"")||`image-${index}`).replace(/[^\w\- ]+/g,"").trim().replace(/\s+/g,"-")||`image-${index}`;
+  if(!taken)return base;
+  // Two photos can share a filename. Without this the second ZIP entry silently
+  // replaces the first and the export comes out short.
+  let name=base,suffix=2;
+  while(taken.has(name))name=`${base}-${suffix++}`;
+  taken.add(name);
+  return name;
 }
 async function renderExport(item){
   const source=await imageFromURL(item.cutoutURL);
@@ -1346,10 +1355,11 @@ async function downloadItems(candidates, button, filenamePrefix, emptyMessage){
       toast(skipped?`1 photo downloaded • ${skipped} not processed yet.`:"Photo downloaded.");
     }else{
       const zip=new JSZip();
+      const taken=new Set();
       let counter=1;
       for(const item of items){
         const {blob,ext}=await renderExport(item);
-        zip.file(`${exportNameFor(item,counter)}-backshotai.${ext}`,blob);
+        zip.file(`${exportNameFor(item,counter,taken)}-backshotai.${ext}`,blob);
         counter++;
       }
       const out=await zip.generateAsync({type:"blob",compression:"DEFLATE"});
