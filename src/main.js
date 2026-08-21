@@ -1,14 +1,24 @@
 import "./style.css";
 import "./editor.css";
-import {chooseSafeCleanup,isHighConfidenceResidual,isNeutralBorderResidual,isGreenFringePixel,recoverForegroundChannel} from "./mask-safety.js";
+import {chooseSafeCleanup,recoverForegroundChannel} from "./mask-safety.js";
+import {refineForegroundAlpha,resampleAlpha,removeTinyForegroundIslands} from "./mask-refine.js";
+import {computeAssistSelection,applyAssistSelection} from "./assist.js";
 import JSZip from "jszip";
-import { removeBackground, preload } from "@imgly/background-removal";
 
+const DEFAULT_SHADOW = { enabled: false, opacity: 0.18, blur: 26, offsetY: 14 };
 const DEFAULT_ADJ = () => ({
   scale: 1, offsetX: 0, offsetY: 0,
   brightness: 100, contrast: 100, saturation: 100,
-  shadow: { enabled: true, opacity: 0.22, blur: 24, offsetY: 18 }
+  shadow: { ...DEFAULT_SHADOW }
 });
+
+const IS_MOBILE = navigator.userAgentData?.mobile === true ||
+  /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ||
+  (/Macintosh/i.test(navigator.userAgent) && Number(navigator.maxTouchPoints || 0) > 1);
+
+// Resolution the mask is refined at before it is applied to the full-size photo.
+// Refinement allocates a handful of float buffers per pixel, so phones stay lower.
+const REFINE_MAX_SIDE = { fast: 768, auto: IS_MOBILE ? 896 : 1280, best: IS_MOBILE ? 1024 : 1440 };
 
 const state = {
   items: [],
@@ -24,10 +34,7 @@ const state = {
   failed: 0,
   quality: "auto",
   editor: null,
-  dragSelecting: false,
-  dragMoved: false,
-  dragStartX: 0,
-  dragStartY: 0
+  drag: null
 };
 
 const app = document.querySelector("#app");
@@ -64,8 +71,9 @@ app.innerHTML = `
       </div>
       <div class="single-mode-badge">Backshot Engine <span id="engineStatus">Starting…</span></div>
       <div class="remove-button-stack">
-        <button id="removeSelectedBtn" class="primary">Remove selected backgrounds</button>
-        <button id="removeAllBtn" class="ghost remove-all-btn">Remove all backgrounds</button>
+        <button id="removeSelectedBtn" class="primary" disabled>Remove selected backgrounds</button>
+        <button id="removeAllBtn" class="ghost remove-all-btn" disabled>Remove all backgrounds</button>
+        <p id="removeHint" class="action-hint">Select photos to remove only those, or use Remove all for the whole batch.</p>
       </div>
       <div id="progressWrap" class="progress-wrap hidden">
         <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
@@ -136,8 +144,10 @@ app.innerHTML = `
       </fieldset>
 
       <div class="divider"></div>
-      <button id="downloadSelectedBtn" class="primary success secondary-download">Download selected</button>
-      <button id="downloadAllBtn" class="primary success">Download all as ZIP</button>
+      <div class="section-title">5. Download</div>
+      <button id="downloadSelectedBtn" class="primary success secondary-download" disabled>Download selected</button>
+      <button id="downloadAllBtn" class="primary success" disabled>Download all</button>
+      <p id="downloadHint" class="action-hint">Only photos that finished background removal are exported.</p>
       <button id="clearBtn" class="danger ghost">Clear batch</button>
     </aside>
 
@@ -145,8 +155,8 @@ app.innerHTML = `
       <div class="gallery-head">
         <div><h2>Your batch</h2><p id="batchCount">0 photos</p></div>
         <div class="gallery-head-actions">
-          <button id="helpBtn" class="ghost">Get help</button>
-          <button id="addMoreBtn" class="ghost">+ Add more</button>
+          <button id="helpBtn" class="ghost" type="button"><span class="help-glyph" aria-hidden="true">?</span> Tutorial</button>
+          <button id="addMoreBtn" class="ghost" type="button">+ Add more</button>
         </div>
       </div>
       <div id="dragGuide" class="drag-guide">
@@ -171,8 +181,9 @@ app.innerHTML = `
         <button id="eraseTool" class="tool active">Erase</button>
         <button id="restoreTool" class="tool">Restore</button>
       </div>
-      <label class="smart-toggle"><input id="assistToggle" type="checkbox" checked /> Assisted</label>
-      <label class="brush-row">Brush <input id="brushSize" type="range" min="8" max="180" value="54" /></label>
+      <label class="smart-toggle"><input id="assistToggle" type="checkbox" checked /> AI Assist</label>
+      <label id="assistSizeRow" class="brush-row">Target <input id="assistSize" type="range" min="14" max="150" step="1" value="46" /><span id="assistSizeLabel" class="range-value">Medium</span></label>
+      <label id="brushSizeRow" class="brush-row hidden">Brush <input id="brushSize" type="range" min="8" max="180" value="54" /></label>
       <button id="undoEdit" class="ghost small-btn">Undo</button>
       <button id="redoEdit" class="ghost small-btn">Redo</button>
       <div class="tool-group" aria-label="Editor zoom">
@@ -180,14 +191,15 @@ app.innerHTML = `
         <button id="fitEditor" class="tool" type="button">Fit</button>
         <button id="zoomInEditor" class="tool" type="button" aria-label="Zoom in">＋</button>
       </div>
-      <button id="smartRecover" class="ghost small-btn">Re-check subject</button>
+      <button id="smartRecover" class="ghost small-btn">Re-run removal</button>
     </div>
     <div class="editor-stage">
       <canvas id="editorCanvas"></canvas>
+      <div id="assistTarget" class="assist-target"><span class="assist-target-dot"></span></div>
       <div id="brushCursor" class="brush-cursor"></div>
     </div>
     <div class="editor-foot">
-      <span id="editorHint">Assisted: tap a missed area and BackshotAI follows that region.</span>
+      <span id="editorHint">AI Assist: place the target on an area to remove and tap once.</span>
       <button id="applyEdit" class="primary compact">Apply cutout</button>
     </div>
   </div>
@@ -205,6 +217,7 @@ app.innerHTML = `
         <div class="tutorial-count" id="tutorialCount">1 / 7</div>
         <h3 id="tutorialTitle"></h3>
         <p id="tutorialText"></p>
+        <ul id="tutorialPoints" class="tutorial-points"></ul>
       </div>
     </div>
     <div class="help-foot">
@@ -236,8 +249,17 @@ function cleanupItem(item) {
   if (item.cutoutURL) URL.revokeObjectURL(item.cutoutURL);
   if (item.background?.url) URL.revokeObjectURL(item.background.url);
 }
+const MAX_FILE_BYTES = 80 * 1024 * 1024;
 function addFiles(fileList) {
-  const files = Array.from(fileList || []).filter(f => f.type.startsWith("image/"));
+  const incoming = Array.from(fileList || []);
+  const files = [];
+  const rejected = [];
+  for (const file of incoming) {
+    if (!file.type?.startsWith("image/")) rejected.push(`${file.name} is not an image`);
+    else if (file.size > MAX_FILE_BYTES) rejected.push(`${file.name} is over 80 MB`);
+    else files.push(file);
+  }
+
   for (const file of files) {
     state.items.push({
       id: crypto.randomUUID(), name: file.name, file,
@@ -250,7 +272,16 @@ function addFiles(fileList) {
     renderGallery();
     updateSelectionUI();
   }
+  // Rejecting a file must never discard the photos that did load.
+  if (rejected.length) {
+    toast(rejected.length === 1 ? `Skipped: ${rejected[0]}.` : `Skipped ${rejected.length} files that are not usable images.`);
+  } else if (!files.length && incoming.length) {
+    toast("No usable images in that selection.");
+  }
 }
+function isProcessed(item){ return item.status === "done" && !!item.cutoutBlob; }
+function processedItems(items){ return items.filter(isProcessed); }
+let suppressNextCardClick = false;
 function statusText(item) {
   return item.status === "processing" ? "Removing…" : item.status === "revealing" ? "Cleaned" : item.status === "done" ? "Ready" : item.status === "failed" ? "Failed" : "Waiting";
 }
@@ -287,7 +318,7 @@ function renderGallery() {
     </article>`).join("");
 
   document.querySelectorAll("[data-card]").forEach(card=>card.onclick=e=>{
-    if(e.target.closest("button") || state.dragMoved) return;
+    if(e.target.closest("button") || suppressNextCardClick) return;
     toggleSelected(card.dataset.card);
   });
   document.querySelectorAll(".select-chip").forEach(btn=>btn.onclick=e=>{e.stopPropagation();toggleSelected(btn.dataset.select);});
@@ -299,8 +330,26 @@ function renderGallery() {
   requestAnimationFrame(renderAllPreviews);
 }
 
-function updateSelectionUI(){const ds=$("#downloadSelectedBtn");if(ds)ds.disabled=state.selected.size===0;
+function updateSelectionUI(){
   const items=selectedItems(), first=items[0];
+  const selectedPending=items.filter(item=>!item.cutoutBlob).length;
+  const allPending=state.items.filter(item=>!item.cutoutBlob).length;
+  const selectedReady=processedItems(items).length;
+  const allReady=processedItems(state.items).length;
+
+  $("#removeSelectedBtn").disabled=state.processing||!selectedPending;
+  $("#removeAllBtn").disabled=state.processing||!allPending;
+  $("#downloadSelectedBtn").disabled=state.processing||!selectedReady;
+  $("#downloadAllBtn").disabled=state.processing||!allReady;
+  $("#removeHint").textContent=
+    !state.items.length?"Add photos to get started."
+    :!items.length?"Nothing selected — tap photos or drag across them, or use Remove all."
+    :!selectedPending?`All ${items.length} selected photo${items.length===1?"":"s"} already done. Remove all covers the rest.`
+    :`Ready to process ${selectedPending} of ${items.length} selected photo${items.length===1?"":"s"}.`;
+  $("#downloadHint").textContent=
+    !allReady?"Finish background removal first — only completed cutouts can be exported."
+    :`${selectedReady} selected and ${allReady} total cutout${allReady===1?"":"s"} ready to export.`;
+
   $("#selectedCount").textContent=`${items.length} selected`;
   $("#positionControls").disabled=state.editScopes.position==="selected"&&!items.length;
   $("#filterControls").disabled=state.editScopes.filters==="selected"&&!items.length;
@@ -319,7 +368,7 @@ function updateSelectionUI(){const ds=$("#downloadSelectedBtn");if(ds)ds.disable
     }else $("#backgroundPreview").classList.add("hidden");
     $("#scaleRange").value=first.adj.scale; $("#xRange").value=first.adj.offsetX; $("#yRange").value=first.adj.offsetY;
     $("#brightnessRange").value=first.adj.brightness; $("#contrastRange").value=first.adj.contrast; $("#saturationRange").value=first.adj.saturation;
-    const shadowCfg=first.adj.shadow||{enabled:true,opacity:.22,blur:24,offsetY:18};
+    const shadowCfg=first.adj.shadow||{...DEFAULT_SHADOW};
     $("#shadowEnabled").checked=shadowCfg.enabled; $("#shadowOpacity").value=shadowCfg.opacity; $("#shadowBlur").value=shadowCfg.blur; $("#shadowY").value=shadowCfg.offsetY;
   }
 }
@@ -336,135 +385,12 @@ function applyScopedEdit(category,key,value){
 function applyScopedShadow(key,value){
   const items=editTargets("shadow");if(!items.length)return;
   for(const item of items){
-    item.adj.shadow ||= {enabled:true,opacity:.22,blur:24,offsetY:18};
+    item.adj.shadow ||= {...DEFAULT_SHADOW};
     item.adj.shadow[key]=value;
   }
   schedulePreviewRender();
 }
 
-function removalConfig(mode, progress, useWorker = true) {
-  const model = mode === "fast" ? "isnet_quint8" : "isnet";
-  return {
-    model,
-    device: "cpu",
-    proxyToWorker: useWorker,
-    output: { format: "image/png", quality: 1 },
-    progress
-  };
-}
-
-async function trySimpleBackgroundRemoval(file){
-  // Fast path for simple/minimal backgrounds: estimate the dominant border colour family
-  // and remove ONLY background pixels connected to the image edges.
-  // This preserves every disconnected object/product in the middle of the frame.
-  const bmp=await createImageBitmap(file);
-  const maxSide=320,scale=Math.min(1,maxSide/Math.max(bmp.width,bmp.height));
-  const w=Math.max(32,Math.round(bmp.width*scale)),h=Math.max(32,Math.round(bmp.height*scale));
-  const c=document.createElement("canvas");c.width=w;c.height=h;
-  const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0,w,h);
-  const img=ctx.getImageData(0,0,w,h),d=img.data;
-
-  function rgb2hsv(r,g,b){
-    r/=255;g/=255;b/=255;const mx=Math.max(r,g,b),mn=Math.min(r,g,b),df=mx-mn;
-    let hh=0;if(df){
-      if(mx===r)hh=((g-b)/df)%6;
-      else if(mx===g)hh=(b-r)/df+2;
-      else hh=(r-g)/df+4;
-      hh*=60;if(hh<0)hh+=360;
-    }
-    return [hh,mx?df/mx:0,mx];
-  }
-  const border=[];
-  const step=Math.max(1,Math.floor(Math.min(w,h)/80));
-  for(let x=0;x<w;x+=step){
-    for(const y of [0,h-1]){const o=(y*w+x)*4;border.push([d[o],d[o+1],d[o+2]]);}
-  }
-  for(let y=0;y<h;y+=step){
-    for(const x of [0,w-1]){const o=(y*w+x)*4;border.push([d[o],d[o+1],d[o+2]]);}
-  }
-  if(border.length<20)return null;
-
-  // Quantize HSV to find a dominant border family.
-  const bins=new Map();
-  for(const [r,g,b] of border){
-    const [hh,s,v]=rgb2hsv(r,g,b);
-    const hb=Math.round(hh/24),sb=Math.round(s*5),vb=Math.round(v*5);
-    const key=`${hb}|${sb}|${vb}`;
-    const a=bins.get(key)||[];a.push([r,g,b,hh,s,v]);bins.set(key,a);
-  }
-  let dominant=null;
-  for(const arr of bins.values())if(!dominant||arr.length>dominant.length)dominant=arr;
-  if(!dominant||dominant.length/border.length<0.32)return null;
-
-  let mr=0,mg=0,mb=0,mh=0,ms=0,mv=0;
-  for(const p of dominant){mr+=p[0];mg+=p[1];mb+=p[2];mh+=p[3];ms+=p[4];mv+=p[5];}
-  mr/=dominant.length;mg/=dominant.length;mb/=dominant.length;mh/=dominant.length;ms/=dominant.length;mv/=dominant.length;
-
-  // Adaptive tolerance from cluster spread.
-  let spread=0;
-  for(const p of dominant)spread+=Math.hypot(p[0]-mr,p[1]-mg,p[2]-mb);
-  spread/=dominant.length;
-  const rgbTol=Math.max(34,Math.min(92,spread*2.6+24));
-  const hueTol=Math.max(18,Math.min(52,spread*.55+20));
-
-  const candidate=new Uint8Array(w*h);
-  for(let i=0;i<w*h;i++){
-    const o=i*4,r=d[o],g=d[o+1],b=d[o+2],dist=Math.hypot(r-mr,g-mg,b-mb);
-    const [hh,s,v]=rgb2hsv(r,g,b);
-    let hd=Math.abs(hh-mh);hd=Math.min(hd,360-hd);
-    const similarRGB=dist<rgbTol;
-    const similarHue=ms>.18 && s>.12 && hd<hueTol && Math.abs(v-mv)<.35;
-    if(similarRGB||similarHue)candidate[i]=1;
-  }
-
-  // Flood only from edges. Similar-colour product pixels that are not edge-connected survive.
-  const bg=new Uint8Array(w*h),q=[];
-  const push=(x,y)=>{const i=y*w+x;if(candidate[i]&&!bg[i]){bg[i]=1;q.push(i);}};
-  for(let x=0;x<w;x++){push(x,0);push(x,h-1);}
-  for(let y=0;y<h;y++){push(0,y);push(w-1,y);}
-  for(let qi=0;qi<q.length;qi++){
-    const i=q[qi],x=i%w,y=(i/w)|0;
-    if(x>0)push(x-1,y);if(x<w-1)push(x+1,y);if(y>0)push(x,y-1);if(y<h-1)push(x,y+1);
-  }
-  let bgCount=0;for(const v of bg)bgCount+=v;
-  const ratio=bgCount/(w*h);
-  // Only trust this shortcut when it clearly identified a substantial background, but not nearly everything.
-  if(ratio<0.12||ratio>0.78)return null;
-
-  // Create a full-resolution alpha mask using nearest scaling of the connected background mask,
-  // then lightly feather the boundary.
-  const full=document.createElement("canvas");full.width=bmp.width;full.height=bmp.height;
-  const fctx=full.getContext("2d",{willReadFrequently:true});fctx.drawImage(bmp,0,0);
-  const out=fctx.getImageData(0,0,full.width,full.height),od=out.data;
-  for(let y=0;y<full.height;y++){
-    const sy=Math.min(h-1,Math.floor(y*h/full.height));
-    for(let x=0;x<full.width;x++){
-      const sx=Math.min(w-1,Math.floor(x*w/full.width)),si=sy*w+sx,o=(y*full.width+x)*4;
-      if(bg[si])od[o+3]=0;
-    }
-    if(y%180===0)await new Promise(r=>setTimeout(r,0));
-  }
-  fctx.putImageData(out,0,0);
-  return await new Promise(res=>full.toBlob(res,"image/png",1));
-}
-
-async function removeStable(file, mode, progress) {
-  // Reliability-first: keep inference off the UI thread when possible.
-  // If worker execution is unsupported on a browser, retry directly on CPU.
-  try {
-    return await removeBackground(file, removalConfig(mode, progress, true));
-  } catch (workerError) {
-    console.warn("Worker removal failed; retrying directly on CPU", workerError);
-    return await removeBackground(file, removalConfig(mode, progress, false));
-  }
-}
-function preloadRemovalModel() {
-  const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 250));
-  idle(async () => {
-    try { await preload(removalConfig("smart", () => {}, true)); document.documentElement.dataset.removerReady = "true"; }
-    catch (error) { console.warn("Background model preload skipped", error); }
-  });
-}
 async function alphaStats(blob) {
   const bmp = await createImageBitmap(blob);
   const maxSide=256,s=Math.min(1,maxSide/Math.max(bmp.width,bmp.height));
@@ -475,175 +401,6 @@ async function alphaStats(blob) {
   const total=d.length/4;return {visible:visible/total,strong:strong/total};
 }
 
-async function cleanCutoutEdges(blob){
-  // Matting-style refinement: preserve the model's foreground alpha and clean only the boundary.
-  // BackshotAI's own API docs note that matting is what improves cutout edges over a raw mask.
-  const bmp=await createImageBitmap(blob),c=document.createElement("canvas");
-  c.width=bmp.width;c.height=bmp.height;
-  const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0);
-  const img=ctx.getImageData(0,0,c.width,c.height),d=img.data,w=c.width,h=c.height;
-  const alpha=new Uint8Array(w*h);
-  for(let i=0,p=3;i<alpha.length;i++,p+=4)alpha[i]=d[p];
-
-  const newA=new Uint8Array(alpha);
-  for(let y=1;y<h-1;y++){
-    for(let x=1;x<w-1;x++){
-      const i=y*w+x,a=alpha[i];
-      if(a===0)continue;
-
-      let minA=255,maxA=0,sumA=0,count=0,best=-1,bestA=-1;
-      for(let oy=-2;oy<=2;oy++){
-        for(let ox=-2;ox<=2;ox++){
-          const nx=x+ox,ny=y+oy;
-          if(nx<0||ny<0||nx>=w||ny>=h)continue;
-          const n=ny*w+nx,na=alpha[n];
-          minA=Math.min(minA,na);maxA=Math.max(maxA,na);sumA+=na;count++;
-          if(na>bestA){bestA=na;best=n;}
-        }
-      }
-
-      const boundary=minA<20 && maxA>210;
-      if(boundary){
-        // Feather without deleting opaque subject pixels.
-        const local=sumA/count;
-        if(a<245)newA[i]=Math.max(a,Math.min(245,Math.round(a*.70+local*.30)));
-
-        // Remove colour spill on the fringe by borrowing colour from the most opaque
-        // neighbouring subject pixel. This targets green/white outlines without shrinking.
-        if(best>=0&&bestA>220){
-          const mix=a>230?.72:a>150?.58:.42;
-          for(let k=0;k<3;k++){
-            d[i*4+k]=Math.round(d[i*4+k]*(1-mix)+d[best*4+k]*mix);
-          }
-        }
-      }
-      if(a<5)newA[i]=0;
-    }
-    if(y%96===0)await new Promise(r=>setTimeout(r,0));
-  }
-
-  // One tiny alpha blur only in the unknown edge band for smoother anti-aliasing.
-  for(let y=1;y<h-1;y++){
-    for(let x=1;x<w-1;x++){
-      const i=y*w+x,a=newA[i];
-      if(a<=5||a>=250)continue;
-      let s=0,n=0;
-      for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){s+=newA[(y+oy)*w+x+ox];n++;}
-      d[i*4+3]=Math.round(a*.78+(s/n)*.22);
-    }
-  }
-  for(let i=0;i<newA.length;i++)if(newA[i]<=5||newA[i]>=250)d[i*4+3]=newA[i];
-
-  ctx.putImageData(img,0,0);
-  return await new Promise(res=>c.toBlob(res,"image/png",1));
-}
-
-
-async function cutoutShapeStats(blob){
-  const bmp=await createImageBitmap(blob);
-  const maxSide=220,s=Math.min(1,maxSide/Math.max(bmp.width,bmp.height));
-  const w=Math.max(1,Math.round(bmp.width*s)),h=Math.max(1,Math.round(bmp.height*s));
-  const c=document.createElement("canvas");c.width=w;c.height=h;
-  const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0,w,h);
-  const d=ctx.getImageData(0,0,w,h).data,mask=new Uint8Array(w*h);
-  let visible=0;
-  for(let i=0;i<w*h;i++){if(d[i*4+3]>80){mask[i]=1;visible++;}}
-  const seen=new Uint8Array(w*h);let largest=0,components=0;
-  for(let i=0;i<w*h;i++){
-    if(!mask[i]||seen[i])continue;
-    components++;let size=0,q=[i];seen[i]=1;
-    for(let qi=0;qi<q.length;qi++){
-      const p=q[qi],x=p%w,y=(p/w)|0;size++;
-      for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){
-        const nx=x+dx,ny=y+dy;if(nx<0||ny<0||nx>=w||ny>=h)continue;
-        const n=ny*w+nx;if(mask[n]&&!seen[n]){seen[n]=1;q.push(n);}
-      }
-    }
-    largest=Math.max(largest,size);
-  }
-  return {visible:visible/(w*h),largestShare:visible?largest/visible:0,components};
-}
-
-async function fuseCutoutsPreserveSubject(aBlob,bBlob){
-  // Conservative union of two AI passes. If one model pass accidentally deletes a
-  // product section, the other pass can restore it. We prefer preserving subject
-  // over aggressively deleting uncertain pixels.
-  const [a,b]=await Promise.all([createImageBitmap(aBlob),createImageBitmap(bBlob)]);
-  const w=a.width,h=a.height,c=document.createElement("canvas");c.width=w;c.height=h;
-  const ctx=c.getContext("2d",{willReadFrequently:true});
-  ctx.drawImage(a,0,0);const ai=ctx.getImageData(0,0,w,h);
-  ctx.clearRect(0,0,w,h);ctx.drawImage(b,0,0,w,h);const bi=ctx.getImageData(0,0,w,h);
-  const ad=ai.data,bd=bi.data;
-  for(let i=0;i<w*h;i++){
-    const o=i*4,aa=ad[o+3],ba=bd[o+3];
-    if(ba>aa){
-      // Use RGB from whichever cutout is more confident at this pixel.
-      ad[o]=bd[o];ad[o+1]=bd[o+1];ad[o+2]=bd[o+2];ad[o+3]=ba;
-    }
-  }
-  ctx.putImageData(ai,0,0);
-  return await new Promise(res=>c.toBlob(res,"image/png",1));
-}
-
-
-let birefModelPromise=null;
-let birefProcessorPromise=null;
-
-async function getBiRefNet(){
-  if(!birefModelPromise){
-    const modelId="onnx-community/BiRefNet_lite-ONNX";
-    const device=navigator.gpu?"webgpu":"wasm";
-    const dtype=navigator.gpu?"fp16":"q4";
-    $("#progressText").textContent="Loading precision cutout model…";
-    birefModelPromise=AutoModel.from_pretrained(modelId,{device,dtype});
-    birefProcessorPromise=AutoProcessor.from_pretrained(modelId);
-  }
-  return Promise.all([birefModelPromise,birefProcessorPromise]);
-}
-
-async function removeWithBiRefNet(file){
-  const [model,processor]=await getBiRefNet();
-  const original=await RawImage.fromBlob(file);
-  const {pixel_values}=await processor(original);
-  const {output_image}=await model({input_image:pixel_values});
-  const mask=await RawImage
-    .fromTensor(output_image[0].sigmoid().mul(255).to("uint8"))
-    .resize(original.width,original.height);
-
-  const bmp=await createImageBitmap(file);
-  const c=document.createElement("canvas");
-  c.width=bmp.width;c.height=bmp.height;
-  const ctx=c.getContext("2d",{willReadFrequently:true});
-  ctx.drawImage(bmp,0,0);
-  const out=ctx.getImageData(0,0,c.width,c.height),d=out.data,md=mask.data;
-
-  // BiRefNet returns a full alpha matte, not a tiny "salient object" crop.
-  for(let i=0;i<c.width*c.height;i++)d[i*4+3]=md[i]??255;
-  ctx.putImageData(out,0,0);
-  return await new Promise(res=>c.toBlob(res,"image/png",1));
-}
-
-async function cleanupDisconnectedSpecks(blob,originalBlob=null){
-  const bmp=await createImageBitmap(blob),c=document.createElement("canvas");c.width=bmp.width;c.height=bmp.height;
-  const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0);bmp.close?.();
-  const image=ctx.getImageData(0,0,c.width,c.height),alpha=new Uint8Array(c.width*c.height);
-  for(let i=0;i<alpha.length;i++)alpha[i]=image.data[i*4+3];
-  let cleaned=removeTinyForegroundIslands(alpha,c.width,c.height);
-  cleaned=removeGreenBoundaryFringe(image.data,cleaned,c.width,c.height);
-  cleaned=refineAlphaEdge(cleaned,c.width,c.height);
-  const safe=chooseSafeCleanup(alpha,cleaned,c.width,c.height);
-  for(let i=0;i<safe.length;i++)image.data[i*4+3]=safe[i];
-  if(originalBlob){
-    // Reuse the existing canvas instead of allocating a second full-resolution
-    // canvas. This materially lowers peak memory for large phone photos.
-    const original=await createImageBitmap(originalBlob);
-    ctx.clearRect(0,0,c.width,c.height);ctx.drawImage(original,0,0,c.width,c.height);original.close?.();
-    const source=ctx.getImageData(0,0,c.width,c.height).data;
-    await decontaminateMatteBoundary(image.data,source,safe,c.width,c.height);
-  }
-  ctx.putImageData(image,0,0);
-  return new Promise((resolve,reject)=>c.toBlob(b=>b?resolve(b):reject(new Error("Could not create cleaned cutout.")),"image/png",1));
-}
 
 async function decontaminateMatteBoundary(rgba,source,alpha,w,h){
   // Source edge pixels are commonly a blend C=aF+(1-a)B. Recover F using
@@ -673,97 +430,6 @@ async function decontaminateMatteBoundary(rgba,source,alpha,w,h){
   }
 }
 
-function removeGreenBoundaryFringe(rgba,alpha,w,h){
-  const out=new Uint8Array(alpha),nearBackground=new Uint8Array(w*h),frontier=new Uint8Array(w*h);
-  for(let i=0;i<alpha.length;i++)if(alpha[i]<24){nearBackground[i]=1;frontier[i]=1;}
-  // Only inspect the immediate soft matte. Earlier versions searched sixteen
-  // pixels inward and could mistake green-tinted navy fabric for grass.
-  let current=frontier;
-  for(let step=0;step<4;step++){
-    const next=new Uint8Array(w*h);
-    for(let i=0;i<current.length;i++)if(current[i]){
-      const x=i%w;
-      const add=j=>{if(j>=0&&j<nearBackground.length&&!nearBackground[j]){nearBackground[j]=1;next[j]=1;}};
-      if(x)add(i-1);if(x<w-1)add(i+1);if(i>=w)add(i-w);if(i<current.length-w)add(i+w);
-    }
-    current=next;
-  }
-  for(let i=0;i<out.length;i++){
-    // Never delete an opaque or confident product pixel based on colour.
-    if(!nearBackground[i]||alpha[i]>=176)continue;
-    const o=i*4,r=rgba[o],g=rgba[o+1],b=rgba[o+2];
-    // Remove only unmistakably green fringe pixels in a two-pixel boundary.
-    // Navy, grey, cyan, white phone bezels and orange tags cannot match this.
-    if(isGreenFringePixel(r,g,b))out[i]=0;
-  }
-  return out;
-}
-
-async function suspiciousResidualRatio(blob){
-  const bmp=await createImageBitmap(blob),max=280,scale=Math.min(1,max/Math.max(bmp.width,bmp.height));
-  const c=document.createElement("canvas");c.width=Math.max(1,Math.round(bmp.width*scale));c.height=Math.max(1,Math.round(bmp.height*scale));
-  const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0,c.width,c.height);bmp.close?.();
-  const d=ctx.getImageData(0,0,c.width,c.height).data,alpha=new Uint8Array(c.width*c.height);let suspicious=0,visible=0;
-  for(let i=0;i<alpha.length;i++)alpha[i]=d[i*4+3];
-  for(let i=0;i<d.length;i+=4){
-    if(d[i+3]<128)continue;visible++;
-    const pixel=i/4,x=pixel%c.width,y=(pixel/c.width)|0,max=Math.max(d[i],d[i+1],d[i+2]),min=Math.min(d[i],d[i+1],d[i+2]);
-    const neutralEdge=(y>c.height*.88||x<c.width*.05||x>c.width*.95)&&max>95&&max-min<52;
-    if(!isHighConfidenceResidual(d[i],d[i+1],d[i+2])&&!neutralEdge)continue;
-    let touchesTransparency=false;
-    for(let oy=-2;oy<=2&&!touchesTransparency;oy++)for(let ox=-2;ox<=2;ox++){
-      const nx=x+ox,ny=y+oy;if(nx<0||ny<0||nx>=c.width||ny>=c.height)continue;
-      if(alpha[ny*c.width+nx]<24){touchesTransparency=true;break;}
-    }
-    if(touchesTransparency)suspicious++;
-  }
-  return suspicious/Math.max(1,visible);
-}
-
-async function refineResidualBackground(baseBlob,aiBlob,originalBlob){
-  const [base,ai,original]=await Promise.all([createImageBitmap(baseBlob),createImageBitmap(aiBlob),createImageBitmap(originalBlob)]);
-  const c=document.createElement("canvas");c.width=base.width;c.height=base.height;const ctx=c.getContext("2d",{willReadFrequently:true});
-  ctx.drawImage(base,0,0);const out=ctx.getImageData(0,0,c.width,c.height);
-  ctx.clearRect(0,0,c.width,c.height);ctx.drawImage(ai,0,0,c.width,c.height);const aid=ctx.getImageData(0,0,c.width,c.height).data;
-  ctx.clearRect(0,0,c.width,c.height);ctx.drawImage(original,0,0,c.width,c.height);const source=ctx.getImageData(0,0,c.width,c.height).data;
-  base.close?.();ai.close?.();original.close?.();
-  const bins=new Map(),keyAt=o=>`${source[o]>>4},${source[o+1]>>4},${source[o+2]>>4}`;let transparent=0;
-  for(let i=0;i<c.width*c.height;i++){const o=i*4;if(out.data[o+3]<24){const key=keyAt(o);bins.set(key,(bins.get(key)||0)+1);transparent++;}}
-  const support=Math.max(6,Math.round(transparent*.00008)),candidate=new Uint8Array(c.width*c.height),borderResidual=new Uint8Array(c.width*c.height),queue=[];
-  for(let i=0;i<c.width*c.height;i++){
-    const o=i*4;
-    // Colour is only a suspicion signal. A second segmentation model must also
-    // call the pixel background before it can be deleted.
-    if(out.data[o+3]>=24&&isHighConfidenceResidual(out.data[o],out.data[o+1],out.data[o+2])&&aid[o+3]<48)out.data[o+3]=0;
-    else if(out.data[o+3]>=24&&aid[o+3]<32&&isNeutralBorderResidual(source[o],source[o+1],source[o+2])&&(bins.get(keyAt(o))||0)>=support)candidate[i]=1;
-  }
-  // Matting pass for the thin halo attached to the product boundary. Unlike
-  // component cleanup, this can reach background-coloured pixels connected to
-  // the jacket, but only when the original colour was learned from already
-  // transparent background and the segmentation model also calls it background.
-  const alphaBeforeEdge=new Uint8Array(c.width*c.height);
-  for(let i=0;i<alphaBeforeEdge.length;i++)alphaBeforeEdge[i]=out.data[i*4+3];
-  for(let y=1;y<c.height-1;y++)for(let x=1;x<c.width-1;x++){
-    const i=y*c.width+x,o=i*4;if(alphaBeforeEdge[i]<24||aid[o+3]>=28)continue;
-    const backgroundColour=isHighConfidenceResidual(source[o],source[o+1],source[o+2])||isNeutralBorderResidual(source[o],source[o+1],source[o+2]);
-    if(!backgroundColour||(bins.get(keyAt(o))||0)<support)continue;
-    let nearTransparent=false;
-    for(let oy=-3;oy<=3&&!nearTransparent;oy++)for(let ox=-3;ox<=3;ox++){
-      const nx=x+ox,ny=y+oy;if(nx<0||ny<0||nx>=c.width||ny>=c.height)continue;
-      if(alphaBeforeEdge[ny*c.width+nx]<20){nearTransparent=true;break;}
-    }
-    if(nearTransparent)out.data[o+3]=0;
-  }
-  // Neutral floors and walls can be too dark for a safe global colour rule.
-  // Remove them only when their colour was learned from existing transparent
-  // background, the AI agrees, and the residual is connected to the frame.
-  const push=i=>{if(i>=0&&i<candidate.length&&candidate[i]&&!borderResidual[i]){borderResidual[i]=1;queue.push(i);}};
-  for(let x=0;x<c.width;x++){push(x);push((c.height-1)*c.width+x);}for(let y=0;y<c.height;y++){push(y*c.width);push(y*c.width+c.width-1);}
-  for(let head=0;head<queue.length;head++){const i=queue[head],x=i%c.width;if(x)push(i-1);if(x<c.width-1)push(i+1);if(i>=c.width)push(i-c.width);if(i<candidate.length-c.width)push(i+c.width);}
-  for(let i=0;i<borderResidual.length;i++)if(borderResidual[i])out.data[i*4+3]=0;
-  ctx.putImageData(out,0,0);
-  return new Promise((resolve,reject)=>c.toBlob(b=>b?resolve(b):reject(new Error("Could not refine bright background.")),"image/png",1));
-}
 
 function rgbToHsv(r,g,b){
   r/=255;g/=255;b/=255;
@@ -855,98 +521,6 @@ async function conservativeCloseupFallback(file){
 }
 
 
-async function buildConservativeBackgroundMask(file){
-  // High-confidence fast path. Learns the outer background, then only removes
-  // pixels connected to the frame edge. It never deletes disconnected centre objects.
-  const bmp=await createImageBitmap(file);
-  const maxSide=360,s=Math.min(1,maxSide/Math.max(bmp.width,bmp.height));
-  const w=Math.max(64,Math.round(bmp.width*s)),h=Math.max(64,Math.round(bmp.height*s));
-  const c=document.createElement("canvas");c.width=w;c.height=h;
-  const ctx=c.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0,w,h);
-  const img=ctx.getImageData(0,0,w,h),d=img.data;
-
-  const edge=[];
-  const band=Math.max(2,Math.round(Math.min(w,h)*.025));
-  const pushPix=(x,y)=>{const o=(y*w+x)*4;edge.push([d[o],d[o+1],d[o+2]]);};
-  for(let x=0;x<w;x+=2){for(let y=0;y<band;y++)pushPix(x,y);}
-  for(let y=0;y<h;y+=2){for(let x=0;x<band;x++)pushPix(x,y);for(let x=w-band;x<w;x++)pushPix(x,y);}
-  if(edge.length<50)return null;
-
-  // Robust median background colour.
-  const med=k=>{const a=edge.map(v=>v[k]).sort((a,b)=>a-b);return a[(a.length/2)|0];};
-  const seed=[med(0),med(1),med(2)];
-  let spread=0;
-  for(const p of edge)spread+=Math.hypot(p[0]-seed[0],p[1]-seed[1],p[2]-seed[2]);
-  spread/=edge.length;
-
-  // Only trust easy, reasonably consistent backgrounds.
-  if(spread>82)return null;
-  const tol=Math.max(42,Math.min(105,spread*1.9+32));
-
-  const cand=new Uint8Array(w*h);
-  for(let i=0;i<w*h;i++){
-    const o=i*4;
-    const dist=Math.hypot(d[o]-seed[0],d[o+1]-seed[1],d[o+2]-seed[2]);
-    if(dist<tol)cand[i]=1;
-  }
-
-  const bg=new Uint8Array(w*h),q=[];
-  const add=(x,y)=>{const i=y*w+x;if(cand[i]&&!bg[i]){bg[i]=1;q.push(i);}};
-  for(let x=0;x<w;x++){add(x,0);add(x,h-1);}
-  for(let y=0;y<h;y++){add(0,y);add(w-1,y);}
-  for(let qi=0;qi<q.length;qi++){
-    const i=q[qi],x=i%w,y=(i/w)|0;
-    if(x>0)add(x-1,y);if(x<w-1)add(x+1,y);if(y>0)add(x,y-1);if(y<h-1)add(x,y+1);
-  }
-
-  let count=0;for(const v of bg)count+=v;
-  const ratio=count/(w*h);
-  if(ratio<.04||ratio>.62)return null;
-  return {bmp,bg,w,h,ratio};
-}
-
-async function applyBackgroundMask(file,maskInfo){
-  const {bmp,bg,w,h}=maskInfo;
-  const full=document.createElement("canvas");full.width=bmp.width;full.height=bmp.height;
-  const ctx=full.getContext("2d",{willReadFrequently:true});ctx.drawImage(bmp,0,0);
-  const out=ctx.getImageData(0,0,full.width,full.height),d=out.data;
-  for(let y=0;y<full.height;y++){
-    const sy=Math.min(h-1,Math.floor(y*h/full.height));
-    for(let x=0;x<full.width;x++){
-      const sx=Math.min(w-1,Math.floor(x*w/full.width));
-      if(bg[sy*w+sx])d[(y*full.width+x)*4+3]=0;
-    }
-    if(y%180===0)await new Promise(r=>setTimeout(r,0));
-  }
-  ctx.putImageData(out,0,0);
-  return await new Promise(res=>full.toBlob(res,"image/png",1));
-}
-
-async function protectSubjectWithBackgroundMask(file,cutout,maskInfo){
-  if(!maskInfo)return cutout;
-  const [orig,fg]=await Promise.all([createImageBitmap(file),createImageBitmap(cutout)]);
-  const {bg,w,h}=maskInfo;
-  const c=document.createElement("canvas");c.width=orig.width;c.height=orig.height;
-  const ctx=c.getContext("2d",{willReadFrequently:true});
-  ctx.drawImage(orig,0,0);const oi=ctx.getImageData(0,0,c.width,c.height);
-  ctx.clearRect(0,0,c.width,c.height);ctx.drawImage(fg,0,0,c.width,c.height);const fi=ctx.getImageData(0,0,c.width,c.height);
-  const od=oi.data,fd=fi.data;
-  for(let y=0;y<c.height;y++){
-    const sy=Math.min(h-1,Math.floor(y*h/c.height));
-    for(let x=0;x<c.width;x++){
-      const sx=Math.min(w-1,Math.floor(x*w/c.width)),o=(y*c.width+x)*4;
-      // Anything not confidently background gets preserved from the original.
-      if(!bg[sy*w+sx] && fd[o+3]<220){
-        od[o+3]=Math.max(fd[o+3],235);
-      }else{
-        od[o+3]=fd[o+3];
-      }
-    }
-    if(y%180===0)await new Promise(r=>setTimeout(r,0));
-  }
-  ctx.putImageData(oi,0,0);
-  return await new Promise(res=>c.toBlob(res,"image/png",1));
-}
 
 
 let removalWorker=null;
@@ -1001,7 +575,8 @@ function getRemovalWorker(){
           msg.primaryBuffer,
           msg.safetyBuffer,
           msg.width,
-          msg.height
+          msg.height,
+          job.profile
         );
         clearTimeout(job.timeout);
         removalPending.delete(msg.id);
@@ -1040,642 +615,6 @@ function getRemovalWorker(){
   return removalWorker;
 }
 
-function combineForegroundMasks(primary,safety){
-  const out=new Uint8Array(primary.length);
-
-  for(let i=0;i<primary.length;i++){
-    const a=primary[i];
-    const b=safety?safety[i]:0;
-
-    if(b>=210){
-      out[i]=Math.max(a,b);
-    }else if(b>=150 && a>=72){
-      out[i]=Math.max(a,Math.round(b*0.88));
-    }else{
-      out[i]=a;
-    }
-  }
-
-  return out;
-}
-
-
-function rgbDist(r1,g1,b1,r2,g2,b2){
-  const dr=r1-r2,dg=g1-g2,db=b1-b2;
-  return Math.sqrt(dr*dr+dg*dg+db*db);
-}
-
-function buildConsensusBackgroundClusters(rgb,primary,safety,w,h){
-  const bins=new Map();
-  const total=w*h;
-  const stride=Math.max(1,Math.floor(Math.sqrt(total/160000)));
-
-  for(let y=0;y<h;y+=stride){
-    for(let x=0;x<w;x+=stride){
-      const i=y*w+x;
-      const p=primary[i];
-      const s=safety?safety[i]:p;
-      if(p>35||s>35)continue;
-
-      const o=i*4;
-      const r=rgb[o],g=rgb[o+1],b=rgb[o+2];
-      const key=`${r>>4},${g>>4},${b>>4}`;
-      let e=bins.get(key);
-      if(!e){
-        e={count:0,r:0,g:0,b:0};
-        bins.set(key,e);
-      }
-      e.count++;
-      e.r+=r;e.g+=g;e.b+=b;
-    }
-  }
-
-  return [...bins.values()]
-    .sort((a,b)=>b.count-a.count)
-    .slice(0,10)
-    .map(e=>({count:e.count,r:e.r/e.count,g:e.g/e.count,b:e.b/e.count}));
-}
-
-function rescueForegroundFromConsensus(rgb,alpha,primary,safety,w,h){
-  const total=w*h;
-  const clusters=buildConsensusBackgroundClusters(rgb,primary,safety,w,h);
-  if(!clusters.length)return new Uint8Array(alpha);
-
-  const out=new Uint8Array(alpha);
-  const definiteBg=new Uint8Array(total);
-
-  const bgDistance=i=>{
-    const o=i*4,r=rgb[o],g=rgb[o+1],b=rgb[o+2];
-    let d=999;
-    for(const c of clusters)d=Math.min(d,rgbDist(r,g,b,c.r,c.g,c.b));
-    return d;
-  };
-
-  for(let i=0;i<total;i++){
-    const p=primary[i],s=safety?safety[i]:p;
-    if(p<48 && s<48 && bgDistance(i)<70){
-      definiteBg[i]=1;
-      out[i]=0;
-    }
-  }
-
-  const visited=new Uint8Array(total);
-  const queue=new Int32Array(total);
-  const comps=[];
-
-  for(let start=0;start<total;start++){
-    if(visited[start]||alpha[start]<145)continue;
-    let head=0,tail=0;
-    queue[tail++]=start; visited[start]=1;
-    const pixels=[];
-
-    while(head<tail){
-      const i=queue[head++]; pixels.push(i);
-      const x=i%w,y=(i/w)|0;
-      const add=j=>{
-        if(j<0||j>=total||visited[j]||alpha[j]<145)return;
-        visited[j]=1; queue[tail++]=j;
-      };
-      if(x>0)add(i-1);
-      if(x<w-1)add(i+1);
-      if(y>0)add(i-w);
-      if(y<h-1)add(i+w);
-    }
-    comps.push(pixels);
-  }
-
-  if(!comps.length)return out;
-  comps.sort((a,b)=>b.length-a.length);
-
-  const rescued=new Uint8Array(total);
-  let head=0,tail=0;
-  const minSubstantial=Math.max(150,Math.round(total*0.0025));
-
-  for(const comp of comps){
-    if(comp!==comps[0] && comp.length<minSubstantial)continue;
-    for(const i of comp){
-      if(rescued[i])continue;
-      rescued[i]=1; queue[tail++]=i;
-      out[i]=Math.max(out[i],alpha[i]);
-    }
-  }
-
-  while(head<tail){
-    const i=queue[head++];
-    const x=i%w,y=(i/w)|0,io=i*4;
-
-    const tryRescue=j=>{
-      if(j<0||j>=total||rescued[j]||definiteBg[j])return;
-
-      const jo=j*4;
-      const local=rgbDist(
-        rgb[io],rgb[io+1],rgb[io+2],
-        rgb[jo],rgb[jo+1],rgb[jo+2]
-      );
-      const bgd=bgDistance(j);
-      const p=primary[j],s=safety?safety[j]:p;
-
-      const hasAIEvidence=Math.max(p,s)>=58;
-      const unlikeBackground=bgd>=92;
-      const locallyContinuous=local<=38 && bgd>=74;
-
-      if(!(hasAIEvidence||unlikeBackground||locallyContinuous))return;
-
-      rescued[j]=1; queue[tail++]=j;
-      const modelA=Math.max(p,s,alpha[j]);
-      out[j]=Math.max(modelA,(locallyContinuous||unlikeBackground)?238:165);
-    };
-
-    if(x>0)tryRescue(i-1);
-    if(x<w-1)tryRescue(i+1);
-    if(y>0)tryRescue(i-w);
-    if(y<h-1)tryRescue(i+w);
-  }
-
-  for(let i=0;i<total;i++){
-    if(definiteBg[i])out[i]=0;
-  }
-
-  return out;
-}
-
-
-function learnConfidentBackgroundModel(rgb,primary,safety,w,h){
-  const bins=new Map();
-  const total=w*h;
-  const stride=Math.max(1,Math.floor(Math.sqrt(total/200000)));
-  let confidentSamples=0;
-
-  const rgbToHSV=(r,g,b)=>{
-    r/=255;g/=255;b/=255;
-    const max=Math.max(r,g,b),min=Math.min(r,g,b),d=max-min;
-    let h=0;
-    if(d){
-      if(max===r)h=((g-b)/d)%6;
-      else if(max===g)h=(b-r)/d+2;
-      else h=(r-g)/d+4;
-      h*=60;
-      if(h<0)h+=360;
-    }
-    const s=max===0?0:d/max;
-    return [h,s,max];
-  };
-
-  for(let y=0;y<h;y+=stride){
-    for(let x=0;x<w;x+=stride){
-      const i=y*w+x;
-      const p=primary[i];
-      const s=safety?safety[i]:p;
-
-      // Learn only where both models are very confident it is background.
-      if(p>24||s>24)continue;
-
-      confidentSamples++;
-      const o=i*4;
-      const r=rgb[o],g=rgb[o+1],b=rgb[o+2];
-
-      // Slightly coarser quantisation groups textured grass/fabric-floor shades.
-      const key=`${r>>5},${g>>5},${b>>5}`;
-      let e=bins.get(key);
-      if(!e){
-        e={count:0,r:0,g:0,b:0};
-        bins.set(key,e);
-      }
-      e.count++;
-      e.r+=r;e.g+=g;e.b+=b;
-    }
-  }
-
-  if(confidentSamples<32||!bins.size)return null;
-
-  const ranked=[...bins.values()].sort((a,b)=>b.count-a.count);
-  const clusters=ranked.slice(0,18).map(e=>{
-    const r=e.r/e.count,g=e.g/e.count,b=e.b/e.count;
-    const hsv=rgbToHSV(r,g,b);
-    return {count:e.count,r,g,b,h:hsv[0],s:hsv[1],v:hsv[2]};
-  });
-
-  const covered=clusters.reduce((n,e)=>n+e.count,0);
-  const coverage=covered/confidentSamples;
-
-  // Textured backgrounds no longer need one dominant colour.
-  // Enough confident samples + broad cluster coverage is sufficient.
-  return {
-    clusters,
-    homogeneous:coverage>=0.48,
-    topShare:coverage,
-    confidentSamples
-  };
-}
-
-function rescueNonBackgroundPixels(rgb,alpha,primary,safety,w,h){
-  const model=learnConfidentBackgroundModel(rgb,primary,safety,w,h);
-  if(!model||!model.homogeneous)return new Uint8Array(alpha);
-
-  const out=new Uint8Array(alpha);
-  const total=w*h;
-
-  const rgbToHSV=(r,g,b)=>{
-    r/=255;g/=255;b/=255;
-    const max=Math.max(r,g,b),min=Math.min(r,g,b),d=max-min;
-    let h=0;
-    if(d){
-      if(max===r)h=((g-b)/d)%6;
-      else if(max===g)h=(b-r)/d+2;
-      else h=(r-g)/d+4;
-      h*=60;
-      if(h<0)h+=360;
-    }
-    const s=max===0?0:d/max;
-    return [h,s,max];
-  };
-
-  const bgScores=i=>{
-    const o=i*4;
-    const r=rgb[o],g=rgb[o+1],b=rgb[o+2];
-    const hsv=rgbToHSV(r,g,b);
-
-    let rgbD=999;
-    let hsvD=999;
-
-    for(const c of model.clusters){
-      rgbD=Math.min(rgbD,rgbDist(r,g,b,c.r,c.g,c.b));
-
-      let hd=Math.abs(hsv[0]-c.h);
-      hd=Math.min(hd,360-hd)/180;
-      const sd=Math.abs(hsv[1]-c.s);
-      const vd=Math.abs(hsv[2]-c.v);
-
-      // Hue matters most for saturated backgrounds such as grass.
-      // Saturation/value separate grey/navy garments from coloured floors.
-      const score=Math.sqrt(
-        (hd*1.45)**2 +
-        (sd*1.15)**2 +
-        (vd*0.65)**2
-      );
-      hsvD=Math.min(hsvD,score);
-    }
-
-    return {rgbD,hsvD};
-  };
-
-  for(let i=0;i<total;i++){
-    if(out[i]>=218)continue;
-
-    const p=primary[i];
-    const s=safety?safety[i]:p;
-    const {rgbD,hsvD}=bgScores(i);
-
-    // Strong disagreement with the learned background family means the pixel
-    // should not be deleted even when the segmentation model made a mistake.
-    const veryUnlikeBg=rgbD>=112 || hsvD>=0.72;
-    const unlikeBg=rgbD>=82 || hsvD>=0.52;
-    const someAI=Math.max(p,s)>=28;
-
-    if(veryUnlikeBg){
-      out[i]=Math.max(out[i],p,s,248);
-    }else if(unlikeBg&&someAI){
-      out[i]=Math.max(out[i],p,s,210);
-    }
-  }
-
-  // Reconnect narrow gaps inside rescued garment regions.
-  const copy=new Uint8Array(out);
-  for(let y=1;y<h-1;y++){
-    for(let x=1;x<w-1;x++){
-      const i=y*w+x;
-      if(copy[i]>=180)continue;
-
-      let strong=0;
-      if(copy[i-1]>=225)strong++;
-      if(copy[i+1]>=225)strong++;
-      if(copy[i-w]>=225)strong++;
-      if(copy[i+w]>=225)strong++;
-
-      if(strong>=3){
-        const {rgbD,hsvD}=bgScores(i);
-        if(rgbD>=70||hsvD>=0.44)out[i]=228;
-      }
-    }
-  }
-
-  return out;
-}
-
-
-function buildBackgroundOnlyCandidate(rgb,primary,safety,w,h){
-  const model=learnConfidentBackgroundModel(rgb,primary,safety,w,h);
-  if(!model||!model.homogeneous||!model.clusters?.length)return null;
-
-  const total=w*h;
-  const out=new Uint8Array(total);
-  const bgLikely=new Uint8Array(total);
-
-  const rgbToHSV=(r,g,b)=>{
-    r/=255;g/=255;b/=255;
-    const max=Math.max(r,g,b),min=Math.min(r,g,b),d=max-min;
-    let h=0;
-    if(d){
-      if(max===r)h=((g-b)/d)%6;
-      else if(max===g)h=(b-r)/d+2;
-      else h=(r-g)/d+4;
-      h*=60;
-      if(h<0)h+=360;
-    }
-    return [h,max===0?0:d/max,max];
-  };
-
-  const backgroundScore=i=>{
-    const o=i*4;
-    const r=rgb[o],g=rgb[o+1],b=rgb[o+2];
-    const hsv=rgbToHSV(r,g,b);
-
-    let rgbD=999,hsvD=999;
-    for(const c of model.clusters){
-      rgbD=Math.min(rgbD,rgbDist(r,g,b,c.r,c.g,c.b));
-
-      let hd=Math.abs(hsv[0]-c.h);
-      hd=Math.min(hd,360-hd)/180;
-      const sd=Math.abs(hsv[1]-c.s);
-      const vd=Math.abs(hsv[2]-c.v);
-
-      hsvD=Math.min(
-        hsvD,
-        Math.sqrt((hd*1.45)**2+(sd*1.10)**2+(vd*0.65)**2)
-      );
-    }
-    return {rgbD,hsvD};
-  };
-
-  for(let i=0;i<total;i++){
-    const p=primary[i];
-    const s=safety?safety[i]:p;
-    const {rgbD,hsvD}=backgroundScore(i);
-
-    const strongAIBackground=p<42 && s<42;
-    const looksLikeBackground=rgbD<76 && hsvD<0.46;
-    const moderateAIBackground=p<92 && s<92;
-    const veryBackgroundLike=rgbD<52 && hsvD<0.32;
-
-    if(
-      (strongAIBackground && looksLikeBackground) ||
-      (moderateAIBackground && veryBackgroundLike)
-    ){
-      bgLikely[i]=1;
-    }
-  }
-
-  for(let i=0;i<total;i++)out[i]=bgLikely[i]?0:255;
-
-  return removeTinyForegroundIslands(out,w,h);
-}
-
-function combineWithBackgroundCandidate(alpha,candidate,primary,safety,w,h){
-  if(!candidate)return new Uint8Array(alpha);
-
-  const total=w*h;
-  const out=new Uint8Array(alpha);
-
-  let aiStrong=0,candidateStrong=0;
-  for(let i=0;i<total;i++){
-    if(alpha[i]>=128)aiStrong++;
-    if(candidate[i]>=128)candidateStrong++;
-  }
-
-  if(candidateStrong/Math.max(1,total)>0.88)return out;
-
-  const candidateGain=candidateStrong/Math.max(1,aiStrong);
-  if(candidateGain<1.035)return out;
-
-  for(let i=0;i<total;i++){
-    if(candidate[i]<128)continue;
-
-    const p=primary[i];
-    const s=safety?safety[i]:p;
-
-    if(Math.max(p,s)>=52){
-      out[i]=Math.max(out[i],p,s,244);
-    }else{
-      out[i]=Math.max(out[i],220);
-    }
-  }
-
-  return out;
-}
-
-function maskDiagnostics(alpha,w,h){
-  const total=w*h;
-  let strong=0;
-  let minX=w,maxX=-1,minY=h,maxY=-1;
-
-  for(let i=0;i<total;i++){
-    if(alpha[i]<128)continue;
-    strong++;
-    const x=i%w,y=(i/w)|0;
-    if(x<minX)minX=x;if(x>maxX)maxX=x;
-    if(y<minY)minY=y;if(y>maxY)maxY=y;
-  }
-
-  return {
-    strong,
-    ratio:strong/Math.max(1,total),
-    width:maxX>=minX?(maxX-minX+1):0,
-    height:maxY>=minY?(maxY-minY+1):0
-  };
-}
-
-function releaseSafetyCheck(beforeCleanup,afterCleanup,w,h){
-  const before=maskDiagnostics(beforeCleanup,w,h);
-  const after=maskDiagnostics(afterCleanup,w,h);
-
-  if(!before.strong)return new Uint8Array(afterCleanup);
-
-  const areaRetention=after.strong/before.strong;
-  const widthRetention=before.width?after.width/before.width:1;
-  const heightRetention=before.height?after.height/before.height:1;
-
-  if(areaRetention<0.94 || widthRetention<0.92 || heightRetention<0.92){
-    console.warn("BackshotAI release safety rollback: product shrink detected");
-    return new Uint8Array(beforeCleanup);
-  }
-
-  return afterCleanup;
-}
-
-function fillEnclosedAlphaHoles(alpha,w,h){
-  const total=w*h;
-  const outsideBg=new Uint8Array(total);
-  const queue=new Int32Array(total);
-  let head=0,tail=0;
-  const threshold=72;
-
-  const add=i=>{
-    if(i<0||i>=total||outsideBg[i]||alpha[i]>=threshold)return;
-    outsideBg[i]=1;
-    queue[tail++]=i;
-  };
-
-  for(let x=0;x<w;x++){
-    add(x);
-    add((h-1)*w+x);
-  }
-  for(let y=0;y<h;y++){
-    add(y*w);
-    add(y*w+w-1);
-  }
-
-  while(head<tail){
-    const i=queue[head++];
-    const x=i%w,y=(i/w)|0;
-    if(x>0)add(i-1);
-    if(x<w-1)add(i+1);
-    if(y>0)add(i-w);
-    if(y<h-1)add(i+w);
-  }
-
-  const out=new Uint8Array(alpha);
-  for(let i=0;i<total;i++){
-    if(alpha[i]<threshold && !outsideBg[i]){
-      out[i]=Math.max(out[i],242);
-    }
-  }
-
-  return out;
-}
-
-function removeTinyForegroundIslands(alpha,w,h){
-  const total=w*h;
-  const visited=new Uint8Array(total);
-  const out=new Uint8Array(alpha);
-  const queue=new Int32Array(total);
-  const components=[];
-
-  const visible=i=>alpha[i]>=48;
-
-  for(let start=0;start<total;start++){
-    if(visited[start]||!visible(start))continue;
-
-    let head=0,tail=0;
-    queue[tail++]=start;
-    visited[start]=1;
-
-    const pixels=[];
-    let minX=w,maxX=0,minY=h,maxY=0;
-
-    while(head<tail){
-      const i=queue[head++];
-      pixels.push(i);
-      const x=i%w,y=(i/w)|0;
-      if(x<minX)minX=x;if(x>maxX)maxX=x;
-      if(y<minY)minY=y;if(y>maxY)maxY=y;
-
-      const add=j=>{
-        if(j<0||j>=total||visited[j]||!visible(j))return;
-        visited[j]=1;
-        queue[tail++]=j;
-      };
-
-      if(x>0)add(i-1);
-      if(x<w-1)add(i+1);
-      if(y>0)add(i-w);
-      if(y<h-1)add(i+w);
-    }
-
-    components.push({pixels,area:pixels.length,minX,maxX,minY,maxY});
-  }
-
-  if(!components.length)return out;
-
-  components.sort((a,b)=>b.area-a.area);
-  const largestArea=components[0].area;
-
-  const hardTiny=Math.max(14,Math.round(total*0.00009));
-  const softTiny=Math.max(50,Math.round(total*0.00032));
-  const maxRelative=largestArea*0.008;
-
-  for(let ci=1;ci<components.length;ci++){
-    const c=components[ci];
-    const bw=c.maxX-c.minX+1;
-    const bh=c.maxY-c.minY+1;
-
-    const definitelyTiny=c.area<=hardTiny;
-    const smallAndCompact=
-      c.area<=Math.min(softTiny,maxRelative) &&
-      bw<=Math.max(16,Math.round(w*0.045)) &&
-      bh<=Math.max(16,Math.round(h*0.045));
-
-    if(definitelyTiny||smallAndCompact){
-      for(const i of c.pixels)out[i]=0;
-    }
-  }
-
-  return out;
-}
-
-
-function countStrongAlpha(alpha,threshold=128){
-  let n=0;
-  for(let i=0;i<alpha.length;i++){
-    if(alpha[i]>=threshold)n++;
-  }
-  return n;
-}
-
-function chooseSaferFinalAlpha(protectedAlpha,cleanedAlpha){
-  const protectedCount=countStrongAlpha(protectedAlpha,128);
-  const cleanedCount=countStrongAlpha(cleanedAlpha,128);
-
-  if(!protectedCount)return cleanedAlpha;
-
-  const retained=cleanedCount/protectedCount;
-
-  // Cleanup should never destroy a large portion of the already-protected
-  // product. If it does, prefer the protected version rather than show holes.
-  if(retained<0.91){
-    console.warn("BackshotAI safety rollback: cleanup removed too much foreground");
-    return new Uint8Array(protectedAlpha);
-  }
-
-  return cleanedAlpha;
-}
-
-function refineAlphaEdge(alpha,w,h){
-  const out=new Uint8Array(alpha);
-
-  for(let y=1;y<h-1;y++){
-    for(let x=1;x<w-1;x++){
-      const i=y*w+x;
-      const a=alpha[i];
-
-      if(a<36){
-        out[i]=0;
-        continue;
-      }
-
-      if(a>248){
-        out[i]=255;
-        continue;
-      }
-
-      let sum=0,touchesClear=false;
-      for(let oy=-1;oy<=1;oy++){
-        for(let ox=-1;ox<=1;ox++){
-          const nearby=alpha[(y+oy)*w+x+ox];
-          sum+=nearby;
-          if(nearby<24)touchesClear=true;
-        }
-      }
-      const avg=sum/9;
-      let smooth=a*.72+avg*.28;
-      // A small matte choke removes the coloured antialias fringe without
-      // moving the strong product silhouette or modifying its RGB pixels.
-      if(touchesClear&&smooth<150)smooth*=.68;
-      out[i]=Math.max(0,Math.min(255,Math.round(smooth)));
-    }
-  }
-
-  return out;
-}
 
 
 async function decodeImageForCanvas(file){
@@ -1728,70 +667,141 @@ function debugMaskStage(label,alpha,w,h){
   gallery.appendChild(figure);
 }
 
-async function applyDualMaskToFile(file,primaryBuffer,safetyBuffer,maskWidth,maskHeight){
+function breathe(){
+  // Long typed-array passes must not starve the scan animation or the mobile
+  // browser watchdog.
+  return new Promise(resolve=>setTimeout(resolve,0));
+}
+
+function alphaToMaskCanvas(alpha,width,height){
+  const canvas=document.createElement("canvas");canvas.width=width;canvas.height=height;
+  const rgba=new Uint8ClampedArray(alpha.length*4);
+  for(let i=0;i<alpha.length;i++){
+    const a=alpha[i],o=i*4;
+    rgba[o]=rgba[o+1]=rgba[o+2]=255;
+    rgba[o+3]=a<6?0:a>250?255:a;
+  }
+  canvas.getContext("2d").putImageData(new ImageData(rgba,width,height),0,0);
+  return canvas;
+}
+
+/**
+ * Rebuilds the true colour of semi-transparent edge pixels, which the camera
+ * recorded as a blend of subject and background. Runs in horizontal strips so peak
+ * memory stays a few megabytes even for a 48 MP photo.
+ */
+async function decontaminateEdgesInStrips(ctx,file,width,height){
+  const decoded=await decodeImageForCanvas(file);
+  const source=document.createElement("canvas");
+  source.width=width;source.height=height;
+  const sourceCtx=source.getContext("2d",{willReadFrequently:true});
+  sourceCtx.drawImage(decoded.image,0,0,width,height);
+  if(decoded.close)decoded.image.close?.();
+
+  const stripHeight=Math.max(64,Math.min(512,Math.round(4e6/Math.max(1,width))));
+  try{
+    for(let y=0;y<height;y+=stripHeight){
+      const rows=Math.min(stripHeight,height-y);
+      const composed=ctx.getImageData(0,y,width,rows);
+      const originalPixels=sourceCtx.getImageData(0,y,width,rows).data;
+      const alpha=new Uint8Array(width*rows);
+      let band=0;
+      for(let i=0;i<alpha.length;i++){
+        const a=composed.data[i*4+3];
+        alpha[i]=a;
+        if(a>24&&a<252)band++;
+      }
+      if(!band)continue;
+      await decontaminateMatteBoundary(composed.data,originalPixels,alpha,width,rows);
+      ctx.putImageData(composed,0,y);
+    }
+  }finally{
+    source.width=0;source.height=0;
+  }
+}
+
+function refineWorkingSize(width,height,profile){
+  const maxSide=REFINE_MAX_SIDE[profile]||REFINE_MAX_SIDE.auto;
+  const scale=Math.min(1,maxSide/Math.max(width,height));
+  return {
+    width:Math.max(32,Math.round(width*scale)),
+    height:Math.max(32,Math.round(height*scale))
+  };
+}
+
+/**
+ * Turns a small inference mask into a full-resolution cutout.
+ *
+ * The mask is first refined against the real photo pixels at a working resolution
+ * (edge-aware upsampling, local colour models, connected background reclaim), then
+ * composited onto the untouched original so the exported image keeps its full size
+ * and is never stretched or cropped.
+ */
+async function applyDualMaskToFile(file,primaryBuffer,safetyBuffer,maskWidth,maskHeight,profile=state.quality){
   if(!primaryBuffer||!maskWidth||!maskHeight){
     throw new Error("The AI returned an invalid mask.");
   }
 
-  const decoded=await decodeImageForCanvas(file);
-  const bitmap=decoded.image;
-  const ow=bitmap.naturalWidth||bitmap.width;
-  const oh=bitmap.naturalHeight||bitmap.height;
-
-  const primaryRaw=new Uint8Array(primaryBuffer);
-  const safetyRaw=safetyBuffer?new Uint8Array(safetyBuffer):null;
-
-  if(primaryRaw.length!==maskWidth*maskHeight){
-    bitmap.close?.();
+  const rawAlpha=new Uint8Array(primaryBuffer);
+  if(rawAlpha.length!==maskWidth*maskHeight){
     throw new Error("The AI mask size did not match the image.");
   }
+  debugMaskStage("01-inference-mask",rawAlpha,maskWidth,maskHeight);
 
-  debugMaskStage("01-primary-rmbg",primaryRaw,maskWidth,maskHeight);
-  if(safetyRaw)debugMaskStage("02-safety-isnet",safetyRaw,maskWidth,maskHeight);
-
-  // Clean and validate the compact inference mask before upscaling. The old
-  // path created multiple full-resolution alpha/RGBA arrays, which could exceed
-  // mobile browser memory and cause the tab to refresh.
-  let alpha=new Uint8Array(primaryRaw);
-  const protectedAlpha=new Uint8Array(alpha);
-  debugMaskStage("03-protected-model-matte",protectedAlpha,maskWidth,maskHeight);
-
-  let cleanedAlpha=removeTinyForegroundIslands(protectedAlpha,maskWidth,maskHeight);
-  cleanedAlpha=refineAlphaEdge(cleanedAlpha,maskWidth,maskHeight);
-  debugMaskStage("04-cleanup",cleanedAlpha,maskWidth,maskHeight);
-
-  // Fail safe: never accept cleanup that removes too much of the protected item.
-  alpha=chooseSafeCleanup(protectedAlpha,cleanedAlpha,maskWidth,maskHeight);
-  alpha=releaseSafetyCheck(protectedAlpha,alpha,maskWidth,maskHeight);
-  const finalDiag=maskDiagnostics(alpha,maskWidth,maskHeight);
-  const protectedDiag=maskDiagnostics(protectedAlpha,maskWidth,maskHeight);
-
-  if(
-    protectedDiag.strong &&
-    (
-      finalDiag.strong/protectedDiag.strong<0.94 ||
-      finalDiag.width<protectedDiag.width*0.92 ||
-      finalDiag.height<protectedDiag.height*0.92
-    )
-  ){
-    alpha=new Uint8Array(protectedAlpha);
+  const decoded=await decodeImageForCanvas(file);
+  const bitmap=decoded.image;
+  const fullWidth=bitmap.naturalWidth||bitmap.width;
+  const fullHeight=bitmap.naturalHeight||bitmap.height;
+  if(!fullWidth||!fullHeight){
+    if(decoded.close)bitmap.close?.();
+    throw new Error("The browser could not read this image's size.");
   }
-  debugMaskStage("05-final",alpha,maskWidth,maskHeight);
 
-  const maskCanvas=document.createElement("canvas");maskCanvas.width=maskWidth;maskCanvas.height=maskHeight;
-  const maskCtx=maskCanvas.getContext("2d"),rgba=new Uint8ClampedArray(alpha.length*4);
-  for(let i=0;i<alpha.length;i++){
-    let a=alpha[i];
-    if(a<14)a=0;
-    else if(a>226)a=255;
-    const o=i*4;rgba[o]=rgba[o+1]=rgba[o+2]=255;rgba[o+3]=a;
+  const work=refineWorkingSize(fullWidth,fullHeight,profile);
+  const workCanvas=document.createElement("canvas");
+  workCanvas.width=work.width;workCanvas.height=work.height;
+  const workCtx=workCanvas.getContext("2d",{willReadFrequently:true});
+  workCtx.imageSmoothingEnabled=true;workCtx.imageSmoothingQuality="high";
+  workCtx.drawImage(bitmap,0,0,work.width,work.height);
+  const workRGB=workCtx.getImageData(0,0,work.width,work.height).data;
+
+  const upscaled=resampleAlpha(rawAlpha,maskWidth,maskHeight,work.width,work.height);
+  debugMaskStage("02-upscaled",upscaled,work.width,work.height);
+
+  const guard=chooseSafeCleanup(
+    upscaled,
+    removeTinyForegroundIslands(upscaled,work.width,work.height),
+    work.width,
+    work.height
+  );
+
+  const {alpha:refined,report}=await refineForegroundAlpha({
+    rgb:workRGB,
+    alpha:guard,
+    width:work.width,
+    height:work.height,
+    options:{reclaim:profile==="fast"?{backgroundTolerance:54,separation:1.4}:undefined},
+    breathe
+  });
+  debugMaskStage("03-refined",refined,work.width,work.height);
+  if(new URLSearchParams(location.search).has("debugMasks")){
+    document.documentElement.dataset.refineReport=JSON.stringify(report);
   }
-  maskCtx.putImageData(new ImageData(rgba,maskWidth,maskHeight),0,0);
 
-  const outCanvas=document.createElement("canvas");outCanvas.width=ow;outCanvas.height=oh;
-  const ctx=outCanvas.getContext("2d");ctx.drawImage(bitmap,0,0,ow,oh);if(decoded.close)bitmap.close?.();
-  ctx.save();ctx.globalCompositeOperation="destination-in";ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality="high";
-  ctx.drawImage(maskCanvas,0,0,ow,oh);ctx.restore();
+  const maskCanvas=alphaToMaskCanvas(refined,work.width,work.height);
+  const outCanvas=document.createElement("canvas");
+  outCanvas.width=fullWidth;outCanvas.height=fullHeight;
+  const ctx=outCanvas.getContext("2d",{willReadFrequently:true});
+  ctx.drawImage(bitmap,0,0,fullWidth,fullHeight);
+  if(decoded.close)bitmap.close?.();
+  ctx.save();
+  ctx.globalCompositeOperation="destination-in";
+  ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality="high";
+  ctx.drawImage(maskCanvas,0,0,fullWidth,fullHeight);
+  ctx.restore();
+
+  // Unmix the soft edge so no background tint survives in semi-transparent pixels.
+  await decontaminateEdgesInStrips(ctx,file,fullWidth,fullHeight);
 
   return new Promise((resolve,reject)=>{
     outCanvas.toBlob(
@@ -1858,7 +868,7 @@ function removeWithBackshotEngine(file,onProgress,attempt=0,profile=state.qualit
       }
     },360000);
 
-    removalPending.set(id,{resolve,reject,onProgress,timeout,file});
+    removalPending.set(id,{resolve,reject,onProgress,timeout,file,profile});
     try{worker.postMessage({type:"remove",id,file,profile});}
     catch(error){
       clearTimeout(timeout);
@@ -1879,64 +889,36 @@ async function chooseSafeCutout(file){
     throw new Error("This image is larger than 80 MB. Please use a smaller photo.");
   }
 
-  // Background-first segmentation is the preservation-biased path for
-  // consistent edge-connected scenes (grass, walls and floors). It removes
-  // only pixels connected to a learned border background and never asks a
-  // foreground model to decide whether a dark jacket panel should exist.
-  const backgroundFirst=await conservativeCloseupFallback(file);
-  if(backgroundFirst){
-    const [before,after,shape]=await Promise.all([alphaStats(file),alphaStats(backgroundFirst),cutoutShapeStats(backgroundFirst)]);
-    if(new URLSearchParams(location.search).has("debugMasks"))document.documentElement.dataset.backgroundDiag=JSON.stringify({before,after,shape});
-    if(after.strong>0.08 && after.strong<before.strong*0.94 && shape.largestShare>.95){
-      $("#progressText").textContent="Background-first mask complete.";
-      let clean=await cleanupDisconnectedSpecks(backgroundFirst,file);
-      // A bright low-saturation residual (for example a white rug under grass)
-      // is suspicious. Ask RMBG only about those pixels; its decisions can
-      // remove the residual but can never delete dark/blue product sections.
-      if(await suspiciousResidualRatio(clean)>.00035){
-        const evidence=await removeWithBackshotEngine(file);
-        clean=await refineResidualBackground(clean,evidence,file);
-        clean=await cleanupDisconnectedSpecks(clean,file);
+  // Segmentation first. Every profile then finishes through the same
+  // refinement inside applyDualMaskToFile, so batch items cannot end up with
+  // visibly different edge quality.
+  try{
+    const blob=await removeWithBackshotEngine(file,msg=>{
+      if(msg.stage==="load"&&Number.isFinite(msg.progress)){
+        $("#progressText").textContent=`Backshot Engine: loading ${Math.round(msg.progress)}%`;
+      }else if(msg.stage==="remove"){
+        $("#progressText").textContent="Backshot Engine: removing background…";
+      }else if(msg.stage==="fast-path"){
+        $("#progressText").textContent=msg.message||"Existing transparency preserved…";
+      }else if(msg.stage==="fallback"){
+        $("#progressText").textContent=msg.message||"Switching removal engine…";
       }
-      return clean;
+    });
+    if(!(blob instanceof Blob)||!blob.size)throw new Error("The remover returned an empty result.");
+    return blob;
+  }catch(aiError){
+    // Last resort for devices that cannot run the model at all: remove only a
+    // dominant background that touches the frame edge. It is deliberately
+    // conservative, so an uncertain photo keeps its subject.
+    console.warn("AI removal failed; trying the edge-connected colour fallback",aiError);
+    $("#progressText").textContent="Trying the offline colour fallback…";
+    const fallback=await conservativeCloseupFallback(file).catch(()=>null);
+    if(fallback){
+      const [before,after]=await Promise.all([alphaStats(file),alphaStats(fallback)]);
+      if(after.strong>0.08&&after.strong<before.strong*0.94)return fallback;
     }
+    throw aiError;
   }
-
-  const blob=await removeWithBackshotEngine(file,msg=>{
-    if(msg.stage==="load"&&Number.isFinite(msg.progress)){
-      $("#progressText").textContent=`Backshot Engine: loading ${Math.round(msg.progress)}%`;
-    }else if(msg.stage==="remove"){
-      $("#progressText").textContent="Backshot Engine: removing background…";
-    }else if(msg.stage==="safety"){
-      $("#progressText").textContent=msg.message||"Protecting product details…";
-    }else if(msg.stage==="fast-path"){
-      $("#progressText").textContent=msg.message||"Clean mask found — finishing…";
-    }else if(msg.stage==="fallback"){
-      $("#progressText").textContent=msg.message||"Switching removal engine…";
-    }
-  });
-
-  if(!(blob instanceof Blob)||!blob.size)throw new Error("The remover returned an empty result.");
-  // Every route must finish through the same preservation-biased cleanup.
-  // Previously only the background-first jacket route removed disconnected
-  // grass specks and green boundary fringe, so otherwise similar batch items
-  // could leave the engine with visibly different edge quality.
-  $("#progressText").textContent="Backshot Engine: cleaning edges…";
-  let clean=await cleanupDisconnectedSpecks(blob,file);
-
-  // Fast Mobile normally finishes after its low-memory 256px pass. If the
-  // finished cutout still contains background-coloured pixels beside
-  // transparency, rerun only that difficult photo at the safer 320px mobile
-  // resolution and use it solely as evidence for residual cleanup. The merge
-  // remains preservation-biased, so the refinement cannot erase opaque jacket
-  // panels, logos, phones or tags.
-  if(state.quality==="fast"&&await suspiciousResidualRatio(clean)>.00025){
-    $("#progressText").textContent="Fast Mobile: refining a difficult edge…";
-    const evidence=await removeWithBackshotEngine(file,undefined,0,"auto");
-    clean=await refineResidualBackground(clean,evidence,file);
-    clean=await cleanupDisconnectedSpecks(clean,file);
-  }
-  return clean;
 }
 
 
@@ -1989,6 +971,7 @@ async function removeOne(item,queueTotal){
 
   updateProgress(queueTotal);
   renderGallery();
+  updateSelectionUI();
 }
 
 async function processRemovalQueue(queue,label){
@@ -1997,6 +980,8 @@ async function processRemovalQueue(queue,label){
     return;
   }
 
+  // Photos that already have a cutout are skipped, so pressing a button twice
+  // never re-runs inference the user did not ask for.
   queue=Array.from(queue||[]).filter(item=>item&&!item.cutoutBlob);
   if(!queue.length){
     toast(`${label} already have backgrounds removed.`);
@@ -2007,10 +992,9 @@ async function processRemovalQueue(queue,label){
   state.completed=0;
   state.failed=0;
 
-  $("#removeSelectedBtn").disabled=true;
-  $("#removeAllBtn").disabled=true;
   $("#qualityMode").disabled=true;
   $("#progressWrap").classList.remove("hidden");
+  updateSelectionUI();
   updateProgress(queue.length);
 
   // A single worker owns one ONNX session. Concurrent run() calls can contend
@@ -2027,9 +1011,8 @@ async function processRemovalQueue(queue,label){
     toast(`Removal queue stopped: ${error?.message||"unknown error"}`);
   }finally{
     state.processing=false;
-    $("#removeSelectedBtn").disabled=false;
-    $("#removeAllBtn").disabled=false;
     $("#qualityMode").disabled=false;
+    updateSelectionUI();
     updateProgress(queue.length);
   }
 
@@ -2099,11 +1082,14 @@ async function drawComposite(canvas,item,exportSize=null){
   if(background.mode==="solid"){ctx.fillStyle=background.color||"#ffffff";ctx.fillRect(0,0,tw,th);}else if(background.mode==="image"&&background.url){drawCover(ctx,await imageFromURL(background.url),tw,th);}
   const a=item.adj||DEFAULT_ADJ(),dw=tw*a.scale,dh=th*a.scale,x=(tw-dw)/2+tw*(a.offsetX/100),y=(th-dh)/2+th*(a.offsetY/100);
   ctx.save();ctx.filter=`brightness(${a.brightness}%) contrast(${a.contrast}%) saturate(${a.saturation}%)`;
-  const shadowCfg=a.shadow||{enabled:true,opacity:.22,blur:24,offsetY:18};
-  if(shadowCfg.enabled&&item.cutoutURL){
+  const shadowCfg=a.shadow||{...DEFAULT_SHADOW};
+  if(shadowCfg.enabled&&item.cutoutURL&&shadowCfg.opacity>0){
+    // Shadow sliders are authored against a ~1000px canvas, so scale them with the
+    // export size. Without this a 24px blur is invisible on a 4000px photo.
+    const relative=Math.max(tw,th)/1000;
     ctx.shadowColor=`rgba(0,0,0,${shadowCfg.opacity})`;
-    ctx.shadowBlur=shadowCfg.blur*(tw/Math.max(900,tw));
-    ctx.shadowOffsetY=shadowCfg.offsetY*(th/Math.max(900,th));
+    ctx.shadowBlur=shadowCfg.blur*relative;
+    ctx.shadowOffsetY=shadowCfg.offsetY*relative;
   }
   ctx.drawImage(subject,x,y,dw,dh);ctx.restore();
 }
@@ -2128,7 +1114,23 @@ async function renderAllPreviews(){
 }
 
 /* ---------- Cutout editor ---------- */
-const ASSIST_LOCAL_RADIUS=96;
+
+// The AI Assist slider is expressed in on-screen pixels so the target always
+// matches what the user sees, whatever the zoom level or photo resolution.
+const ASSIST_SIZE_LABELS=[[26,"Small"],[70,"Medium"],[Infinity,"Large"]];
+function assistDisplayDiameter(){return Number($("#assistSize").value)||46;}
+function assistSizeLabel(){
+  const size=assistDisplayDiameter();
+  return (ASSIST_SIZE_LABELS.find(([limit])=>size<=limit)||ASSIST_SIZE_LABELS.at(-1))[1];
+}
+function canvasPixelsPerScreenPixel(){
+  const e=state.editor;if(!e)return 1;
+  const rect=e.canvas.getBoundingClientRect();
+  return e.canvas.width/Math.max(1,rect.width);
+}
+function assistRadiusInImagePixels(){
+  return Math.max(4,assistDisplayDiameter()/2*canvasPixelsPerScreenPixel());
+}
 
 async function openEditor(id){
   const item=state.items.find(x=>x.id===id);if(!item?.cutoutURL)return;
@@ -2160,7 +1162,28 @@ function setEditorZoom(next){
   if(e.viewScale===1){e.panX=0;e.panY=0;}
   updateEditorTransform();
 }
-function updateEditorUI(){if(!state.editor)return;$("#eraseTool").classList.toggle("active",state.editor.mode==="erase");$("#restoreTool").classList.toggle("active",state.editor.mode==="restore");const assisted=$("#assistToggle").checked;$("#brushSize").disabled=assisted;$("#editorHint").textContent=assisted?`Assisted: tap a ${state.editor.mode==="erase"?"missed background area":"missing product area"} and BackshotAI follows that region.`:state.editor.mode==="erase"?"Manual: brush over unwanted areas.":"Manual: brush over missing parts to restore them.";$("#undoEdit").disabled=state.editor.history.length<=1;$("#redoEdit").disabled=!state.editor.redo.length;}
+function updateEditorUI(){
+  const e=state.editor;if(!e)return;
+  $("#eraseTool").classList.toggle("active",e.mode==="erase");
+  $("#restoreTool").classList.toggle("active",e.mode==="restore");
+  const assisted=$("#assistToggle").checked;
+  $("#assistSizeRow").classList.toggle("hidden",!assisted);
+  $("#brushSizeRow").classList.toggle("hidden",assisted);
+  $("#assistSizeLabel").textContent=assistSizeLabel();
+  $("#editorHint").textContent=assisted
+    ? `AI Assist: place the target on ${e.mode==="erase"?"leftover background":"a missing part of the subject"} and tap. Only that area is analysed.`
+    : e.mode==="erase"?"Manual: brush over unwanted areas.":"Manual: brush over missing parts to restore them.";
+  $("#undoEdit").disabled=e.history.length<=1;
+  $("#redoEdit").disabled=!e.redo.length;
+  updateAssistTargetSize();
+}
+function updateAssistTargetSize(){
+  const target=$("#assistTarget");if(!target)return;
+  const size=assistDisplayDiameter();
+  target.style.width=`${size}px`;
+  target.style.height=`${size}px`;
+  if(!$("#assistToggle").checked)target.classList.remove("show");
+}
 function setupEditorEvents(){
   const e=state.editor,c=e.canvas,stage=$(".editor-stage");
   stage.onwheel=ev=>{ev.preventDefault();setEditorZoom(e.viewScale*(ev.deltaY<0?1.12:.89));};
@@ -2168,16 +1191,17 @@ function setupEditorEvents(){
     c.setPointerCapture(ev.pointerId);e.pointers.set(ev.pointerId,{x:ev.clientX,y:ev.clientY});
     if(e.pointers.size===2){const pts=[...e.pointers.values()];e.drawing=false;e.pinch={distance:Math.hypot(pts[1].x-pts[0].x,pts[1].y-pts[0].y),scale:e.viewScale,midX:(pts[0].x+pts[1].x)/2,midY:(pts[0].y+pts[1].y)/2,panX:e.panX,panY:e.panY};return;}
     if(ev.button===1||ev.altKey){e.panning={x:ev.clientX,y:ev.clientY,panX:e.panX,panY:e.panY};return;}
+    moveEditorCursor(ev);
     const p=pointFor(ev,c);if($("#assistToggle").checked){assistedTap(p);return;}e.drawing=true;e.last=p;paintAt(p);
   };
   c.onpointermove=ev=>{
-    moveBrushCursor(ev);if(e.pointers.has(ev.pointerId))e.pointers.set(ev.pointerId,{x:ev.clientX,y:ev.clientY});
+    moveEditorCursor(ev);if(e.pointers.has(ev.pointerId))e.pointers.set(ev.pointerId,{x:ev.clientX,y:ev.clientY});
     if(e.pointers.size===2&&e.pinch){const pts=[...e.pointers.values()],distance=Math.hypot(pts[1].x-pts[0].x,pts[1].y-pts[0].y),midX=(pts[0].x+pts[1].x)/2,midY=(pts[0].y+pts[1].y)/2;e.viewScale=Math.max(1,Math.min(8,e.pinch.scale*distance/Math.max(1,e.pinch.distance)));e.panX=e.pinch.panX+midX-e.pinch.midX;e.panY=e.pinch.panY+midY-e.pinch.midY;updateEditorTransform();return;}
     if(e.panning){e.panX=e.panning.panX+ev.clientX-e.panning.x;e.panY=e.panning.panY+ev.clientY-e.panning.y;updateEditorTransform();return;}
     if(!e.drawing||$("#assistToggle").checked)return;const p=pointFor(ev,c);paintLine(e.last,p);e.last=p;
   };
   const finish=ev=>{e.pointers.delete(ev.pointerId);e.pinch=null;e.panning=null;if(e.drawing){e.drawing=false;pushHistory();}};
-  c.onpointerup=finish;c.onpointercancel=finish;c.onpointerleave=()=>$("#brushCursor").classList.remove("show");c.onpointerenter=()=>$("#brushCursor").classList.add("show");
+  c.onpointerup=finish;c.onpointercancel=finish;c.onpointerleave=hideEditorCursor;c.onpointerenter=ev=>moveEditorCursor(ev);
 }
 function pointFor(ev,c){const r=c.getBoundingClientRect();return{x:(ev.clientX-r.left)/r.width*c.width,y:(ev.clientY-r.top)/r.height*c.height};}
 function brushRadius(){return Number($("#brushSize").value)/2*(state.editor.canvas.width/state.editor.canvas.getBoundingClientRect().width);}
@@ -2186,69 +1210,94 @@ function paintAt(p){const e=state.editor,r=brushRadius(),ctx=e.ctx;ctx.save();if
 
 function assistedTap(p){
   const e=state.editor,w=e.canvas.width,h=e.canvas.height;
-  const x0=Math.max(0,Math.min(w-1,Math.round(p.x))),y0=Math.max(0,Math.min(h-1,Math.round(p.y)));
-  const cur=e.ctx.getImageData(0,0,w,h),cd=cur.data,od=e.originalData.data;
-  let sr=0,sg=0,sb=0,sc=0;
-  const seedRadius=Math.max(2,Math.round(Math.min(w,h)/350));
-  for(let yy=Math.max(0,y0-seedRadius);yy<=Math.min(h-1,y0+seedRadius);yy++){
-    for(let xx=Math.max(0,x0-seedRadius);xx<=Math.min(w-1,x0+seedRadius);xx++){
-      const o=(yy*w+xx)*4;sr+=od[o];sg+=od[o+1];sb+=od[o+2];sc++;
-    }
-  }
-  const seed=[sr/sc,sg/sc,sb/sc],seedLum=.299*seed[0]+.587*seed[1]+.114*seed[2];
-  const visited=new Uint8Array(w*h),stack=[y0*w+x0],region=[];
-  const scale=w/Math.max(1,e.canvas.getBoundingClientRect().width);
-  const maxRadius=Math.max(12,ASSIST_LOCAL_RADIUS*scale);
-  const maxRegion=Math.ceil(Math.PI*maxRadius*maxRadius);
-  const colourTol=e.mode==="erase"?82:72,lumTol=e.mode==="erase"?72:62;
+  const current=e.ctx.getImageData(0,0,w,h);
+  const alpha=new Uint8Array(w*h);
+  for(let i=0;i<alpha.length;i++)alpha[i]=current.data[i*4+3];
 
-  while(stack.length&&region.length<maxRegion){
-    const i=stack.pop();if(visited[i])continue;visited[i]=1;
-    const x=i%w,y=(i/w)|0;if(Math.hypot(x-x0,y-y0)>maxRadius)continue;
-    const o=i*4,a=cd[o+3];
-    if(e.mode==="erase"&&a<5)continue;
-    if(e.mode==="restore"&&a>250)continue;
-    const r=od[o],g=od[o+1],b=od[o+2],dr=r-seed[0],dg=g-seed[1],db=b-seed[2];
-    const colour=Math.sqrt(dr*dr*.30+dg*dg*.59+db*db*.11),lum=.299*r+.587*g+.114*b;
-    if(colour>colourTol||Math.abs(lum-seedLum)>lumTol)continue;
-    region.push(i);
-    for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){
-      if(!ox&&!oy)continue;const nx=x+ox,ny=y+oy;if(nx>=0&&nx<w&&ny>=0&&ny<h)stack.push(ny*w+nx);
-    }
+  const radius=assistRadiusInImagePixels();
+  const selection=computeAssistSelection({
+    rgb:e.originalData.data,
+    alpha,
+    width:w,
+    height:h,
+    x:p.x,
+    y:p.y,
+    radius,
+    mode:e.mode
+  });
+
+  if(!selection){
+    toast(e.mode==="erase"
+      ? "Nothing to remove there. Move the target onto the leftover background."
+      : "Nothing to restore there. Move the target onto the missing area.");
+    return;
   }
-  if(region.length<3){toast("Tap inside the area you want to change.");return;}
-  if(e.mode==="erase"){for(const i of region)cd[i*4+3]=0;}
-  else{for(const i of region){const o=i*4;cd[o]=od[o];cd[o+1]=od[o+1];cd[o+2]=od[o+2];cd[o+3]=od[o+3];}}
-  e.ctx.putImageData(cur,0,0);pushHistory();toast(`${e.mode==="erase"?"Removed":"Restored"} the selected area.`);
+
+  const changed=applyAssistSelection(current.data,e.originalData.data,w,selection,e.mode);
+  if(!changed){
+    toast(e.mode==="erase"?"That area is already removed.":"That area is already part of the cutout.");
+    return;
+  }
+
+  e.ctx.putImageData(current,0,0);
+  pushHistory();
+  pulseAssistTarget();
+  toast(e.mode==="erase"?"Removed the targeted area." : "Restored the targeted area.");
 }
 function pushHistory(){const e=state.editor;e.history.push(e.ctx.getImageData(0,0,e.canvas.width,e.canvas.height));if(e.history.length>18)e.history.shift();e.redo=[];updateEditorUI();}
 function undo(){const e=state.editor;if(e.history.length<=1)return;const cur=e.history.pop();e.redo.push(cur);e.ctx.putImageData(e.history[e.history.length-1],0,0);updateEditorUI();}
 function redo(){const e=state.editor;if(!e.redo.length)return;const img=e.redo.pop();e.history.push(img);e.ctx.putImageData(img,0,0);updateEditorUI();}
-function moveBrushCursor(ev){const stage=$(".editor-stage").getBoundingClientRect(),size=$("#assistToggle").checked?28:Number($("#brushSize").value),el=$("#brushCursor");el.classList.add("show");el.style.width=`${size}px`;el.style.height=`${size}px`;el.style.left=`${ev.clientX-stage.left-size/2}px`;el.style.top=`${ev.clientY-stage.top-size/2}px`;}
+function moveEditorCursor(ev){
+  const stage=$(".editor-stage").getBoundingClientRect();
+  const assisted=$("#assistToggle").checked;
+  const el=assisted?$("#assistTarget"):$("#brushCursor");
+  const other=assisted?$("#brushCursor"):$("#assistTarget");
+  other.classList.remove("show");
+  const size=assisted?assistDisplayDiameter():Number($("#brushSize").value);
+  el.classList.add("show");
+  el.style.width=`${size}px`;
+  el.style.height=`${size}px`;
+  el.style.left=`${ev.clientX-stage.left-size/2}px`;
+  el.style.top=`${ev.clientY-stage.top-size/2}px`;
+}
+function hideEditorCursor(){
+  $("#brushCursor").classList.remove("show");
+  $("#assistTarget").classList.remove("show");
+}
+function pulseAssistTarget(){
+  const target=$("#assistTarget");
+  target.classList.remove("pulse");
+  // Restart the keyframes so repeated taps each get their own confirmation.
+  void target.offsetWidth;
+  target.classList.add("pulse");
+}
 async function smartRecover(){
   const e=state.editor;if(!e)return;
   const button=$("#smartRecover");let recoverURL="";
-  button.disabled=true;button.textContent="Checking…";
+  button.disabled=true;button.textContent="Working…";
   try{
     const clean=await chooseSafeCutout(e.item.file);
     recoverURL=URL.createObjectURL(clean);
     const img=await imageFromURL(recoverURL);
-    e.ctx.save();e.ctx.globalCompositeOperation="source-over";e.ctx.drawImage(img,0,0,e.canvas.width,e.canvas.height);e.ctx.restore();
-    pushHistory();toast("Safer high-quality subject pass merged.");
+    e.ctx.save();
+    e.ctx.globalCompositeOperation="copy";
+    e.ctx.drawImage(img,0,0,e.canvas.width,e.canvas.height);
+    e.ctx.restore();
+    pushHistory();toast("Removal re-run. Undo restores your previous edit.");
   }catch(err){
-    console.error("Subject re-check failed",err);
-    toast(`Re-check failed: ${err?.message||"this device could not complete it."}`);
+    console.error("Removal re-run failed",err);
+    toast(`Re-run failed: ${err?.message||"this device could not complete it."}`);
   }finally{
     if(recoverURL)URL.revokeObjectURL(recoverURL);
-    button.disabled=false;button.textContent="Re-check subject";
+    button.disabled=false;button.textContent="Re-run removal";
   }
 }
 async function applyEditor(){
   const e=state.editor;if(!e)return;
   try{
     const blob=await new Promise((resolve,reject)=>e.canvas.toBlob(value=>value?resolve(value):reject(new Error("The edited image could not be encoded.")),"image/png",1));
-    e.item.cutoutBlob=blob;if(e.item.cutoutURL)URL.revokeObjectURL(e.item.cutoutURL);e.item.cutoutURL=URL.createObjectURL(blob);e.item.status="done";
-    closeEditor();renderGallery();toast("Cutout updated.");
+    e.item.cutoutBlob=blob;if(e.item.cutoutURL)URL.revokeObjectURL(e.item.cutoutURL);e.item.cutoutURL=URL.createObjectURL(blob);e.item.status="done";e.item.error=null;
+    closeEditor();renderGallery();updateSelectionUI();toast("Cutout updated.");
   }catch(err){
     console.error("Cutout editor export failed",err);
     toast(`Could not save the edit: ${err?.message||"unknown error"}`);
@@ -2265,74 +1314,137 @@ function downloadBlob(blob,filename){
   setTimeout(()=>link.remove(),1000);
   setTimeout(()=>URL.revokeObjectURL(url),60000);
 }
-async function downloadItems(items, button, filenamePrefix){
-  if(!items.length){toast("Select one or more photos first.");return;}
+function exportNameFor(item,index){
+  const base=(item.name.replace(/\.[^.]+$/,"")||`image-${index}`).replace(/[^\w\- ]+/g,"").trim().replace(/\s+/g,"-");
+  return base||`image-${index}`;
+}
+async function renderExport(item){
+  const source=await imageFromURL(item.cutoutURL);
+  const canvas=document.createElement("canvas");
+  await drawComposite(canvas,item,{width:source.naturalWidth||source.width,height:source.naturalHeight||source.height});
+  const transparent=backgroundFor(item).mode==="transparent";
+  const mime=transparent?"image/png":"image/jpeg";
+  const blob=await new Promise((resolve,reject)=>canvas.toBlob(
+    value=>value?resolve(value):reject(new Error(`Could not export ${item.name}.`)),
+    mime,
+    transparent?undefined:.95
+  ));
+  return {blob,ext:transparent?"png":"jpg"};
+}
+async function downloadItems(candidates, button, filenamePrefix, emptyMessage){
+  // Only completed cutouts are exported, so a half-finished batch can never
+  // silently ship original photos with their backgrounds still attached.
+  const items=processedItems(candidates);
+  if(!items.length){toast(emptyMessage);return;}
+  const skipped=candidates.length-items.length;
   const originalText=button.textContent;
   button.disabled=true;button.textContent="Preparing…";
   try{
-    const zip=new JSZip();let counter=1;
-    for(const item of items){
-      const img=await imageFromURL(item.cutoutURL||item.originalURL),canvas=document.createElement("canvas");
-      await drawComposite(canvas,item,{width:img.naturalWidth||img.width,height:img.naturalHeight||img.height});
-      const transparent=backgroundFor(item).mode==="transparent",mime=transparent?"image/png":"image/jpeg",ext=transparent?"png":"jpg";
-      const blob=await new Promise((resolve,reject)=>canvas.toBlob(b=>b?resolve(b):reject(new Error(`Could not export ${item.name}.`)),mime,transparent?undefined:.95));
-      const name=(item.name.replace(/\.[^.]+$/,"")||`image-${counter}`).replace(/[^\w\- ]+/g,"").trim().replace(/\s+/g,"-");
-      zip.file(`${name||`image-${counter}`}-edited.${ext}`,blob);counter++;
+    if(items.length===1){
+      const {blob,ext}=await renderExport(items[0]);
+      downloadBlob(blob,`${exportNameFor(items[0],1)}-backshotai.${ext}`);
+      toast(skipped?`1 photo downloaded • ${skipped} not processed yet.`:"Photo downloaded.");
+    }else{
+      const zip=new JSZip();
+      let counter=1;
+      for(const item of items){
+        const {blob,ext}=await renderExport(item);
+        zip.file(`${exportNameFor(item,counter)}-backshotai.${ext}`,blob);
+        counter++;
+      }
+      const out=await zip.generateAsync({type:"blob",compression:"DEFLATE"});
+      downloadBlob(out,`${filenamePrefix}-${new Date().toISOString().slice(0,10)}.zip`);
+      toast(skipped?`ZIP ready: ${items.length} photos • ${skipped} not processed yet.`:`ZIP ready: ${items.length} photos.`);
     }
-    const out=await zip.generateAsync({type:"blob",compression:"DEFLATE"});
-    downloadBlob(out,`${filenamePrefix}-${new Date().toISOString().slice(0,10)}.zip`);
-    toast(`ZIP ready: ${items.length} photo${items.length===1?"":"s"}.`);
-  }catch(e){console.error(e);toast(`Couldn't create ZIP: ${e?.message||"unknown export error"}`);}
+  }catch(e){console.error(e);toast(`Couldn't export: ${e?.message||"unknown export error"}`);}
   button.disabled=false;button.textContent=originalText;
+  updateSelectionUI();
 }
-async function downloadSelected(){await downloadItems(selectedItems(),$("#downloadSelectedBtn"),"BackshotAI-selected");}
-async function downloadAll(){await downloadItems(state.items,$("#downloadAllBtn"),"BackshotAI");}
+async function downloadSelected(){
+  const items=selectedItems();
+  await downloadItems(
+    items,
+    $("#downloadSelectedBtn"),
+    "BackshotAI-selected",
+    items.length?"None of the selected photos have finished background removal yet.":"Select one or more photos first."
+  );
+}
+async function downloadAll(){
+  await downloadItems(state.items,$("#downloadAllBtn"),"BackshotAI","No finished cutouts to download yet.");
+}
+
+// Small illustrations built from the same tokens as the app itself, so the
+// tutorial reads as part of BackshotAI rather than a bolted-on component.
+const tutorialArt={
+  upload:`<div class="tut-art tut-upload"><div class="tut-plate"></div><div class="tut-plate"></div><div class="tut-plate"></div><span class="tut-plus">＋</span></div>`,
+  select:`<div class="tut-art tut-grid">${[0,1,2,3].map(i=>`<span class="tut-cell${i===1?" picked":""}"></span>`).join("")}</div>`,
+  drag:`<div class="tut-art tut-grid tut-drag">${[0,1,2,3,4,5].map(i=>`<span class="tut-cell${[0,1,3,4].includes(i)?" swept":""}"></span>`).join("")}<span class="tut-marquee"></span><span class="tut-pointer"></span></div>`,
+  removeSelected:`<div class="tut-art tut-grid">${[0,1,2,3].map(i=>`<span class="tut-cell${i<2?" picked cleared":""}"></span>`).join("")}<span class="tut-sweep"></span></div>`,
+  removeAll:`<div class="tut-art tut-grid">${[0,1,2,3].map(()=>`<span class="tut-cell cleared"></span>`).join("")}<span class="tut-sweep"></span></div>`,
+  refine:`<div class="tut-art tut-refine"><span class="tut-subject"></span><span class="tut-target"></span></div>`,
+  downloadSelected:`<div class="tut-art tut-grid">${[0,1,2,3].map(i=>`<span class="tut-cell${i===0||i===2?" picked":""}"></span>`).join("")}<span class="tut-arrow">↓</span></div>`,
+  downloadAll:`<div class="tut-art tut-zip"><span class="tut-zip-body">ZIP</span><span class="tut-arrow">↓</span></div>`
+};
 
 const tutorialSteps=[
   {
-    title:"Add your photos",
-    text:"Choose one image or a whole batch from Photos or Files.",
-    visual:"＋"
+    title:"Upload your images",
+    text:"Tap Select photos on the home screen, or + Add more once a batch is open. Choose one image or hundreds — everything runs privately in this browser.",
+    points:["JPG, PNG, HEIC and WebP are all accepted.","Unsupported files are skipped without touching the rest of your batch."],
+    visual:tutorialArt.upload
   },
   {
-    title:"Select exactly what you want",
-    text:"Tap individual photos, or click and drag across cards to select several without selecting the whole batch.",
-    visual:"✓"
+    title:"Select individual images",
+    text:"Tap a photo, or its circular tick, to select it. Tap again to unselect. The selection count in the controls panel always shows what an action will affect.",
+    points:["All and None select or clear the whole batch instantly."],
+    visual:tutorialArt.select
   },
   {
-    title:"Remove backgrounds",
-    text:"Press Remove selected backgrounds for your selection, or Remove all backgrounds for the entire batch.",
-    visual:"✦"
+    title:"Drag-select several at once",
+    text:"Press on empty space in the grid and drag a box across the cards you want. Everything the box touches is selected — no mode to switch on first.",
+    points:["Hold Shift while dragging to add to an existing selection.","On a phone, press and hold briefly, then drag."],
+    visual:tutorialArt.drag
   },
   {
-    title:"Choose a new background",
-    text:"Keep transparency, use a solid colour, or choose one image to use as the new background.",
-    visual:"▧"
+    title:"Remove selected backgrounds",
+    text:"With photos selected, press Remove selected backgrounds. Only those photos are processed and everything else is left exactly as it is.",
+    points:["The button stays disabled while nothing is selected."],
+    visual:tutorialArt.removeSelected
   },
   {
-    title:"Adjust selected photos or the batch",
-    text:"Position, filters and shadows each have their own Selected or Whole batch switch, so every category follows the scope you choose.",
-    visual:"↔"
+    title:"Remove all backgrounds",
+    text:"Press Remove all backgrounds to process every uploaded photo, whatever is selected. Photos that already have a cutout are skipped instead of being redone.",
+    points:["Each photo shows a scanning animation while it is being processed."],
+    visual:tutorialArt.removeAll
   },
   {
     title:"Refine a cutout",
-    text:"Press Edit cutout on one photo to erase or restore areas using Assisted mode or the manual brush.",
-    visual:"⌁"
+    text:"Press Edit cutout on any finished photo. AI Assist analyses only the area under the circular target, so one tap clears leftover background without eating into the subject.",
+    points:["Pick Small, Medium or Large with the Target slider.","Undo and Redo cover every correction."],
+    visual:tutorialArt.refine
   },
   {
-    title:"Download",
-    text:"Download only your selected photos or export the complete batch as a ZIP.",
-    visual:"↓"
+    title:"Download selected images",
+    text:"Press Download selected to export just your current selection. One photo downloads directly; several arrive as a ZIP.",
+    points:["Only photos that finished background removal are included."],
+    visual:tutorialArt.downloadSelected
+  },
+  {
+    title:"Download all images",
+    text:"Press Download all to export every finished cutout in one ZIP. Transparent photos export as PNG; replaced backgrounds export as JPG.",
+    points:["Photos still processing or failed are left out of the export."],
+    visual:tutorialArt.downloadAll
   }
 ];
 let tutorialIndex=0;
 
 function renderTutorial(){
   const step=tutorialSteps[tutorialIndex]||tutorialSteps[0];
-  $("#tutorialCount").textContent=`${tutorialIndex+1} / ${tutorialSteps.length}`;
+  $("#tutorialCount").textContent=`Step ${tutorialIndex+1} of ${tutorialSteps.length}`;
   $("#tutorialTitle").textContent=step.title;
   $("#tutorialText").textContent=step.text;
-  $("#tutorialVisual").textContent=step.visual;
+  $("#tutorialVisual").innerHTML=step.visual;
+  $("#tutorialPoints").innerHTML=(step.points||[]).map(point=>`<li>${escapeHtml(point)}</li>`).join("");
   $("#tutorialDots").innerHTML=tutorialSteps
     .map((_,i)=>`<span class="${i===tutorialIndex?"active":""}"></span>`)
     .join("");
@@ -2341,7 +1453,7 @@ function renderTutorial(){
     tutorialIndex===tutorialSteps.length-1?"Done":"Next";
 }
 
-function openHelp(){tutorialIndex=0;renderTutorial();$("#helpModal").classList.remove("hidden");}
+function openHelp(){tutorialIndex=0;renderTutorial();$("#helpModal").classList.remove("hidden");$("#closeHelp").focus();}
 function closeHelp(){$("#helpModal").classList.add("hidden");}
 photoInput.addEventListener("change", e => {
   addFiles(e.target.files);
@@ -2441,130 +1553,218 @@ $("#resetSelected").onclick=()=>{
   updateSelectionUI();schedulePreviewRender();
 };
 
+/* ---------- Drag selection ----------
+ * Always available: there is no mode to turn on. A pointer press anywhere in the
+ * grid starts a marquee, the selection previews live while dragging, and the
+ * anchor is corrected for any scrolling that happens mid-drag so the box stays on
+ * the cards it started from. Touch waits for a short hold so ordinary scrolling
+ * still works. */
 const dragSelectBox=$("#dragSelectBox");
+const TOUCH_HOLD_MS=190;
+const AUTO_SCROLL_EDGE=44;
 
-function pagePoint(e){ return {x:e.clientX,y:e.clientY}; }
-function updateDragBox(x1,y1,x2,y2){
+function galleryScroller(){ return document.querySelector(".gallery-shell"); }
+function currentScrollTop(){
+  const el=galleryScroller();
+  return (el?el.scrollTop:0)+window.scrollY;
+}
+function dragAnchor(){
+  const drag=state.drag;
+  return {x:drag.startX,y:drag.startY-(currentScrollTop()-drag.startScrollTop)};
+}
+function drawDragBox(x1,y1,x2,y2){
   const left=Math.min(x1,x2),top=Math.min(y1,y2),right=Math.max(x1,x2),bottom=Math.max(y1,y2);
-  dragSelectBox.style.left=`${left}px`;dragSelectBox.style.top=`${top}px`;
-  dragSelectBox.style.width=`${right-left}px`;dragSelectBox.style.height=`${bottom-top}px`;
+  dragSelectBox.style.left=`${left}px`;
+  dragSelectBox.style.top=`${top}px`;
+  dragSelectBox.style.width=`${right-left}px`;
+  dragSelectBox.style.height=`${bottom-top}px`;
   return {left,top,right,bottom};
 }
-function applyDragSelection(rect){
-  let hits=0;
+function cardsWithin(rect){
+  const ids=[];
   for(const card of gallery.querySelectorAll(".photo-card")){
-    const r=card.getBoundingClientRect();
-    const hit=!(r.right<rect.left||r.left>rect.right||r.bottom<rect.top||r.top>rect.bottom);
-    if(hit){const id=card.dataset.card;if(id&&!state.selected.has(id)){state.selected.add(id);hits++;}}
+    const box=card.getBoundingClientRect();
+    const hit=!(box.right<rect.left||box.left>rect.right||box.bottom<rect.top||box.top>rect.bottom);
+    if(hit&&card.dataset.card)ids.push(card.dataset.card);
   }
-  if(hits){updateSelectionClasses();updateSelectionUI();}
+  return ids;
 }
+function previewDragSelection(){
+  const drag=state.drag;if(!drag?.active)return;
+  drag.dirty=false;
+  const anchor=dragAnchor();
+  const rect=drawDragBox(anchor.x,anchor.y,drag.currentX,drag.currentY);
+  const next=drag.additive?new Set(drag.base):new Set();
+  for(const id of cardsWithin(rect))next.add(id);
+  state.selected=next;
+  updateSelectionClasses();
+  updateSelectionUI();
+}
+// One update per frame: pointermove only records the position, and auto-scroll
+// near an edge keeps the marquee growing when the grid runs out of room.
+function dragFrame(){
+  const drag=state.drag;if(!drag?.active)return;
+  const scroller=galleryScroller();
+  const box=scroller?.getBoundingClientRect();
+  const scrollable=!!box&&scroller.scrollHeight>scroller.clientHeight+1;
+  const top=scrollable?box.top:0;
+  const bottom=scrollable?box.bottom:window.innerHeight;
+  let amount=0;
+  if(drag.currentY<top+AUTO_SCROLL_EDGE)amount=-Math.min(18,(top+AUTO_SCROLL_EDGE-drag.currentY)/2);
+  else if(drag.currentY>bottom-AUTO_SCROLL_EDGE)amount=Math.min(18,(drag.currentY-(bottom-AUTO_SCROLL_EDGE))/2);
+  if(amount){
+    if(scrollable)scroller.scrollTop+=amount;
+    else window.scrollBy(0,amount);
+    drag.dirty=true;
+  }
+  if(drag.dirty)previewDragSelection();
+  drag.frame=requestAnimationFrame(dragFrame);
+}
+function activateDrag(){
+  const drag=state.drag;if(!drag||drag.active)return;
+  drag.active=true;
+  drag.base=new Set(state.selected);
+  dragSelectBox.classList.remove("hidden");
+  gallery.classList.add("drag-select-active");
+  document.body.classList.add("drag-selecting");
+  previewDragSelection();
+  drag.frame=requestAnimationFrame(dragFrame);
+}
+function endDrag(){
+  const drag=state.drag;
+  state.drag=null;
+  if(!drag)return false;
+  clearTimeout(drag.holdTimer);
+  cancelAnimationFrame(drag.frame);
+  dragSelectBox.classList.add("hidden");
+  gallery.classList.remove("drag-select-active");
+  document.body.classList.remove("drag-selecting");
+  return drag.active;
+}
+
+// While a marquee is running the grid must not also scroll under the finger.
+gallery.addEventListener("touchmove",e=>{
+  if(state.drag?.active)e.preventDefault();
+},{passive:false});
+
 gallery.addEventListener("pointerdown",e=>{
   if(e.target.closest("button"))return;
-  if(e.button!==undefined&&e.button!==0)return;
-  const p=pagePoint(e);
-  state.dragSelecting=true;state.dragMoved=false;state.dragStartX=p.x;state.dragStartY=p.y;
-  updateDragBox(p.x,p.y,p.x,p.y);
+  if(e.button)return;
+  endDrag();
+  state.drag={
+    pointerId:e.pointerId,
+    pointerType:e.pointerType,
+    startX:e.clientX,
+    startY:e.clientY,
+    currentX:e.clientX,
+    currentY:e.clientY,
+    startScrollTop:currentScrollTop(),
+    additive:e.shiftKey||e.ctrlKey||e.metaKey,
+    base:new Set(state.selected),
+    active:false,
+    armed:e.pointerType!=="touch",
+    dirty:false,
+    holdTimer:0,
+    frame:0
+  };
+  if(e.pointerType==="touch"){
+    // A brief hold separates "I want to select" from "I want to scroll".
+    state.drag.holdTimer=setTimeout(()=>{
+      if(state.drag)state.drag.armed=true;
+      activateDrag();
+    },TOUCH_HOLD_MS);
+  }
   try{gallery.setPointerCapture(e.pointerId);}catch{}
 });
+
 gallery.addEventListener("pointermove",e=>{
-  if(!state.dragSelecting)return;
-  const p=pagePoint(e),dx=p.x-state.dragStartX,dy=p.y-state.dragStartY;
-  if(!state.dragMoved && Math.hypot(dx,dy)<9)return;
-  // Keep ordinary vertical touch scrolling usable; mouse/pen drag-select is always ready.
-  if(e.pointerType==="touch" && Math.abs(dy)>Math.abs(dx)*1.25 && !state.dragMoved){state.dragSelecting=false;return;}
-  state.dragMoved=true;e.preventDefault();dragSelectBox.classList.remove("hidden");
-  updateDragBox(state.dragStartX,state.dragStartY,p.x,p.y);
-});
-function finishDragSelection(e){
-  if(!state.dragSelecting)return;
-  const p=pagePoint(e);state.dragSelecting=false;
-  if(state.dragMoved){
-    e.preventDefault();e.stopPropagation();
-    const rect=updateDragBox(state.dragStartX,state.dragStartY,p.x,p.y);
-    applyDragSelection(rect);
+  const drag=state.drag;
+  if(!drag||e.pointerId!==drag.pointerId)return;
+  drag.currentX=e.clientX;
+  drag.currentY=e.clientY;
+  if(!drag.active){
+    const moved=Math.hypot(e.clientX-drag.startX,e.clientY-drag.startY);
+    if(!drag.armed){
+      // Still deciding: a real scroll gesture cancels the pending marquee.
+      if(moved>10){clearTimeout(drag.holdTimer);state.drag=null;}
+      return;
+    }
+    if(moved<8)return;
+    activateDrag();
   }
-  dragSelectBox.classList.add("hidden");
-  setTimeout(()=>state.dragMoved=false,0);
-}
-gallery.addEventListener("pointerup",finishDragSelection);
-gallery.addEventListener("pointercancel",()=>{state.dragSelecting=false;state.dragMoved=false;dragSelectBox.classList.add("hidden");});
+  e.preventDefault();
+  drag.dirty=true;
+},{passive:false});
+
+gallery.addEventListener("pointerup",e=>{
+  const drag=state.drag;
+  if(drag&&e.pointerId===drag.pointerId&&drag.active){
+    drag.currentX=e.clientX;
+    drag.currentY=e.clientY;
+    previewDragSelection();
+    e.preventDefault();
+    e.stopPropagation();
+    endDrag();
+    // The click that follows a marquee must not toggle the card underneath.
+    suppressNextCardClick=true;
+    setTimeout(()=>{suppressNextCardClick=false;},0);
+    return;
+  }
+  endDrag();
+});
+gallery.addEventListener("pointercancel",endDrag);
 
 $("#shadowEnabled").onchange=e=>applyScopedShadow("enabled",e.target.checked);
 $("#shadowOpacity").oninput=e=>applyScopedShadow("opacity",Number(e.target.value));
 $("#shadowBlur").oninput=e=>applyScopedShadow("blur",Number(e.target.value));
 $("#shadowY").oninput=e=>applyScopedShadow("offsetY",Number(e.target.value));
-$("#eraseTool").onclick=()=>{state.editor.mode="erase";updateEditorUI();};$("#restoreTool").onclick=()=>{state.editor.mode="restore";updateEditorUI();};$("#assistToggle").onchange=updateEditorUI;$("#undoEdit").onclick=undo;$("#redoEdit").onclick=redo;$("#smartRecover").onclick=smartRecover;$("#applyEdit").onclick=applyEditor;$("#closeEditor").onclick=closeEditor;$("#cutoutModal").onclick=e=>{if(e.target.id==="cutoutModal")closeEditor();};
+$("#eraseTool").onclick=()=>{if(state.editor){state.editor.mode="erase";updateEditorUI();}};
+$("#restoreTool").onclick=()=>{if(state.editor){state.editor.mode="restore";updateEditorUI();}};
+$("#assistToggle").onchange=updateEditorUI;
+$("#assistSize").oninput=()=>{$("#assistSizeLabel").textContent=assistSizeLabel();updateAssistTargetSize();};
+$("#undoEdit").onclick=undo;$("#redoEdit").onclick=redo;$("#smartRecover").onclick=smartRecover;$("#applyEdit").onclick=applyEditor;$("#closeEditor").onclick=closeEditor;$("#cutoutModal").onclick=e=>{if(e.target.id==="cutoutModal")closeEditor();};
 $("#zoomOutEditor").onclick=()=>setEditorZoom((state.editor?.viewScale||1)/1.25);$("#zoomInEditor").onclick=()=>setEditorZoom((state.editor?.viewScale||1)*1.25);$("#fitEditor").onclick=()=>setEditorZoom(1);
 let installPrompt=null;window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();installPrompt=e;$("#installBtn").classList.remove("hidden");});$("#installBtn").onclick=async()=>{if(!installPrompt){toast("On iPhone: Safari → Share → Add to Home Screen");return;}installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;$("#installBtn").classList.add("hidden");};
 window.addEventListener("resize",()=>{if(state.editor)requestAnimationFrame(fitEditorCanvasToStage);});
 if("serviceWorker" in navigator)window.addEventListener("load",()=>navigator.serviceWorker.register("./sw.js").catch(console.warn));
 
 
-function enableScrollChaining(el){
+/* ---------- Scrolling ----------
+ * The controls column and the photo grid each scroll on their own, and once one
+ * of them reaches an end the gesture continues into the page instead of dead-
+ * ending. Touch scrolling is left entirely to the browser: CSS overscroll
+ * chaining already hands the gesture over, and intercepting touchmove used to
+ * kill momentum scrolling inside both panels. */
+function enableWheelChaining(el){
   if(!el)return;
-
-  // Desktop / trackpad scrolling:
-  // - scroll the panel while it has more content
-  // - once the panel reaches top/bottom, continue scrolling the whole page
-  // - never hijack Ctrl/Cmd + wheel because that is browser pinch zoom
   el.addEventListener("wheel",e=>{
-    if(e.ctrlKey||e.metaKey)return;
+    // Ctrl/Cmd + wheel is browser zoom, and a marquee drag owns the pointer.
+    if(e.ctrlKey||e.metaKey||state.drag?.active)return;
+    if(el.scrollHeight<=el.clientHeight+1)return;
 
-    const up=e.deltaY<0;
-    const down=e.deltaY>0;
-    const atTop=el.scrollTop<=1;
+    const atTop=el.scrollTop<=0;
     const atBottom=Math.ceil(el.scrollTop+el.clientHeight)>=el.scrollHeight-1;
-
-    if((up&&atTop)||(down&&atBottom)){
+    if((e.deltaY<0&&atTop)||(e.deltaY>0&&atBottom)){
       e.preventDefault();
       window.scrollBy({top:e.deltaY,left:0,behavior:"auto"});
     }
   },{passive:false});
-
-  // Mobile touch scrolling:
-  // keep normal scrolling inside the panel, then hand movement back to the page
-  // when the panel reaches either end. Two-finger pinch is left untouched.
-  let lastY=null;
-
-  el.addEventListener("touchstart",e=>{
-    if(e.touches.length===1)lastY=e.touches[0].clientY;
-    else lastY=null;
-  },{passive:true});
-
-  el.addEventListener("touchmove",e=>{
-    if(e.touches.length!==1||lastY===null)return;
-
-    const y=e.touches[0].clientY;
-    const fingerDelta=y-lastY;
-    lastY=y;
-
-    const movingDown=fingerDelta>0; // user finger down => content/page goes toward top
-    const movingUp=fingerDelta<0;   // user finger up => content/page goes toward bottom
-    const atTop=el.scrollTop<=1;
-    const atBottom=Math.ceil(el.scrollTop+el.clientHeight)>=el.scrollHeight-1;
-
-    if((movingDown&&atTop)||(movingUp&&atBottom)){
-      e.preventDefault();
-      window.scrollBy({top:-fingerDelta,left:0,behavior:"auto"});
-    }
-  },{passive:false});
-
-  el.addEventListener("touchend",()=>{lastY=null;},{passive:true});
-  el.addEventListener("touchcancel",()=>{lastY=null;},{passive:true});
 }
 
-enableScrollChaining(document.querySelector(".controls"));
-enableScrollChaining(document.querySelector(".gallery-shell"));
+enableWheelChaining(document.querySelector(".controls"));
+enableWheelChaining(document.querySelector(".gallery-shell"));
+
+document.addEventListener("keydown",e=>{
+  if(e.key!=="Escape")return;
+  if(!$("#cutoutModal").classList.contains("hidden")){closeEditor();return;}
+  if(!$("#helpModal").classList.contains("hidden"))closeHelp();
+});
 
 // Preload only where the device/network has comfortable headroom. Constrained
 // devices load on demand so merely opening a shared link cannot crash the tab.
 const connection=navigator.connection||navigator.mozConnection||navigator.webkitConnection;
 const memory=Number(navigator.deviceMemory||0),cores=Number(navigator.hardwareConcurrency||0);
-const mobile=navigator.userAgentData?.mobile===true||
-  /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)||
-  (/Macintosh/i.test(navigator.userAgent)&&Number(navigator.maxTouchPoints||0)>1);
-const constrained=mobile||(memory>0&&memory<6)||(cores>0&&cores<6)||connection?.saveData||/2g/.test(connection?.effectiveType||"");
+const constrained=IS_MOBILE||(memory>0&&memory<6)||(cores>0&&cores<6)||connection?.saveData||/2g/.test(connection?.effectiveType||"");
 if(!constrained){
   if("requestIdleCallback" in window)requestIdleCallback(()=>warmBackshotEngine(),{timeout:1800});
   else setTimeout(()=>warmBackshotEngine(),1200);

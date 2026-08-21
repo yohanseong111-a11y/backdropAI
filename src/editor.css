@@ -156,15 +156,8 @@ fieldset{border:0;padding:0;margin:0;min-width:0}fieldset:disabled{opacity:.42}.
 /* Selected-background removal + drag selection */
 .remove-button-stack{display:grid;gap:8px}
 .remove-all-btn{width:100%;border:1px solid rgba(255,255,255,.08)}
-#dragSelectBtn.active{background:rgba(118,95,255,.16);color:#c9c0ff;border-radius:8px}
 .gallery.drag-select-active{cursor:crosshair;user-select:none;touch-action:none}
-.drag-select-box{
-  position:fixed;z-index:90;pointer-events:none;
-  border:1px solid rgba(164,149,255,.95);
-  background:rgba(118,95,255,.14);
-  box-shadow:0 0 0 1px rgba(118,95,255,.12),0 8px 30px rgba(0,0,0,.2);
-  border-radius:6px
-}
+.drag-select-box{position:fixed;z-index:90;pointer-events:none}
 .status.failed{cursor:help}
 
 
@@ -193,11 +186,18 @@ fieldset{border:0;padding:0;margin:0;min-width:0}fieldset:disabled{opacity:.42}.
 @keyframes scanTrackSweep{from{transform:translate3d(0,-100%,0)}to{transform:translate3d(0,0,0)}}
 .preview-wrap.scanning .scan-line,.preview-wrap.scanning .scan-glow{animation:none!important;transform:none!important}
 
+/* Two-column workspace: each column scrolls on its own, and once a column reaches
+   an end the gesture continues into the page (overscroll chaining for touch,
+   enableWheelChaining in main.js for trackpad and wheel). The reserved scrollbar
+   gutter keeps the thumb off the controls and cards. */
 @media(min-width:901px){
-  .workspace{height:min(780px,calc(100vh - 108px));min-height:560px;overflow:hidden;align-items:stretch}
-  .controls{position:static!important;height:100%;max-height:none;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:18px}
-  .gallery-shell{height:100%;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:8px}
-  .controls::-webkit-scrollbar,.gallery-shell::-webkit-scrollbar{width:9px}.controls::-webkit-scrollbar-thumb,.gallery-shell::-webkit-scrollbar-thumb{background:#2b2b31;border-radius:999px;border:2px solid #111114}
+  .workspace{height:min(820px,calc(100vh - 108px));min-height:560px;overflow:hidden;align-items:stretch}
+  .controls{position:static!important;height:100%;max-height:none;overflow-y:auto;overscroll-behavior-y:auto;scrollbar-gutter:stable;padding-right:16px}
+  .gallery-shell{height:100%;overflow-y:auto;overscroll-behavior-y:auto;scrollbar-gutter:stable;padding-right:6px}
+  .controls::-webkit-scrollbar,.gallery-shell::-webkit-scrollbar{width:9px}
+  .controls::-webkit-scrollbar-track,.gallery-shell::-webkit-scrollbar-track{background:transparent}
+  .controls::-webkit-scrollbar-thumb,.gallery-shell::-webkit-scrollbar-thumb{background:#2b2b31;border-radius:999px;border:2px solid transparent;background-clip:padding-box}
+  .controls:hover::-webkit-scrollbar-thumb,.gallery-shell:hover::-webkit-scrollbar-thumb{background:#3a3a43;background-clip:padding-box}
 }
 @media(max-width:700px){.drag-guide{grid-template-columns:38px 1fr auto;padding:11px 12px;gap:10px}.drag-guide-icon{width:34px;height:30px}.drag-guide-copy strong{font-size:12px}.drag-guide-copy span{font-size:9px}.guide-got-it{padding:7px 10px;font-size:10px}.gallery-head-actions{gap:5px}.gallery-head-actions button{font-size:10px;padding:9px 10px}.help-body{grid-template-columns:1fr;padding:20px}.tutorial-visual{height:92px;font-size:42px}.help-card{border-radius:20px}.help-modal{padding:10px}}
 
@@ -213,4 +213,122 @@ body.processing,.page.processing,.workspace.processing{pointer-events:auto!impor
 .editor-stage,
 .editor-canvas-wrap{
   touch-action:pan-x pan-y pinch-zoom;
+}
+
+/* ---------- Action hints and disabled affordances ---------- */
+.action-hint{margin:9px 3px 0;font-size:10px;line-height:1.5;color:#7b7b85}
+.remove-button-stack .action-hint{margin:2px 3px 0}
+.help-glyph{display:inline-grid;place-items:center;width:15px;height:15px;margin-right:5px;border-radius:50%;border:1px solid rgba(255,255,255,.28);font-size:9px;font-weight:800;vertical-align:-2px}
+.gallery-head-actions button{transition:background .15s ease,color .15s ease,transform .15s ease}
+.gallery-head-actions button:hover{background:rgba(255,255,255,.1)}
+.gallery-head-actions button:active{transform:translateY(1px)}
+.primary,.ghost,.success,.danger,.tool,.seg,.text-btn,.edit-cutout,.icon-btn{transition:background .15s ease,color .15s ease,box-shadow .15s ease,transform .12s ease}
+.primary:hover:not(:disabled){background:#8672ff}
+.success:hover:not(:disabled){background:#ffffff}
+.ghost:hover:not(:disabled){background:rgba(255,255,255,.1)}
+.primary:active:not(:disabled),.ghost:active:not(:disabled),.success:active:not(:disabled){transform:translateY(1px)}
+.seg:hover:not(.active){color:#d7d7dd}
+.tool:hover:not(.active){color:#d7d7dd}
+.range-value{min-width:52px;font-size:10px;font-weight:800;color:#b8adff;letter-spacing:.03em}
+
+/* ---------- AI Assist target ---------- */
+.assist-target{
+  position:absolute;display:none;pointer-events:none;z-index:11;border-radius:50%;
+  border:1.5px solid rgba(178,164,255,.95);
+  background:radial-gradient(circle,rgba(124,102,255,.22),rgba(124,102,255,.06) 62%,transparent 70%);
+  box-shadow:0 0 0 1px rgba(8,8,11,.65),0 0 14px rgba(120,98,255,.42)
+}
+.assist-target.show{display:grid;place-items:center}
+.assist-target-dot{width:5px;height:5px;border-radius:50%;background:#fff;box-shadow:0 0 6px rgba(255,255,255,.85)}
+.assist-target.pulse{animation:assistPulse .42s ease-out}
+@keyframes assistPulse{
+  0%{transform:scale(.86);border-color:#fff;box-shadow:0 0 0 1px rgba(8,8,11,.65),0 0 0 rgba(120,98,255,.6)}
+  100%{transform:scale(1);border-color:rgba(178,164,255,.95);box-shadow:0 0 0 1px rgba(8,8,11,.65),0 0 22px rgba(120,98,255,0)}
+}
+
+/* ---------- Drag selection ---------- */
+body.drag-selecting{user-select:none;-webkit-user-select:none}
+body.drag-selecting .photo-card{cursor:crosshair}
+.drag-select-box{
+  border:1px solid rgba(164,149,255,.95);
+  background:rgba(118,95,255,.16);
+  box-shadow:0 0 0 1px rgba(118,95,255,.14),0 10px 34px rgba(0,0,0,.28);
+  border-radius:8px
+}
+.gallery.drag-select-active{touch-action:none;cursor:crosshair}
+.photo-card:hover{border-color:rgba(255,255,255,.16)}
+.photo-card.selected:hover{border-color:rgba(151,132,255,1)}
+
+/* ---------- Tutorial ---------- */
+.tutorial-points{margin:12px 0 0;padding:0 0 0 16px;display:grid;gap:5px}
+.tutorial-points li{font-size:11px;line-height:1.5;color:#83838d}
+.tutorial-points:empty{display:none}
+.tut-art{position:relative;width:100%;height:100%;display:grid;place-items:center}
+.tut-grid{grid-template-columns:repeat(2,1fr);gap:6px;align-content:center;padding:12px}
+.tut-drag{grid-template-columns:repeat(3,1fr)}
+.tut-cell{
+  width:100%;aspect-ratio:4/5;border-radius:7px;background:#1c1c22;
+  border:1px solid rgba(255,255,255,.09);transition:.2s ease
+}
+.tut-cell.picked{border-color:rgba(140,120,255,.95);background:#252036;box-shadow:0 0 0 2px rgba(132,111,255,.2)}
+.tut-cell.swept{border-color:rgba(140,120,255,.8);background:#221e33}
+.tut-cell.cleared{
+  background:
+    linear-gradient(45deg,#22222a 25%,transparent 25%) 0 0/10px 10px,
+    linear-gradient(-45deg,#22222a 25%,transparent 25%) 0 5px/10px 10px,
+    linear-gradient(45deg,transparent 75%,#22222a 75%) 5px -5px/10px 10px,
+    linear-gradient(-45deg,transparent 75%,#22222a 75%) -5px 0/10px 10px,#141418
+}
+.tut-marquee{
+  position:absolute;left:9px;top:12px;width:64%;height:76%;border-radius:8px;
+  border:1px solid rgba(178,164,255,.95);background:rgba(118,95,255,.16);
+  animation:tutMarquee 2.6s ease-in-out infinite
+}
+.tut-pointer{
+  position:absolute;left:calc(9px + 64%);top:calc(12px + 76%);width:9px;height:9px;border-radius:50%;
+  background:#fff;box-shadow:0 0 10px rgba(255,255,255,.8);
+  animation:tutPointer 2.6s ease-in-out infinite
+}
+@keyframes tutMarquee{
+  0%,8%{width:0;height:0;opacity:.35}
+  55%,88%{width:64%;height:76%;opacity:1}
+  100%{width:64%;height:76%;opacity:0}
+}
+@keyframes tutPointer{
+  0%,8%{transform:translate(-64%,-76%) scale(.7)}
+  55%,88%{transform:translate(0,0) scale(1)}
+  100%{transform:translate(0,0) scale(1);opacity:0}
+}
+.tut-sweep{
+  position:absolute;left:6%;right:6%;height:2px;border-radius:999px;
+  background:linear-gradient(90deg,transparent,#fff 50%,transparent);
+  box-shadow:0 0 10px rgba(147,126,255,.9);
+  animation:tutSweep 1.9s cubic-bezier(.45,0,.55,1) infinite alternate
+}
+@keyframes tutSweep{from{top:14%}to{top:84%}}
+.tut-upload{grid-template-columns:1fr}
+.tut-plate{
+  position:absolute;width:44px;height:54px;border-radius:9px;background:#1c1c22;
+  border:1px solid rgba(255,255,255,.1)
+}
+.tut-plate:nth-child(1){transform:translate(-16px,-6px) rotate(-9deg)}
+.tut-plate:nth-child(2){transform:translate(0,0) rotate(2deg)}
+.tut-plate:nth-child(3){transform:translate(16px,6px) rotate(11deg)}
+.tut-plus{position:relative;font-size:30px;color:#c3b6ff;text-shadow:0 4px 18px rgba(118,95,255,.5)}
+.tut-refine{position:relative}
+.tut-subject{width:52px;height:66px;border-radius:12px;background:linear-gradient(160deg,#3b3358,#241f38);border:1px solid rgba(255,255,255,.1)}
+.tut-target{
+  position:absolute;right:20px;bottom:24px;width:30px;height:30px;border-radius:50%;
+  border:1.5px solid rgba(178,164,255,.95);background:radial-gradient(circle,rgba(124,102,255,.3),transparent 70%);
+  animation:tutTarget 1.8s ease-in-out infinite
+}
+@keyframes tutTarget{0%,100%{transform:scale(.86);opacity:.75}50%{transform:scale(1.06);opacity:1}}
+.tut-arrow{position:absolute;bottom:8px;right:12px;font-size:20px;color:#c3b6ff;animation:tutArrow 1.5s ease-in-out infinite}
+@keyframes tutArrow{0%,100%{transform:translateY(-3px)}50%{transform:translateY(3px)}}
+.tut-zip-body{
+  display:grid;place-items:center;width:62px;height:62px;border-radius:16px;font-size:13px;font-weight:800;
+  color:#cabfff;background:linear-gradient(160deg,#2a2440,#1b1826);border:1px solid rgba(150,135,255,.28)
+}
+@media (prefers-reduced-motion:reduce){
+  .tut-marquee,.tut-pointer,.tut-sweep,.tut-target,.tut-arrow,.assist-target.pulse{animation:none}
 }

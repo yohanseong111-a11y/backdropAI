@@ -208,9 +208,8 @@ input[type="checkbox"] { accent-color: #846fff; transform: scale(1.15); }
 .status.done { background:rgba(31,112,73,.88); }
 .status.failed { background:rgba(135,43,43,.9); }
 .status.processing { background:rgba(77,63,181,.9); }
-.photo-meta { display:flex; align-items:center; justify-content:space-between; padding:10px 11px; gap:8px; }
-.photo-meta span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#aaaab2; font-size:11px; }
 .remove-one { width:27px; height:27px; padding:0; border-radius:8px; background:#232329; color:#aaaab2; font-size:17px; }
+.remove-one:hover { background:#33333b; color:#f2f2f4; }
 
 .toast {
   position:fixed;
@@ -254,14 +253,6 @@ input[type="checkbox"] { accent-color: #846fff; transform: scale(1.15); }
 .brand-wrap{display:flex;align-items:center;gap:12px}
 .brand-logo{width:42px;height:42px;border-radius:12px;display:block;object-fit:cover;box-shadow:0 0 22px rgba(128,90,255,.18)}
 .secondary-download{margin-bottom:8px}
-@media (min-width:900px){
-  .controls,.gallery-shell{
-    max-height:calc(100vh - 120px);
-    overflow-y:auto;
-    overscroll-behavior-y:auto;
-    scrollbar-gutter:stable;
-  }
-}
 
 
 .single-mode-badge{font-weight:700;color:#c8b9ff;background:rgba(126,91,255,.10);border:1px solid rgba(126,91,255,.25);padding:8px 10px;border-radius:10px}
@@ -281,24 +272,14 @@ html,body{
   overflow:visible;
 }
 
+/* Below the two-column breakpoint the page is the only scroller. Nesting a
+   scrollable controls panel inside a scrollable page is what made phone
+   scrolling feel like it was fighting back. */
 .controls,
 .gallery-shell{
-  overflow-y:auto !important;
-  overflow-x:hidden;
+  overflow:visible;
+  max-height:none;
   -webkit-overflow-scrolling:touch;
-  overscroll-behavior-y:auto;
-  touch-action:pan-y pinch-zoom;
-  scrollbar-gutter:stable;
-}
-
-/* Keep each editing column independently scrollable while the page itself can still
-   continue scrolling once either inner area reaches its top/bottom. */
-.controls{
-  max-height:calc(100vh - 24px);
-}
-
-.gallery-shell{
-  max-height:calc(100vh - 24px);
 }
 
 /* Never block browser pinch zoom on cards or previews. */
