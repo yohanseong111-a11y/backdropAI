@@ -7,11 +7,10 @@
     "dev": "vite",
     "build": "node scripts/prepare-models.mjs && vite build",
     "preview": "vite preview",
-    "lint": "node --check src/main.js && node --check src/removal-worker.js && node --check src/mask-safety.js",
+    "lint": "node --check src/main.js && node --check src/removal-worker.js && node --check src/mask-safety.js && node --check src/mask-refine.js && node --check src/assist.js",
     "test": "node --test"
   },
   "dependencies": {
-    "@imgly/background-removal": "1.7.0",
     "jszip": "3.10.1",
     "onnxruntime-web": "1.21.0",
     "@huggingface/transformers": "3.7.1"

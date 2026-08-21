@@ -10,18 +10,19 @@ env.allowRemoteModels=true;
 env.useBrowserCache=true;
 env.localModelPath=new URL("../models/",self.location.href).href;
 
-const PRIMARY_MODEL_ID="onnx-community/BiRefNet_lite";
 const FALLBACK_MODEL_ID="briaai/RMBG-1.4";
-// Phones use 320px inference to reduce compute and memory by about 61% versus
-// 512px. Only the alpha mask is smaller; main.js applies it to original RGB at
-// the original dimensions with high-quality interpolation.
+// RMBG-1.4 was trained at 1024px. Small inference squares are much cheaper but
+// they blur away thin gaps (between two legs, between an arm and the body) and
+// leave a halo of original background, so only the phone-friendly profiles drop
+// below 512. main.js refines the mask against the real photo afterwards, which
+// recovers most of the remaining detail without extra inference cost.
 const WORKER_UA=self.navigator?.userAgent||"";
 const IS_MOBILE=self.navigator?.userAgentData?.mobile===true||
   /iPhone|iPad|iPod|Android/i.test(WORKER_UA)||
   (/Macintosh/i.test(WORKER_UA)&&Number(self.navigator?.maxTouchPoints||0)>1);
-const inferenceSizeFor=profile=>profile==="fast"?256:profile==="best"?512:(IS_MOBILE?320:512);
+const inferenceSizeFor=profile=>profile==="fast"?320:profile==="best"?(IS_MOBILE?768:1024):(IS_MOBILE?512:768);
 const processorConfig=size=>({do_normalize:true,do_pad:false,do_rescale:true,do_resize:true,image_mean:[0.5,0.5,0.5],image_std:[1,1,1],resample:2,rescale_factor:1/255,size:{width:size,height:size}});
-let primaryPromise=null,primaryProcessorPromise=null,fallbackPromise=null;
+let fallbackPromise=null;
 const fallbackProcessorPromises=new Map();
 let fallbackDevice="wasm",webGPUDisabled=false;
 
@@ -35,15 +36,6 @@ function canUseStableWebGPU(){
 }
 
 const progressFor=(id,engine)=>info=>{if(Number.isFinite(info?.progress))self.postMessage({type:"progress",id,stage:"load",engine,progress:Number(info.progress)});};
-
-async function loadPrimary(id){
-  // Use the upstream model's documented Transformers.js configuration. The
-  // fp16 graph currently fails in some ORT WebGPU/WASM builds at inference.
-  primaryPromise??=AutoModel.from_pretrained(PRIMARY_MODEL_ID,{dtype:"fp32",progress_callback:progressFor(id,"BiRefNet")});
-  primaryProcessorPromise??=AutoProcessor.from_pretrained(PRIMARY_MODEL_ID);
-  try{return await Promise.all([primaryPromise,primaryProcessorPromise]);}
-  catch(error){primaryPromise=null;primaryProcessorPromise=null;throw error;}
-}
 
 async function loadFallback(id,profile="auto"){
   // Prefer GPU inference where ONNX WebGPU is available. The quantized WASM
@@ -70,11 +62,10 @@ async function loadFallback(id,profile="auto"){
   }
 }
 
-async function tensorToAlpha(tensor,applySigmoid=false){
-  const converted=applySigmoid?tensor.sigmoid():tensor;
+async function tensorToAlpha(tensor){
   // Keep the native inference mask compact. Expanding it to a 12–48 MP phone
   // image here previously duplicated large buffers and could reload the tab.
-  const mask=await RawImage.fromTensor(converted.mul(255).to("uint8"));
+  const mask=await RawImage.fromTensor(tensor.mul(255).to("uint8"));
   const pixels=mask.width*mask.height,src=mask.data instanceof Uint8Array?mask.data:new Uint8Array(mask.data);
   if(src.length===pixels)return {alpha:new Uint8Array(src),width:mask.width,height:mask.height};
   const channels=Math.max(1,Math.floor(src.length/pixels)),alpha=new Uint8Array(pixels);
@@ -88,17 +79,8 @@ async function existingAlpha(image){
   return transparent>alpha.length*0.001?alpha:null;
 }
 
-async function getPrimaryMask(id,image){
-  const [model,processor]=await loadPrimary(id);
-  self.postMessage({type:"progress",id,stage:"remove",message:"Creating precision matte…"});
-  const processed=await processor(image),input=processed.pixel_values||processed.input_image;
-  const result=await model({input_image:input}),tensor=result.output_image?.[0]||result.output?.[0];
-  if(!tensor)throw new Error("BiRefNet returned no matte.");
-  return tensorToAlpha(tensor,true);
-}
-
 async function getFallbackMask(id,image,profile){
-  self.postMessage({type:"progress",id,stage:"fallback",message:"Using compatibility model…"});
+  self.postMessage({type:"progress",id,stage:"remove",message:"Removing background…"});
   let [model,processor]=await loadFallback(id,profile),{pixel_values}=await processor(image),result;
   try{result=await model({input:pixel_values});}
   catch(error){
@@ -110,7 +92,7 @@ async function getFallbackMask(id,image,profile){
   }
   const {output}=result;
   if(!output?.[0])throw new Error("RMBG returned no matte.");
-  return tensorToAlpha(output[0],false);
+  return tensorToAlpha(output[0]);
 }
 
 function diagnostics(alpha,w,h){
