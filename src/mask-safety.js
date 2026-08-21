@@ -25,28 +25,9 @@ export function chooseSafeCleanup(protectedAlpha,cleanedAlpha,width,height){
     : new Uint8Array(protectedAlpha);
 }
 
+// Hard containment for AI Assist: nothing outside the visible target may change.
 export function insideBrushFootprint(x,y,cx,cy,radius){
   return (x-cx)**2+(y-cy)**2<=radius**2;
-}
-
-export function isHighConfidenceResidual(r,g,b){
-  const max=Math.max(r,g,b),min=Math.min(r,g,b);
-  const grass=g>r*1.12&&g>b*1.06&&g-r>14&&g-b>8;
-  const neutralBright=max>174&&max-min<58;
-  return grass||neutralBright;
-}
-
-export function isNeutralBorderResidual(r,g,b){
-  const max=Math.max(r,g,b),min=Math.min(r,g,b);
-  // Mid/light neutral floor or wall only. Dark navy/grey garment panels must
-  // never enter the border-removal candidate, even if another model misses them.
-  return max>125&&max-min<48;
-}
-
-export function isGreenFringePixel(r,g,b){
-  // Includes grass mixed with a dark antialiased garment edge. Cyan fabric has
-  // substantially more blue than green, while navy has too little green excess.
-  return g>r*1.07&&g-r>10&&g-b>-12;
 }
 
 export function recoverForegroundChannel(composite,background,alpha){
