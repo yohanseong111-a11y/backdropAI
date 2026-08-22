@@ -1985,7 +1985,15 @@ $("#zoomOutEditor").onclick=()=>setEditorZoom((state.editor?.viewScale||1)/1.25)
 let installPrompt=null;window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();installPrompt=e;$("#installBtn").classList.remove("hidden");});$("#installBtn").onclick=async()=>{if(!installPrompt){toast("On iPhone: Safari → Share → Add to Home Screen");return;}installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;$("#installBtn").classList.add("hidden");};
 window.addEventListener("resize",()=>{if(state.editor)requestAnimationFrame(fitEditorCanvasToStage);});
 if("serviceWorker" in navigator)window.addEventListener("load",()=>{
-  navigator.serviceWorker.register("./sw.js?v=65").then(reg=>reg.update()).catch(console.warn);
+  // If a worker already controls this tab, a newly claimed worker means a new
+  // app version. Reload so the merged JS actually replaces what is in memory —
+  // otherwise a GitHub Pages deploy can still look like yesterday's cutout app.
+  if(navigator.serviceWorker.controller){
+    navigator.serviceWorker.addEventListener("controllerchange",()=>{
+      window.location.reload();
+    });
+  }
+  navigator.serviceWorker.register("./sw.js?v=66").then(reg=>reg.update()).catch(console.warn);
 });
 
 
