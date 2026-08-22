@@ -1195,7 +1195,7 @@ async function renderAllPreviews(){
       await drawComposite(buffer,item,{width:Math.round(w),height:Math.round(w*ratio)});
       if(generation!==previewRenderGeneration||!canvas.isConnected)return;
       if(canvas.width!==buffer.width)canvas.width=buffer.width;if(canvas.height!==buffer.height)canvas.height=buffer.height;
-      const ctx=canvas.getContext("2d");ctx.clearRect(0,0,canvas.width,canvas.height);ctx.drawImage(buffer,0,0);
+      const ctx=canvas.getContext("2d",{willReadFrequently:true});ctx.clearRect(0,0,canvas.width,canvas.height);ctx.drawImage(buffer,0,0);
     }catch(error){console.warn("Preview render skipped",error);}
   }));
 }
@@ -1226,7 +1226,7 @@ async function openEditor(id){
   const oc=document.createElement("canvas");oc.width=canvas.width;oc.height=canvas.height;const octx=oc.getContext("2d",{willReadFrequently:true});octx.drawImage(original,0,0,canvas.width,canvas.height);
   const ghost=$("#editorGhost");
   ghost.width=canvas.width;ghost.height=canvas.height;
-  ghost.getContext("2d").drawImage(original,0,0,canvas.width,canvas.height);
+  ghost.getContext("2d",{willReadFrequently:true}).drawImage(original,0,0,canvas.width,canvas.height);
   const veil=$("#editorVeil");
   veil.width=canvas.width;veil.height=canvas.height;
   state.editor={item,original,canvas,ghost,veil,ctx,originalData:octx.getImageData(0,0,canvas.width,canvas.height),mode:"erase",assisted:true,history:[ctx.getImageData(0,0,canvas.width,canvas.height)],redo:[],drawing:false,last:null,viewScale:1,fitScale:1,panX:0,panY:0,pointers:new Map(),pinch:null};
@@ -1257,7 +1257,7 @@ function updateEditorTransform(){
 function paintEditorRemovedVeil(){
   const e=state.editor;if(!e?.veil)return;
   const w=e.canvas.width,h=e.canvas.height;
-  const vctx=e.veil.getContext("2d");
+  const vctx=e.veil.getContext("2d",{willReadFrequently:true});
   vctx.clearRect(0,0,w,h);
   const size=Math.max(10,Math.round(Math.min(w,h)/42));
   for(let y=0;y<h;y+=size){
@@ -1911,7 +1911,7 @@ $("#zoomOutEditor").onclick=()=>setEditorZoom((state.editor?.viewScale||1)/1.25)
 let installPrompt=null;window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();installPrompt=e;$("#installBtn").classList.remove("hidden");});$("#installBtn").onclick=async()=>{if(!installPrompt){toast("On iPhone: Safari → Share → Add to Home Screen");return;}installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;$("#installBtn").classList.add("hidden");};
 window.addEventListener("resize",()=>{if(state.editor)requestAnimationFrame(fitEditorCanvasToStage);});
 if("serviceWorker" in navigator)window.addEventListener("load",()=>{
-  navigator.serviceWorker.register("./sw.js?v=63").then(reg=>reg.update()).catch(console.warn);
+  navigator.serviceWorker.register("./sw.js?v=64").then(reg=>reg.update()).catch(console.warn);
 });
 
 

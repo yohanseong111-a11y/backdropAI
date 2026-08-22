@@ -10,7 +10,8 @@
     "lint": "node --check src/main.js && node --check src/removal-worker.js && node --check src/refine-worker.js && node --check src/mask-safety.js && node --check src/mask-refine.js && node --check src/mask-recover.js && node --check src/assist.js",
     "test": "node --test",
     "verify:cutout": "node scripts/verify-cutout.mjs",
-    "verify:real-jacket": "node scripts/verify-real-jacket.mjs"
+    "verify:real-jacket": "node scripts/verify-real-jacket.mjs",
+    "verify:app": "node scripts/verify-app.mjs"
   },
   "dependencies": {
     "@huggingface/transformers": "3.7.1",
