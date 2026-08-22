@@ -1911,7 +1911,7 @@ $("#zoomOutEditor").onclick=()=>setEditorZoom((state.editor?.viewScale||1)/1.25)
 let installPrompt=null;window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();installPrompt=e;$("#installBtn").classList.remove("hidden");});$("#installBtn").onclick=async()=>{if(!installPrompt){toast("On iPhone: Safari → Share → Add to Home Screen");return;}installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;$("#installBtn").classList.add("hidden");};
 window.addEventListener("resize",()=>{if(state.editor)requestAnimationFrame(fitEditorCanvasToStage);});
 if("serviceWorker" in navigator)window.addEventListener("load",()=>{
-  navigator.serviceWorker.register("./sw.js?v=60").then(reg=>reg.update()).catch(console.warn);
+  navigator.serviceWorker.register("./sw.js?v=61").then(reg=>reg.update()).catch(console.warn);
 });
 
 
