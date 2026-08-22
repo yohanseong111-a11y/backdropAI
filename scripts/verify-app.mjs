@@ -114,6 +114,17 @@ const cutout=await page.evaluate(async(originalBytes,classifySrc)=>{
 await page.click(".edit-cutout");
 await page.waitForSelector("#cutoutModal:not(.hidden)");
 await page.waitForSelector("#editorCanvas");
+
+const loupe=await page.evaluate(()=>{
+  const canvas=document.querySelector("#editorCanvas");
+  const rect=canvas.getBoundingClientRect();
+  const clientX=rect.left+rect.width*0.5;
+  const clientY=rect.top+rect.height*0.5;
+  canvas.dispatchEvent(new PointerEvent("pointermove",{bubbles:true,cancelable:true,pointerId:1,clientX,clientY}));
+  const el=document.querySelector("#editorLoupe");
+  return {visible:!!el&&!el.hidden,hasCanvas:!!document.querySelector("#loupeCanvas")};
+});
+
 await page.click("#restoreTool");
 
 const clickEditor=async(fx,fy)=>{
@@ -152,7 +163,23 @@ const afterRestoreLeft=await scoreEditor({x0:0,y0:0,x1:0.12,y1:0.10});
 const afterRestoreRight=await scoreEditor({x0:0.88,y0:0,x1:1,y1:0.10});
 
 await page.click("#eraseTool");
-await clickEditor(0.50,0.55);
+const liveErase=await page.evaluate(()=>{
+  const canvas=document.querySelector("#editorCanvas");
+  const rect=canvas.getBoundingClientRect();
+  const ctx=canvas.getContext("2d",{willReadFrequently:true});
+  const {width,height}=canvas;
+  const before=ctx.getImageData(0,0,width,height).data;
+  const clientX=rect.left+rect.width*0.50;
+  const clientY=rect.top+rect.height*0.55;
+  const opts={bubbles:true,cancelable:true,pointerId:1,clientX,clientY,button:0};
+  canvas.dispatchEvent(new PointerEvent("pointerdown",opts));
+  canvas.dispatchEvent(new PointerEvent("pointermove",{...opts,clientX:clientX+8,clientY:clientY+8}));
+  const mid=ctx.getImageData(0,0,width,height).data;
+  let changed=0;
+  for(let i=3;i<before.length;i+=4) if(mid[i]<before[i]) changed++;
+  canvas.dispatchEvent(new PointerEvent("pointerup",opts));
+  return {changed,ok:changed>80};
+});
 const afterEraseLeft=await scoreEditor({x0:0,y0:0,x1:0.12,y1:0.10});
 const afterEraseRight=await scoreEditor({x0:0.88,y0:0,x1:1,y1:0.10});
 const afterEraseBody=await scoreEditor({x0:0.40,y0:0.48,x1:0.60,y1:0.68});
@@ -165,10 +192,12 @@ const assist={
   beforeLeft,beforeRight,afterRestoreLeft,afterRestoreRight,afterEraseLeft,afterEraseRight,afterEraseBody,
   restoreOnlyOne:afterRestoreLeft>0.45&&afterRestoreRight<0.2,
   eraseLeavesOtherGreen:afterEraseRight<0.2&&afterEraseLeft>afterRestoreLeft-0.15,
-  eraseHitsJacket:afterEraseBody<0.55
+  eraseHitsJacket:afterEraseBody<0.55,
+  liveErase:liveErase.ok,
+  loupe:loupe.visible&&loupe.hasCanvas
 };
-const ok=status.includes("done")&&cutout.ok&&assist.restoreOnlyOne&&assist.eraseLeavesOtherGreen&&assist.eraseHitsJacket&&hardErrors.length===0;
-const result={ok,status,cutout,assist,hardErrors,logs:logs.slice(-24)};
+const ok=status.includes("done")&&cutout.ok&&assist.restoreOnlyOne&&assist.eraseLeavesOtherGreen&&assist.eraseHitsJacket&&assist.liveErase&&assist.loupe&&hardErrors.length===0;
+const result={ok,status,cutout,assist,loupe,liveErase,hardErrors,logs:logs.slice(-24)};
 console.log(JSON.stringify(result,null,2));
 if(!ok){
   console.error("APP_VERIFY_FAILED");

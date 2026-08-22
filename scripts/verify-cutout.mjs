@@ -90,23 +90,20 @@ await page.click("#removeAllBtn");
 await page.waitForSelector(".preview-wrap.scanning");
 
 const scan=await page.evaluate(async()=>{
-  const track=document.querySelector(".scan-beam");
-  if(!track)return {ok:false,reason:"no scan-beam"};
-  const read=()=>{
-    const style=getComputedStyle(track);
-    const matrix=new DOMMatrixReadOnly(style.transform);
-    return {y:matrix.m42,height:track.getBoundingClientRect().height};
-  };
+  const bar=document.querySelector(".scan-bar");
+  const overlay=document.querySelector(".scan-overlay");
+  if(!bar||!overlay)return {ok:false,reason:"no scan-bar"};
+  const read=()=>bar.getBoundingClientRect().top-overlay.getBoundingClientRect().top;
   const samples=[];
-  for(let i=0;i<6;i++){
-    samples.push(read().y);
-    await new Promise(resolve=>setTimeout(resolve,280));
+  for(let i=0;i<8;i++){
+    samples.push(read());
+    await new Promise(resolve=>setTimeout(resolve,180));
   }
-  const height=read().height;
+  const height=overlay.getBoundingClientRect().height;
   let down=false,up=false;
   for(let i=1;i<samples.length;i++){
-    if(samples[i]-samples[i-1]>10)down=true;
-    if(samples[i-1]-samples[i]>10)up=true;
+    if(samples[i]-samples[i-1]>8)down=true;
+    if(samples[i-1]-samples[i]>8)up=true;
   }
   const travel=Math.max(...samples)-Math.min(...samples);
   return {ok:down&&up&&travel>height*0.25,down,up,travel,samples,height};

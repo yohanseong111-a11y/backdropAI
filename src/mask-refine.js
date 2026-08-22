@@ -12,7 +12,7 @@
  * deleting it, and the orchestrator rolls a stage back when the subject shrinks.
  */
 
-import { recoverDeletedSubject, restoreSubjectColouredGaps, restoreNonBackgroundPanels, cornerBackgroundSeed, looksLikeBackdropColour } from "./mask-recover.js";
+import { recoverDeletedSubject, restoreSubjectColouredGaps, restoreNonBackgroundPanels, cornerBackgroundSeed, looksLikeBackdropColour, dropLeftoverBackdropIslands } from "./mask-recover.js";
 
 const UNKNOWN_DISTANCE = 999;
 
@@ -1013,6 +1013,9 @@ export async function refineForegroundAlpha({ rgb, alpha, width, height, options
   report.filled += afterHoles.filled;
 
   current = removeTinyForegroundIslands(current, width, height);
+  const leftoverDrop = dropLeftoverBackdropIslands(rgb, current, width, height, { seed: backdropSeed });
+  current = leftoverDrop.alpha;
+  report.dropped = leftoverDrop.removed;
   await breathe();
 
   const matted = colourRatioEdgeRefine(current, distances, width, height, options.edge);
@@ -1027,6 +1030,9 @@ export async function refineForegroundAlpha({ rgb, alpha, width, height, options
   const lastPanels = restoreNonBackgroundPanels(rgb, current, width, height);
   current = lastPanels.alpha;
   report.recoloured += lastPanels.restored;
+  const lastLeftovers = dropLeftoverBackdropIslands(rgb, current, width, height, { seed: backdropSeed });
+  current = lastLeftovers.alpha;
+  report.dropped = (report.dropped || 0) + lastLeftovers.removed;
   await breathe();
 
   if (

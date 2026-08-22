@@ -41,9 +41,11 @@ async function loadFallback(id,profile="auto"){
   // Prefer GPU inference where ONNX WebGPU is available. The quantized WASM
   // graph remains the reliable low-memory fallback for Safari and mobile.
   fallbackPromise??=(async()=>{
+    // Always load the quantized graph. The fp16 file is twice as large and
+    // made the first visit sit on "Downloading AI" for a long time.
     if(!webGPUDisabled&&canUseStableWebGPU()){
       try{
-        const model=await AutoModel.from_pretrained(FALLBACK_MODEL_ID,{config:{model_type:"custom"},device:"webgpu",dtype:"fp16",progress_callback:progressFor(id,"RMBG")});
+        const model=await AutoModel.from_pretrained(FALLBACK_MODEL_ID,{config:{model_type:"custom"},device:"webgpu",dtype:"q8",progress_callback:progressFor(id,"RMBG")});
         fallbackDevice="webgpu";return model;
       }catch(error){
         console.warn("WebGPU model unavailable; using quantized WASM",error);

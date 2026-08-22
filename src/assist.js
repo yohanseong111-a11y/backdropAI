@@ -7,7 +7,7 @@
  * corners stay two patches. Erasing the jacket must not take the carpet.
  */
 
-import { isGreenDominant, looksLikeBrightNeutral, looksLikeSecondaryGarment } from "./mask-recover.js";
+import { isGreenDominant, looksLikeBrightNeutral, looksLikeGround, looksLikeSecondaryGarment } from "./mask-recover.js";
 
 function colourDistance(r, g, b, r2, g2, b2) {
   return Math.hypot(r - r2, g - g2, b - b2);
@@ -15,14 +15,149 @@ function colourDistance(r, g, b, r2, g2, b2) {
 
 export function colourFamily(r, g, b) {
   if (isGreenDominant(r, g, b) || (g - Math.max(r, b) > 16 && g >= 50)) return "green";
-  if (looksLikeBrightNeutral(r, g, b)) return "white";
+  if (looksLikeBrightNeutral(r, g, b) || looksLikeGround(r, g, b)) return "white";
   if (b > r + 30 && g > r + 8 && b > 80) return "cyan";
   if (looksLikeSecondaryGarment(r, g, b)) return "navy";
   return "other";
 }
 
 function isBackdropFamily(family) {
-  return family === "green" || family === "white";
+  return family === "green" || family === "white" || family === "other";
+}
+
+function sameAssistFamily(pixelFamily, seedFamily, mode) {
+  if (pixelFamily === seedFamily) return true;
+  // Leftover ground is mixed tan/grey/green. Erasing that section should
+  // take the crumbs, not stop at every shade change — but never the jacket.
+  if (mode === "erase" && isBackdropFamily(seedFamily) && isBackdropFamily(pixelFamily)) return true;
+  return false;
+}
+
+function fillInteriorHoles(inChunk, alpha, width, height, mode) {
+  const total = width * height;
+  const outside = new Uint8Array(total);
+  const queue = new Int32Array(total);
+  let head = 0;
+  let tail = 0;
+  const add = index => {
+    if (index < 0 || index >= total || outside[index] || inChunk[index]) return;
+    outside[index] = 1;
+    queue[tail++] = index;
+  };
+  for (let x = 0; x < width; x++) {
+    add(x);
+    add((height - 1) * width + x);
+  }
+  for (let y = 0; y < height; y++) {
+    add(y * width);
+    add(y * width + width - 1);
+  }
+  while (head < tail) {
+    const i = queue[head++];
+    const x = i % width;
+    if (x > 0) add(i - 1);
+    if (x < width - 1) add(i + 1);
+    if (i >= width) add(i - width);
+    if (i < total - width) add(i + width);
+  }
+  for (let i = 0; i < total; i++) {
+    if (!outside[i] && !inChunk[i] && canChange(alpha, i, mode)) inChunk[i] = 1;
+  }
+}
+
+function absorbCrumbs(inChunk, rgb, alpha, width, height, seedFamily, mode) {
+  const total = width * height;
+  const extra = new Uint8Array(total);
+  for (let pass = 0; pass < 7; pass++) {
+    extra.fill(0);
+    let added = 0;
+    for (let i = 0; i < total; i++) {
+      if (!inChunk[i]) continue;
+      const x = i % width;
+      const neighbors = [i - 1, i + 1, i - width, i + width];
+      for (const n of neighbors) {
+        if (n < 0 || n >= total || inChunk[n] || extra[n]) continue;
+        if ((n % width === 0 && x === width - 1) || (x === 0 && n % width === width - 1)) continue;
+        if (!canChange(alpha, n, mode)) continue;
+        const o = n * 4;
+        if (!sameAssistFamily(colourFamily(rgb[o], rgb[o + 1], rgb[o + 2]), seedFamily, mode)) continue;
+        extra[n] = 1;
+        added++;
+      }
+    }
+    if (!added) break;
+    for (let i = 0; i < total; i++) if (extra[i]) inChunk[i] = 1;
+  }
+  absorbNearbyIslands(inChunk, rgb, alpha, width, height, seedFamily, mode);
+  fillInteriorHoles(inChunk, alpha, width, height, mode);
+}
+
+function absorbNearbyIslands(inChunk, rgb, alpha, width, height, seedFamily, mode) {
+  const total = width * height;
+  const maxGap = 12;
+  const maxIsland = Math.max(28, Math.round(total * 0.004));
+  const near = new Uint8Array(total);
+  const queue = new Int32Array(total);
+  const dist = new Int16Array(total).fill(-1);
+  let head = 0;
+  let tail = 0;
+  for (let i = 0; i < total; i++) {
+    if (!inChunk[i]) continue;
+    dist[i] = 0;
+    queue[tail++] = i;
+  }
+  while (head < tail) {
+    const i = queue[head++];
+    const d = dist[i];
+    if (d >= maxGap) continue;
+    near[i] = 1;
+    const x = i % width;
+    const step = index => {
+      if (index < 0 || index >= total || dist[index] >= 0) return;
+      dist[index] = d + 1;
+      queue[tail++] = index;
+    };
+    if (x > 0) step(i - 1);
+    if (x < width - 1) step(i + 1);
+    if (i >= width) step(i - width);
+    if (i < total - width) step(i + width);
+  }
+
+  const visited = new Uint8Array(total);
+  for (let start = 0; start < total; start++) {
+    if (visited[start] || inChunk[start] || !canChange(alpha, start, mode)) continue;
+    const so = start * 4;
+    if (!sameAssistFamily(colourFamily(rgb[so], rgb[so + 1], rgb[so + 2]), seedFamily, mode)) {
+      visited[start] = 1;
+      continue;
+    }
+    let qh = 0;
+    let qt = 0;
+    const pixels = [];
+    queue[qt++] = start;
+    visited[start] = 1;
+    let touchesNear = near[start] === 1;
+    while (qh < qt) {
+      const i = queue[qh++];
+      pixels.push(i);
+      if (near[i]) touchesNear = true;
+      const x = i % width;
+      const add = index => {
+        if (index < 0 || index >= total || visited[index] || inChunk[index]) return;
+        if (!canChange(alpha, index, mode)) return;
+        const o = index * 4;
+        if (!sameAssistFamily(colourFamily(rgb[o], rgb[o + 1], rgb[o + 2]), seedFamily, mode)) return;
+        visited[index] = 1;
+        queue[qt++] = index;
+      };
+      if (x > 0) add(i - 1);
+      if (x < width - 1) add(i + 1);
+      if (i >= width) add(i - width);
+      if (i < total - width) add(i + width);
+    }
+    if (!touchesNear || pixels.length > maxIsland) continue;
+    for (const i of pixels) inChunk[i] = 1;
+  }
 }
 
 function sampleSeedColour(rgb, width, height, cx, cy, radius, options) {
@@ -102,7 +237,7 @@ export function computeAssistSelection({ rgb, alpha, width, height, x, y, radius
       const i = py * width + px;
       if (!canChange(alpha, i, mode)) continue;
       const o = i * 4;
-      if (colourFamily(rgb[o], rgb[o + 1], rgb[o + 2]) !== family) continue;
+      if (!sameAssistFamily(colourFamily(rgb[o], rgb[o + 1], rgb[o + 2]), family, mode)) continue;
       if (inChunk[i]) continue;
       inChunk[i] = 1;
       queue[tail++] = i;
@@ -111,7 +246,7 @@ export function computeAssistSelection({ rgb, alpha, width, height, x, y, radius
   if (!tail) return null;
 
   const maxReach = isBackdropFamily(family)
-    ? Math.max(40, Math.round(Math.min(width, height) * (options.backdropReach ?? 0.28)))
+    ? Math.max(56, Math.round(Math.min(width, height) * (options.backdropReach ?? 0.42)))
     : Infinity;
 
   while (head < tail) {
@@ -123,7 +258,7 @@ export function computeAssistSelection({ rgb, alpha, width, height, x, y, radius
       if (index < 0 || index >= total || inChunk[index]) return;
       if (!canChange(alpha, index, mode)) return;
       const o = index * 4;
-      if (colourFamily(rgb[o], rgb[o + 1], rgb[o + 2]) !== family) return;
+      if (!sameAssistFamily(colourFamily(rgb[o], rgb[o + 1], rgb[o + 2]), family, mode)) return;
       const toNeighbor = colourDistance(rgb[o], rgb[o + 1], rgb[o + 2], rgb[fo], rgb[fo + 1], rgb[fo + 2]);
       if (toNeighbor > stepLimit) return;
       if (maxReach !== Infinity) {
@@ -139,6 +274,8 @@ export function computeAssistSelection({ rgb, alpha, width, height, x, y, radius
     if (cy > 0) consider(i - width);
     if (cy < height - 1) consider(i + width);
   }
+
+  absorbCrumbs(inChunk, rgb, alpha, width, height, family, mode);
 
   let minX = width, maxX = -1, minY = height, maxY = -1;
   let accepted = 0;

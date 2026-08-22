@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { computeAssistSelection, applyAssistSelection, colourFamily } from "../src/assist.js";
 import { SCENE, buildScene, buildCoarseAlpha, isSubject } from "./fixtures/scene.js";
-import { buildTwoToneJacket, buildTwoToneCoarseAlpha, buildShadedNavyCollar } from "./fixtures/jacket.js";
+import { buildTwoToneJacket, buildTwoToneCoarseAlpha, buildShadedNavyCollar, buildJacketWithTanLeftovers, buildTanLeftoverAlpha } from "./fixtures/jacket.js";
 import { regionStats } from "./fixtures/scene.js";
 
 function editorState() {
@@ -297,6 +297,37 @@ test("erase tap on the jacket does not take the leftover green with it", () => {
   const jacket = (Math.round((body.y0 + body.y1) / 2) * width + Math.round((body.x0 + body.x1) / 2)) * 4 + 3;
   assert.ok(pixels[jacket] < 40, "the tapped jacket patch must go");
   assert.ok(pixels[(8 * width + 8) * 4 + 3] > 200, "green carpet must stay when the jacket is erased");
+});
+
+test("erase tap on leftover tan takes the whole section including crumbs", () => {
+  const scene = buildJacketWithTanLeftovers();
+  const { rgb, width, height, left, right, crumbs, body } = scene;
+  const alpha = buildTanLeftoverAlpha(scene);
+  const pixels = new Uint8ClampedArray(rgb);
+  for (let i = 0; i < alpha.length; i++) pixels[i * 4 + 3] = alpha[i];
+
+  const selection = computeAssistSelection({
+    rgb,
+    alpha,
+    width,
+    height,
+    x: Math.round((left.x0 + left.x1) / 2),
+    y: Math.round((left.y0 + left.y1) / 2),
+    radius: 10,
+    mode: "erase"
+  });
+  assert.ok(selection, "the leftover tan section must be selectable");
+  applyAssistSelection(pixels, rgb, width, selection, "erase");
+
+  const leftGone = regionStats(Uint8Array.from({ length: width * height }, (_, i) => pixels[i * 4 + 3]), width, left);
+  assert.ok(leftGone.share < 0.08, `the tapped tan section must go, leftover ${leftGone.share}`);
+  for (const crumb of crumbs) {
+    assert.ok(pixels[(crumb.y * width + crumb.x) * 4 + 3] < 40, `crumb at ${crumb.x},${crumb.y} must go with the section`);
+  }
+  const rightKept = regionStats(Uint8Array.from({ length: width * height }, (_, i) => pixels[i * 4 + 3]), width, right);
+  assert.ok(rightKept.share > 0.85, "the far tan island is a different section");
+  const jacket = (Math.round((body.y0 + body.y1) / 2) * width + Math.round((body.x0 + body.x1) / 2)) * 4 + 3;
+  assert.ok(pixels[jacket] > 200, "the jacket must stay");
 });
 
 test("a target with nothing to change reports back instead of guessing", () => {

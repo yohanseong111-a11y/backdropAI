@@ -333,6 +333,53 @@ export function buildJacketOnGrassAndWhiteRug() {
   return { rgb, truth, width, height, body, collar, rug };
 }
 
+/**
+ * Live leftover case: the model kept the cyan/navy jacket AND isolated
+ * tan / grey ground islands around the hem and right sleeve.
+ */
+export function buildJacketWithTanLeftovers() {
+  const scene = buildTwoToneJacket();
+  const { rgb, truth, width, height } = scene;
+  const left = { x0: 4, x1: 22, y0: 150, y1: 188 };
+  const right = { x0: 136, x1: 156, y0: 70, y1: 150 };
+  const crumbs = [
+    { x: 24, y: 170 },
+    { x: 26, y: 174 },
+    { x: 8, y: 142 }
+  ];
+  const paintTan = (x, y) => {
+    const o = (y * width + x) * 4;
+    rgb[o] = 176;
+    rgb[o + 1] = 164;
+    rgb[o + 2] = 146;
+    truth[y * width + x] = 0;
+  };
+  for (let y = left.y0; y < left.y1; y++) {
+    for (let x = left.x0; x < left.x1; x++) paintTan(x, y);
+  }
+  for (let y = right.y0; y < right.y1; y++) {
+    for (let x = right.x0; x < right.x1; x++) paintTan(x, y);
+  }
+  for (const crumb of crumbs) paintTan(crumb.x, crumb.y);
+  return { ...scene, left, right, crumbs };
+}
+
+export function buildTanLeftoverAlpha(scene) {
+  const { width, height, body, left, right, crumbs } = scene;
+  const alpha = new Uint8Array(width * height);
+  for (let y = body.y0; y < body.y1; y++) {
+    for (let x = body.x0; x < body.x1; x++) alpha[y * width + x] = 255;
+  }
+  for (let y = left.y0; y < left.y1; y++) {
+    for (let x = left.x0; x < left.x1; x++) alpha[y * width + x] = 255;
+  }
+  for (let y = right.y0; y < right.y1; y++) {
+    for (let x = right.x0; x < right.x1; x++) alpha[y * width + x] = 255;
+  }
+  for (const crumb of crumbs) alpha[crumb.y * width + crumb.x] = 255;
+  return alpha;
+}
+
 export function buildTwoToneCoarseAlpha(scene) {
   const { width, height, body, collar } = scene;
   const alpha = new Uint8Array(width * height);
