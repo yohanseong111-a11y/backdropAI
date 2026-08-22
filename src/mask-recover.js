@@ -226,6 +226,7 @@ export function restoreSubjectColouredGaps(rgb, alpha, width, height, options = 
   const subjectLevel = options.subjectLevel ?? 220;
   const emptyLevel = options.emptyLevel ?? 80;
   const maxDistance = options.maxDistance ?? 62;
+  const neighborDistance = options.neighborDistance ?? 30;
   const minSeparation = options.minSeparation ?? 26;
   const seed = cornerBackgroundSeed(rgb, width, height);
   const foreground = opaqueClusters(
@@ -265,16 +266,31 @@ export function restoreSubjectColouredGaps(rgb, alpha, width, height, options = 
   }
   if (!tail) return { alpha: out, restored: 0 };
 
-  const consider = index => {
+  const consider = (index, from) => {
     if (index < 0 || index >= total || seen[index]) return;
     seen[index] = 1;
     if (alpha[index] > emptyLevel) return;
     const o = index * 4;
-    const toSubject = nearestDistance(foreground, rgb[o], rgb[o + 1], rgb[o + 2]);
-    if (toSubject > maxDistance) return;
-    if (seed && colourDistance([rgb[o], rgb[o + 1], rgb[o + 2]], seed.colour) < 36) return;
-    if (hasBackground) {
-      const toBackground = nearestDistance(background, rgb[o], rgb[o + 1], rgb[o + 2]);
+    const pixel = [rgb[o], rgb[o + 1], rgb[o + 2]];
+    const toSubject = nearestDistance(foreground, pixel[0], pixel[1], pixel[2]);
+    const fo = from * 4;
+    const fromPixel = [rgb[fo], rgb[fo + 1], rgb[fo + 2]];
+    const toNeighbor = colourDistance(pixel, fromPixel);
+    // A shadowed sleeve can be farther than `maxDistance` from the highlight
+    // the model kept. Walk through those shades via the neighbour we grew from,
+    // otherwise the dark half of a jacket stays a hole.
+    if (toSubject > maxDistance) {
+      if (toNeighbor > neighborDistance) return;
+      const parentRestored = alpha[from] <= emptyLevel && out[from] >= 220;
+      const parentSubject = nearestDistance(foreground, fromPixel[0], fromPixel[1], fromPixel[2]) <= maxDistance;
+      if (!parentRestored && !parentSubject) return;
+    }
+    if (seed && colourDistance(pixel, seed.colour) < 36) return;
+    // A deleted shadow is transparent, so it used to be learned as "background"
+    // and then this walk refused to enter it. When the step is a local shade
+    // change, trust the neighbour and only reject the known backdrop colour.
+    if (hasBackground && toNeighbor > neighborDistance) {
+      const toBackground = nearestDistance(background, pixel[0], pixel[1], pixel[2]);
       if (toSubject > toBackground * (options.separation ?? 1.05)) return;
     }
     out[index] = 255;
@@ -285,10 +301,10 @@ export function restoreSubjectColouredGaps(rgb, alpha, width, height, options = 
   while (head < tail) {
     const i = queue[head++];
     const x = i % width;
-    if (x > 0) consider(i - 1);
-    if (x < width - 1) consider(i + 1);
-    if (i >= width) consider(i - width);
-    if (i < total - width) consider(i + width);
+    if (x > 0) consider(i - 1, i);
+    if (x < width - 1) consider(i + 1, i);
+    if (i >= width) consider(i - width, i);
+    if (i < total - width) consider(i + width, i);
   }
 
   return { alpha: out, restored };

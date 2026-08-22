@@ -129,6 +129,52 @@ export function buildFullBleedJacket() {
   return { rgb, truth, width, height, hole: { x0: 48, x1: 112, y0: 70, y1: 130 }, carpet };
 }
 
+/**
+ * Same cyan jacket, but with a left-to-right lighting falloff. RMBG often keeps
+ * the highlight and deletes the shadow, and those two shades are farther apart
+ * than a single global colour threshold.
+ */
+export function buildLitJacketScene() {
+  const width = 160;
+  const height = 200;
+  const rgb = new Uint8ClampedArray(width * height * 4);
+  const truth = new Uint8Array(width * height);
+  const random = mulberry32(7);
+  const body = { x0: 28, x1: 132, y0: 20, y1: 188 };
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      const o = i * 4;
+      if (x >= body.x0 && x < body.x1 && y >= body.y0 && y < body.y1) {
+        truth[i] = 1;
+        const t = x / width;
+        const shade = random() * 10 - 5;
+        rgb[o] = Math.max(0, Math.min(255, 18 + shade + (1 - t) * 8));
+        rgb[o + 1] = Math.max(0, Math.min(255, 70 + shade + (1 - t) * 140));
+        rgb[o + 2] = Math.max(0, Math.min(255, 90 + shade + (1 - t) * 150));
+      } else {
+        const pile = random() * 18 - 9;
+        rgb[o] = 36 + pile;
+        rgb[o + 1] = 112 + pile;
+        rgb[o + 2] = 42 + pile * 0.5;
+      }
+      rgb[o + 3] = 255;
+    }
+  }
+  return { rgb, truth, width, height, body, shadow: { x0: 100, x1: body.x1, y0: body.y0, y1: body.y1 } };
+}
+
+export function buildLitJacketShadowWipe(scene) {
+  const { width, height, truth, shadow } = scene;
+  const alpha = new Uint8Array(width * height);
+  for (let i = 0; i < truth.length; i++) alpha[i] = truth[i] ? 255 : 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = shadow.x0; x < width; x++) alpha[y * width + x] = 0;
+  }
+  return alpha;
+}
+
 export function buildFullBleedCoarseAlpha(scene) {
   const { width, height, hole, carpet } = scene;
   const alpha = new Uint8Array(width * height).fill(255);

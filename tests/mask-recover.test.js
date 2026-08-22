@@ -15,6 +15,8 @@ import {
   buildJacketCoarseAlpha,
   buildFullBleedJacket,
   buildFullBleedCoarseAlpha,
+  buildLitJacketScene,
+  buildLitJacketShadowWipe,
   isJacket
 } from "./fixtures/jacket.js";
 import { regionStats, subjectRetention, backgroundLeftover } from "./fixtures/scene.js";
@@ -91,6 +93,22 @@ test("a full-bleed jacket hole closes even when the photo border is the jacket",
   assert.ok(regionStats(alpha, width, hole).share > 0.9, "refine must keep the hole closed");
   assert.ok(subjectRetention(alpha, truth) > 0.94, `jacket retained ${subjectRetention(alpha, truth)}`);
   assert.ok(backgroundLeftover(alpha, truth) < 0.12, `carpet leftover ${backgroundLeftover(alpha, truth)}`);
+});
+
+test("a shadowed jacket side that the model deleted still comes back", async () => {
+  const scene = buildLitJacketScene();
+  const { rgb, truth, width, height, shadow } = scene;
+  const coarse = buildLitJacketShadowWipe(scene);
+  assert.ok(subjectRetention(coarse, truth) < 0.82, "the fixture starts with the shadow wiped");
+  assert.equal(regionStats(coarse, width, shadow).share, 0);
+
+  const recovered = recoverDeletedSubject(rgb, coarse, width, height);
+  assert.ok(regionStats(recovered.alpha, width, shadow).share > 0.9, "recovery must walk across the lighting change");
+
+  const { alpha } = await refineForegroundAlpha({ rgb, alpha: coarse, width, height });
+  assert.ok(regionStats(alpha, width, shadow).share > 0.9, "refine must keep the shadowed fabric");
+  assert.ok(subjectRetention(alpha, truth) > 0.94, `jacket retained ${subjectRetention(alpha, truth)}`);
+  assert.ok(backgroundLeftover(alpha, truth) < 0.1, `carpet leftover ${backgroundLeftover(alpha, truth)}`);
 });
 
 test("a jacket bite that reaches the frame is repaired by the full refine pass", async () => {
