@@ -93,3 +93,50 @@ export function buildJacketCoarseAlpha() {
   }
   return alpha;
 }
+
+/**
+ * The live failure: the coat is cropped by the frame, so the photo border *is*
+ * jacket. A hole in the fabric must still close, and the carpet strip at the
+ * top must stay gone.
+ */
+export function buildFullBleedJacket() {
+  const width = 160;
+  const height = 200;
+  const rgb = new Uint8ClampedArray(width * height * 4);
+  const truth = new Uint8Array(width * height);
+  const random = mulberry32(20260822);
+  const carpet = 22;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      const o = i * 4;
+      if (y < carpet) {
+        const pile = random() * 22 - 11;
+        rgb[o] = 36 + pile;
+        rgb[o + 1] = 112 + pile;
+        rgb[o + 2] = 42 + pile * 0.6;
+      } else {
+        truth[i] = 1;
+        const shade = random() * 18 - 9;
+        rgb[o] = 8 + shade * 0.2;
+        rgb[o + 1] = 168 + shade;
+        rgb[o + 2] = 228 + shade;
+      }
+      rgb[o + 3] = 255;
+    }
+  }
+  return { rgb, truth, width, height, hole: { x0: 48, x1: 112, y0: 70, y1: 130 }, carpet };
+}
+
+export function buildFullBleedCoarseAlpha(scene) {
+  const { width, height, hole, carpet } = scene;
+  const alpha = new Uint8Array(width * height).fill(255);
+  for (let y = 0; y < carpet; y++) {
+    for (let x = 0; x < width; x++) alpha[y * width + x] = 0;
+  }
+  for (let y = hole.y0; y < hole.y1; y++) {
+    for (let x = hole.x0; x < hole.x1; x++) alpha[y * width + x] = 0;
+  }
+  return alpha;
+}

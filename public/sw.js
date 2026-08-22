@@ -1,4 +1,4 @@
-const CACHE = "backshotai-shell-v56";
+const CACHE = "backshotai-shell-v57";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", event => {

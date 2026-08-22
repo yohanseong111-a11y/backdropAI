@@ -5,13 +5,16 @@ import {
   invertAlpha,
   maskLooksInverted,
   restoreSubjectColouredGaps,
-  recoverDeletedSubject
+  recoverDeletedSubject,
+  cornerBackgroundSeed
 } from "../src/mask-recover.js";
 import { refineForegroundAlpha } from "../src/mask-refine.js";
 import {
   JACKET,
   buildJacketScene,
   buildJacketCoarseAlpha,
+  buildFullBleedJacket,
+  buildFullBleedCoarseAlpha,
   isJacket
 } from "./fixtures/jacket.js";
 import { regionStats, subjectRetention, backgroundLeftover } from "./fixtures/scene.js";
@@ -70,6 +73,24 @@ test("an inverted jacket mask is flipped and the carpet stays gone", async () =>
   assert.equal(report.inverted, true);
   assert.ok(subjectRetention(alpha, truth) > 0.94, `jacket retained ${subjectRetention(alpha, truth)}`);
   assert.ok(backgroundLeftover(alpha, truth) < 0.1, `carpet leftover ${backgroundLeftover(alpha, truth)}`);
+});
+
+test("a full-bleed jacket hole closes even when the photo border is the jacket", async () => {
+  const scene = buildFullBleedJacket();
+  const { rgb, truth, width, height, hole } = scene;
+  const coarse = buildFullBleedCoarseAlpha(scene);
+  assert.equal(regionStats(coarse, width, hole).share, 0, "the fixture starts with a hole in the coat");
+
+  const seed = cornerBackgroundSeed(rgb, width, height);
+  assert.ok(seed, "top corners are carpet, so the backdrop seed must be found");
+
+  const recovered = recoverDeletedSubject(rgb, coarse, width, height);
+  assert.ok(regionStats(recovered.alpha, width, hole).share > 0.85, "recovery must close the hole");
+
+  const { alpha } = await refineForegroundAlpha({ rgb, alpha: coarse, width, height });
+  assert.ok(regionStats(alpha, width, hole).share > 0.9, "refine must keep the hole closed");
+  assert.ok(subjectRetention(alpha, truth) > 0.94, `jacket retained ${subjectRetention(alpha, truth)}`);
+  assert.ok(backgroundLeftover(alpha, truth) < 0.12, `carpet leftover ${backgroundLeftover(alpha, truth)}`);
 });
 
 test("a jacket bite that reaches the frame is repaired by the full refine pass", async () => {

@@ -1,11 +1,11 @@
 /*
  * Recover a subject the segmentation model deleted.
  *
- * RMBG is trained to find "the object", but a close-up garment on a busy carpet
- * often comes back inverted or with a bite that reaches the photo edge. The
- * previous reclaim pass treated anything touching the frame as background, so a
- * jacket that touches the crop was eaten. These helpers look at the *photo*
- * (border colour vs subject colour) instead of trusting the mask's holes.
+ * Close-up garments often touch the photo edge. Using the frame RGB as
+ * "background" then refuses to restore jacket-coloured holes, because the
+ * crop itself is jacket. These helpers learn background from colours that are
+ * *not* the kept subject, and from agreeing corners (carpet in the corners,
+ * product in the middle).
  */
 
 function packClusters(bins, maxClusters) {
@@ -46,6 +46,24 @@ function nearestDistance(clusters, r, g, b) {
   return Math.sqrt(best);
 }
 
+function colourDistance(a, b) {
+  return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+}
+
+function meanPatch(rgb, x0, y0, size, width, height) {
+  let r = 0, g = 0, b = 0, n = 0;
+  for (let y = y0; y < Math.min(height, y0 + size); y++) {
+    for (let x = x0; x < Math.min(width, x0 + size); x++) {
+      const o = (y * width + x) * 4;
+      r += rgb[o];
+      g += rgb[o + 1];
+      b += rgb[o + 2];
+      n++;
+    }
+  }
+  return n ? [r / n, g / n, b / n] : [0, 0, 0];
+}
+
 export function frameCoverage(alpha, width, height, threshold = 128) {
   const inset = Math.max(2, Math.round(Math.min(width, height) * 0.08));
   let border = 0;
@@ -77,67 +95,162 @@ export function invertAlpha(alpha) {
   return out;
 }
 
-/**
- * The model deleted the product: the frame still looks "kept" (carpet) while the
- * middle of the photo is empty (the jacket).
- */
 export function maskLooksInverted(alpha, width, height) {
   const { borderOpaque, interiorOpaque } = frameCoverage(alpha, width, height);
   return borderOpaque > 0.38 && interiorOpaque < borderOpaque - 0.16 && interiorOpaque < 0.55;
 }
 
-function borderClusters(rgb, width, height, maxClusters = 4) {
-  const bins = new Map();
-  const step = Math.max(1, Math.round(Math.max(width, height) / 280));
-  for (let x = 0; x < width; x += step) {
-    addSample(bins, rgb, x);
-    addSample(bins, rgb, (height - 1) * width + x);
-  }
-  for (let y = 0; y < height; y += step) {
-    addSample(bins, rgb, y * width);
-    addSample(bins, rgb, y * width + width - 1);
-  }
-  return packClusters(bins, maxClusters);
-}
-
-function opaqueClusters(rgb, alpha, width, height, level, maxClusters = 5) {
+function opaqueClusters(rgb, alpha, width, height, level, maxClusters = 5, skipColour = null, skipDistance = 36) {
   const bins = new Map();
   const step = Math.max(1, Math.round(Math.max(width, height) / 360));
   for (let y = 0; y < height; y += step) {
     for (let x = 0; x < width; x += step) {
       const i = y * width + x;
-      if (alpha[i] >= level) addSample(bins, rgb, i);
+      if (alpha[i] < level) continue;
+      const o = i * 4;
+      if (skipColour && colourDistance([rgb[o], rgb[o + 1], rgb[o + 2]], skipColour) < skipDistance) continue;
+      addSample(bins, rgb, i);
     }
   }
   return packClusters(bins, maxClusters);
 }
 
-function clustersSeparated(foreground, background, minDistance = 28) {
-  if (!foreground.length || !background.length) return false;
-  let best = Infinity;
-  for (let f = 0; f < foreground.length; f += 3) {
-    const distance = nearestDistance(background, foreground[f], foreground[f + 1], foreground[f + 2]);
-    if (distance < best) best = distance;
+function distinctBackgroundClusters(rgb, alpha, width, height, foreground, emptyLevel, minDistance) {
+  const bins = new Map();
+  const step = Math.max(1, Math.round(Math.max(width, height) / 320));
+  for (let y = 0; y < height; y += step) {
+    for (let x = 0; x < width; x += step) {
+      const i = y * width + x;
+      if (alpha[i] > emptyLevel) continue;
+      const o = i * 4;
+      if (nearestDistance(foreground, rgb[o], rgb[o + 1], rgb[o + 2]) < minDistance) continue;
+      addSample(bins, rgb, i);
+    }
   }
-  return best >= minDistance;
+  return packClusters(bins, 4);
 }
 
 /**
- * Grow the kept subject into transparent pixels that still look like it — including
- * bites that touch the photo edge, which border-seeded reclaim would call background.
+ * When two or more corners share a colour that is different from the centre,
+ * that colour is the backdrop (carpet in the corners, product in the middle).
+ */
+export function cornerBackgroundSeed(rgb, width, height) {
+  const patch = Math.max(6, Math.round(Math.min(width, height) * 0.06));
+  const corners = [
+    meanPatch(rgb, 0, 0, patch, width, height),
+    meanPatch(rgb, width - patch, 0, patch, width, height),
+    meanPatch(rgb, 0, height - patch, patch, width, height),
+    meanPatch(rgb, width - patch, height - patch, patch, width, height)
+  ];
+  const center = meanPatch(
+    rgb,
+    Math.round(width * 0.35),
+    Math.round(height * 0.35),
+    Math.round(Math.min(width, height) * 0.3),
+    width,
+    height
+  );
+
+  let best = null;
+  let bestScore = 0;
+  for (let i = 0; i < 4; i++) {
+    let count = 0;
+    let r = 0, g = 0, b = 0;
+    for (let j = 0; j < 4; j++) {
+      if (colourDistance(corners[i], corners[j]) > 28) continue;
+      count++;
+      r += corners[j][0];
+      g += corners[j][1];
+      b += corners[j][2];
+    }
+    if (count < 2) continue;
+    const mean = [r / count, g / count, b / count];
+    const score = colourDistance(mean, center);
+    if (score > bestScore) {
+      bestScore = score;
+      best = mean;
+    }
+  }
+  if (!best || bestScore < 30) return null;
+  return { colour: best, separation: bestScore };
+}
+
+export function cornerBackgroundFlood(rgb, width, height, options = {}) {
+  const seed = cornerBackgroundSeed(rgb, width, height);
+  if (!seed) return { subject: null, confident: false };
+  const total = width * height;
+  const tolerance = options.tolerance ?? Math.max(42, seed.separation * 0.55);
+  const background = new Uint8Array(total);
+  const queue = new Int32Array(total);
+  let head = 0;
+  let tail = 0;
+  const consider = index => {
+    if (index < 0 || index >= total || background[index]) return;
+    const o = index * 4;
+    if (colourDistance([rgb[o], rgb[o + 1], rgb[o + 2]], seed.colour) > tolerance) return;
+    background[index] = 1;
+    queue[tail++] = index;
+  };
+  for (let x = 0; x < width; x++) {
+    consider(x);
+    consider((height - 1) * width + x);
+  }
+  for (let y = 0; y < height; y++) {
+    consider(y * width);
+    consider(y * width + width - 1);
+  }
+  while (head < tail) {
+    const i = queue[head++];
+    const x = i % width;
+    if (x > 0) consider(i - 1);
+    if (x < width - 1) consider(i + 1);
+    if (i >= width) consider(i - width);
+    if (i < total - width) consider(i + width);
+  }
+  let bgCount = 0;
+  for (let i = 0; i < total; i++) bgCount += background[i];
+  const ratio = bgCount / total;
+  if (ratio < 0.04 || ratio > 0.72) return { subject: null, confident: false };
+  const subject = new Uint8Array(total);
+  for (let i = 0; i < total; i++) subject[i] = background[i] ? 0 : 255;
+  return { subject, confident: true, ratio };
+}
+
+/**
+ * Grow the kept subject into transparent pixels that still look like it.
+ * Works even when the jacket touches the crop, because background is learned
+ * from non-subject colours, not from the photo border.
  */
 export function restoreSubjectColouredGaps(rgb, alpha, width, height, options = {}) {
   const total = width * height;
   const subjectLevel = options.subjectLevel ?? 220;
   const emptyLevel = options.emptyLevel ?? 80;
-  const maxDistance = options.maxDistance ?? 58;
-  const separation = options.separation ?? 1.12;
-  const foreground = opaqueClusters(rgb, alpha, width, height, subjectLevel);
-  const background = borderClusters(rgb, width, height);
+  const maxDistance = options.maxDistance ?? 62;
+  const minSeparation = options.minSeparation ?? 26;
+  const seed = cornerBackgroundSeed(rgb, width, height);
+  const foreground = opaqueClusters(
+    rgb,
+    alpha,
+    width,
+    height,
+    subjectLevel,
+    5,
+    seed?.colour,
+    36
+  );
   const out = new Uint8Array(alpha);
-  if (!foreground.length || !clustersSeparated(foreground, background, options.minSeparation ?? 26)) {
-    return { alpha: out, restored: 0 };
-  }
+  if (!foreground.length) return { alpha: out, restored: 0 };
+
+  const background = distinctBackgroundClusters(
+    rgb,
+    alpha,
+    width,
+    height,
+    foreground,
+    emptyLevel,
+    minSeparation
+  );
+  const hasBackground = background.length > 0;
 
   const queue = new Int32Array(total);
   const seen = new Uint8Array(total);
@@ -158,8 +271,12 @@ export function restoreSubjectColouredGaps(rgb, alpha, width, height, options = 
     if (alpha[index] > emptyLevel) return;
     const o = index * 4;
     const toSubject = nearestDistance(foreground, rgb[o], rgb[o + 1], rgb[o + 2]);
-    const toBorder = nearestDistance(background, rgb[o], rgb[o + 1], rgb[o + 2]);
-    if (toSubject > maxDistance || toSubject > toBorder * separation) return;
+    if (toSubject > maxDistance) return;
+    if (seed && colourDistance([rgb[o], rgb[o + 1], rgb[o + 2]], seed.colour) < 36) return;
+    if (hasBackground) {
+      const toBackground = nearestDistance(background, rgb[o], rgb[o + 1], rgb[o + 2]);
+      if (toSubject > toBackground * (options.separation ?? 1.05)) return;
+    }
     out[index] = 255;
     restored++;
     queue[tail++] = index;
@@ -177,6 +294,19 @@ export function restoreSubjectColouredGaps(rgb, alpha, width, height, options = 
   return { alpha: out, restored };
 }
 
+function unionSubject(alpha, extra) {
+  if (!extra) return { alpha, added: 0 };
+  const out = new Uint8Array(alpha);
+  let added = 0;
+  for (let i = 0; i < out.length; i++) {
+    if (extra[i] >= 220 && out[i] < 128) {
+      out[i] = 255;
+      added++;
+    }
+  }
+  return { alpha: out, added };
+}
+
 export function recoverDeletedSubject(rgb, alpha, width, height) {
   let current = new Uint8Array(alpha);
   let inverted = false;
@@ -184,6 +314,22 @@ export function recoverDeletedSubject(rgb, alpha, width, height) {
     current = invertAlpha(current);
     inverted = true;
   }
+  const { interiorOpaque } = frameCoverage(current, width, height);
+  const flood = cornerBackgroundFlood(rgb, width, height);
+  let added = 0;
+  // Only adopt the colour prior when the model deleted the product. Using it on
+  // a normal over-covered mask would paint the backdrop back in and then
+  // reclaim would have no transparent seed left.
+  if (flood.confident && (inverted || interiorOpaque < 0.45)) {
+    const merged = unionSubject(current, flood.subject);
+    current = merged.alpha;
+    added = merged.added;
+  }
   const gaps = restoreSubjectColouredGaps(rgb, current, width, height);
-  return { alpha: gaps.alpha, inverted, restored: gaps.restored };
+  return {
+    alpha: gaps.alpha,
+    inverted,
+    restored: gaps.restored + added,
+    cornerFlood: flood.confident && (inverted || interiorOpaque < 0.45)
+  };
 }
