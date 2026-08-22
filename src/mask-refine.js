@@ -12,6 +12,8 @@
  * deleting it, and the orchestrator rolls a stage back when the subject shrinks.
  */
 
+import { recoverDeletedSubject, restoreSubjectColouredGaps } from "./mask-recover.js";
+
 const UNKNOWN_DISTANCE = 999;
 
 function buildIntegral(src, width, height, out) {
@@ -917,15 +919,20 @@ const identityBreathe = () => Promise.resolve();
  * Returns the refined alpha plus a report describing which stages were accepted.
  */
 export async function refineForegroundAlpha({ rgb, alpha, width, height, options = {}, breathe = identityBreathe }) {
-  const report = { guided: false, reclaimed: 0, evidence: 0, filled: 0, edge: false, rolledBack: false };
+  const report = { guided: false, reclaimed: 0, evidence: 0, filled: 0, edge: false, rolledBack: false, inverted: false, recoloured: 0 };
   const total = width * height;
   if (!total || alpha.length !== total) return { alpha: new Uint8Array(alpha), report };
+
+  const recovered = recoverDeletedSubject(rgb, alpha, width, height);
+  let current = recovered.alpha;
+  const baseline = new Uint8Array(current);
+  report.inverted = recovered.inverted;
+  report.recoloured = recovered.restored;
+  await breathe();
 
   const channels = colourChannels(rgb, width, height);
   const edges = colourEdgeStrength(channels, width, height);
   await breathe();
-
-  let current = new Uint8Array(alpha);
 
   const guideRadius = options.guideRadius ?? Math.max(3, Math.min(12, Math.round(Math.max(width, height) / 190)));
   const guideEps = options.guideEps ?? 2e-4;
@@ -999,17 +1006,20 @@ export async function refineForegroundAlpha({ rgb, alpha, width, height, options
     report.edge = true;
   }
   current = featherAlphaBand(current, width, height, options.feather);
+  const lastGaps = restoreSubjectColouredGaps(rgb, current, width, height);
+  current = lastGaps.alpha;
+  report.recoloured += lastGaps.restored;
   await breathe();
 
   if (
-    !shapeSurvived(alpha, current, width, height, {
+    !shapeSurvived(baseline, current, width, height, {
       minArea: options.finalMinArea ?? 0.5,
       minSpan: options.finalMinSpan ?? 0.72
     }) ||
-    !solidSubjectSurvived(alpha, current, distances, options.solid)
+    !solidSubjectSurvived(baseline, current, distances, options.solid)
   ) {
     report.rolledBack = true;
-    return { alpha: removeTinyForegroundIslands(alpha, width, height), report };
+    return { alpha: removeTinyForegroundIslands(baseline, width, height), report };
   }
 
   return { alpha: current, report };

@@ -173,19 +173,31 @@ app.innerHTML = `
 <div id="cutoutModal" class="modal hidden">
   <div class="modal-card">
     <div class="modal-head">
-      <div><strong>Edit cutout</strong><span>AI Assist target or manual brush. Works with mouse and touch.</span></div>
+      <div><strong>Edit cutout</strong><span>Remove leftover background or restore missing fabric from the original photo.</span></div>
       <button id="closeEditor" class="icon-btn">×</button>
     </div>
     <div class="editor-toolbar">
-      <div class="tool-group">
-        <button id="eraseTool" class="tool active">Erase</button>
-        <button id="restoreTool" class="tool">Restore</button>
+      <div class="tool-group editor-mode-group" aria-label="Edit mode">
+        <button id="eraseTool" class="tool active" type="button">Remove</button>
+        <button id="restoreTool" class="tool" type="button">Restore</button>
       </div>
-      <label class="smart-toggle"><input id="assistToggle" type="checkbox" checked /> AI Assist</label>
+      <div class="tool-group" aria-label="How to edit">
+        <button id="assistModeBtn" class="tool active" type="button">Assisted</button>
+        <button id="manualModeBtn" class="tool" type="button">Manual</button>
+      </div>
       <label id="assistSizeRow" class="brush-row">Target <input id="assistSize" type="range" min="14" max="150" step="1" value="46" /><span id="assistSizeLabel" class="range-value">Medium</span></label>
-      <label id="brushSizeRow" class="brush-row hidden">Brush <input id="brushSize" type="range" min="8" max="180" value="54" /></label>
+      <label id="brushSizeRow" class="brush-row hidden">Size <input id="brushSize" type="range" min="8" max="180" value="54" /></label>
+      <label id="brushSoftRow" class="brush-row hidden">Softness <input id="brushSoftness" type="range" min="0" max="100" value="35" /></label>
+      <label class="smart-toggle"><input id="showOriginalToggle" type="checkbox" checked /> Show original</label>
+      <div class="editor-stage-swatches" aria-label="Editor background">
+        <button type="button" class="stage-swatch checker active" data-stage="checker" title="Checkerboard"></button>
+        <button type="button" class="stage-swatch" data-stage="#111114" title="Dark" style="background:#111114"></button>
+        <button type="button" class="stage-swatch" data-stage="#f4f4f5" title="White" style="background:#f4f4f5"></button>
+        <button type="button" class="stage-swatch" data-stage="#2f6f3e" title="Green" style="background:#2f6f3e"></button>
+      </div>
       <button id="undoEdit" class="ghost small-btn">Undo</button>
       <button id="redoEdit" class="ghost small-btn">Redo</button>
+      <button id="invertCutout" class="ghost small-btn" type="button">Invert</button>
       <div class="tool-group" aria-label="Editor zoom">
         <button id="zoomOutEditor" class="tool" type="button" aria-label="Zoom out">−</button>
         <button id="fitEditor" class="tool" type="button">Fit</button>
@@ -194,12 +206,15 @@ app.innerHTML = `
       <button id="smartRecover" class="ghost small-btn">Re-run removal</button>
     </div>
     <div class="editor-stage">
-      <canvas id="editorCanvas"></canvas>
+      <div class="editor-stack">
+        <canvas id="editorGhost" class="editor-ghost"></canvas>
+        <canvas id="editorCanvas"></canvas>
+      </div>
       <div id="assistTarget" class="assist-target"><span class="assist-target-dot"></span></div>
       <div id="brushCursor" class="brush-cursor"></div>
     </div>
     <div class="editor-foot">
-      <span id="editorHint">AI Assist: place the target on an area to remove and tap once.</span>
+      <span id="editorHint">Assisted: place the target on leftover background and tap once.</span>
       <button id="applyEdit" class="primary compact">Apply cutout</button>
     </div>
   </div>
@@ -1204,8 +1219,13 @@ async function openEditor(id){
   const original=await imageFromURL(item.originalURL),cutout=await imageFromURL(item.cutoutURL),canvas=$("#editorCanvas"),max=1400,s=Math.min(1,max/Math.max(original.naturalWidth,original.naturalHeight));
   canvas.width=Math.round(original.naturalWidth*s);canvas.height=Math.round(original.naturalHeight*s);const ctx=canvas.getContext("2d",{willReadFrequently:true});ctx.clearRect(0,0,canvas.width,canvas.height);ctx.drawImage(cutout,0,0,canvas.width,canvas.height);
   const oc=document.createElement("canvas");oc.width=canvas.width;oc.height=canvas.height;const octx=oc.getContext("2d",{willReadFrequently:true});octx.drawImage(original,0,0,canvas.width,canvas.height);
-  state.editor={item,original,canvas,ctx,originalData:octx.getImageData(0,0,canvas.width,canvas.height),mode:"erase",history:[ctx.getImageData(0,0,canvas.width,canvas.height)],redo:[],drawing:false,last:null,viewScale:1,fitScale:1,panX:0,panY:0,pointers:new Map(),pinch:null};
+  const ghost=$("#editorGhost");
+  ghost.width=canvas.width;ghost.height=canvas.height;
+  ghost.getContext("2d").drawImage(original,0,0,canvas.width,canvas.height);
+  state.editor={item,original,canvas,ghost,ctx,originalData:octx.getImageData(0,0,canvas.width,canvas.height),mode:"erase",assisted:true,history:[ctx.getImageData(0,0,canvas.width,canvas.height)],redo:[],drawing:false,last:null,viewScale:1,fitScale:1,panX:0,panY:0,pointers:new Map(),pinch:null};
   $("#cutoutModal").classList.remove("hidden");
+  $("#showOriginalToggle").checked=true;
+  setEditorStage("checker");
   requestAnimationFrame(()=>{ fitEditorCanvasToStage(); updateEditorUI(); setupEditorEvents(); });
 }
 function fitEditorCanvasToStage(){
@@ -1219,9 +1239,11 @@ function fitEditorCanvasToStage(){
 function updateEditorTransform(){
   const e=state.editor;if(!e)return;
   const scale=e.fitScale*e.viewScale;
-  e.canvas.style.width=`${Math.max(1,Math.floor(e.canvas.width*scale))}px`;
-  e.canvas.style.height=`${Math.max(1,Math.floor(e.canvas.height*scale))}px`;
-  e.canvas.style.transform=`translate3d(${e.panX}px,${e.panY}px,0)`;
+  const width=`${Math.max(1,Math.floor(e.canvas.width*scale))}px`;
+  const height=`${Math.max(1,Math.floor(e.canvas.height*scale))}px`;
+  const transform=`translate3d(${e.panX}px,${e.panY}px,0)`;
+  e.canvas.style.width=width;e.canvas.style.height=height;e.canvas.style.transform=transform;
+  if(e.ghost){e.ghost.style.width=width;e.ghost.style.height=height;e.ghost.style.transform=transform;}
 }
 function setEditorZoom(next){
   const e=state.editor;if(!e)return;
@@ -1229,17 +1251,22 @@ function setEditorZoom(next){
   if(e.viewScale===1){e.panX=0;e.panY=0;}
   updateEditorTransform();
 }
+function editorIsAssisted(){return !!state.editor?.assisted;}
 function updateEditorUI(){
   const e=state.editor;if(!e)return;
   $("#eraseTool").classList.toggle("active",e.mode==="erase");
   $("#restoreTool").classList.toggle("active",e.mode==="restore");
-  const assisted=$("#assistToggle").checked;
+  $("#assistModeBtn").classList.toggle("active",e.assisted);
+  $("#manualModeBtn").classList.toggle("active",!e.assisted);
+  const assisted=e.assisted;
   $("#assistSizeRow").classList.toggle("hidden",!assisted);
   $("#brushSizeRow").classList.toggle("hidden",assisted);
+  $("#brushSoftRow").classList.toggle("hidden",assisted);
   $("#assistSizeLabel").textContent=assistSizeLabel();
+  $(".editor-stage")?.classList.toggle("show-original",$("#showOriginalToggle").checked);
   $("#editorHint").textContent=assisted
-    ? `AI Assist: place the target on ${e.mode==="erase"?"leftover background":"a missing part of the subject"} and tap. Only that area is analysed.`
-    : e.mode==="erase"?"Manual: brush over unwanted areas.":"Manual: brush over missing parts to restore them.";
+    ? `Assisted: tap leftover ${e.mode==="erase"?"background":"missing fabric"}. Only the circle is analysed, like PhotoRoom Guided.`
+    : e.mode==="erase"?"Manual: paint over leftover background. Softness feathers the edge.":"Manual: paint the faded original back onto the cutout.";
   $("#undoEdit").disabled=e.history.length<=1;
   $("#redoEdit").disabled=!e.redo.length;
   updateAssistTargetSize();
@@ -1249,7 +1276,13 @@ function updateAssistTargetSize(){
   const size=assistDisplayDiameter();
   target.style.width=`${size}px`;
   target.style.height=`${size}px`;
-  if(!$("#assistToggle").checked)target.classList.remove("show");
+  if(!editorIsAssisted())target.classList.remove("show");
+}
+function setEditorStage(stage){
+  const wrap=$(".editor-stage");if(!wrap)return;
+  wrap.dataset.stage=stage;
+  wrap.style.background=stage==="checker"?"":stage;
+  document.querySelectorAll(".stage-swatch").forEach(btn=>btn.classList.toggle("active",btn.dataset.stage===stage));
 }
 function setupEditorEvents(){
   const e=state.editor,c=e.canvas,stage=$(".editor-stage");
@@ -1259,13 +1292,13 @@ function setupEditorEvents(){
     if(e.pointers.size===2){const pts=[...e.pointers.values()];e.drawing=false;e.pinch={distance:Math.hypot(pts[1].x-pts[0].x,pts[1].y-pts[0].y),scale:e.viewScale,midX:(pts[0].x+pts[1].x)/2,midY:(pts[0].y+pts[1].y)/2,panX:e.panX,panY:e.panY};return;}
     if(ev.button===1||ev.altKey){e.panning={x:ev.clientX,y:ev.clientY,panX:e.panX,panY:e.panY};return;}
     moveEditorCursor(ev);
-    const p=pointFor(ev,c);if($("#assistToggle").checked){assistedTap(p);return;}e.drawing=true;e.last=p;paintAt(p);
+    const p=pointFor(ev,c);if(editorIsAssisted()){assistedTap(p);return;}e.drawing=true;e.last=p;paintAt(p);
   };
   c.onpointermove=ev=>{
     moveEditorCursor(ev);if(e.pointers.has(ev.pointerId))e.pointers.set(ev.pointerId,{x:ev.clientX,y:ev.clientY});
     if(e.pointers.size===2&&e.pinch){const pts=[...e.pointers.values()],distance=Math.hypot(pts[1].x-pts[0].x,pts[1].y-pts[0].y),midX=(pts[0].x+pts[1].x)/2,midY=(pts[0].y+pts[1].y)/2;e.viewScale=Math.max(1,Math.min(8,e.pinch.scale*distance/Math.max(1,e.pinch.distance)));e.panX=e.pinch.panX+midX-e.pinch.midX;e.panY=e.pinch.panY+midY-e.pinch.midY;updateEditorTransform();return;}
     if(e.panning){e.panX=e.panning.panX+ev.clientX-e.panning.x;e.panY=e.panning.panY+ev.clientY-e.panning.y;updateEditorTransform();return;}
-    if(!e.drawing||$("#assistToggle").checked)return;const p=pointFor(ev,c);paintLine(e.last,p);e.last=p;
+    if(!e.drawing||editorIsAssisted())return;const p=pointFor(ev,c);paintLine(e.last,p);e.last=p;
   };
   const finish=ev=>{e.pointers.delete(ev.pointerId);e.pinch=null;e.panning=null;if(e.drawing){e.drawing=false;pushHistory();}};
   c.onpointerup=finish;c.onpointercancel=finish;c.onpointerleave=hideEditorCursor;c.onpointerenter=ev=>moveEditorCursor(ev);
@@ -1273,7 +1306,49 @@ function setupEditorEvents(){
 function pointFor(ev,c){const r=c.getBoundingClientRect();return{x:(ev.clientX-r.left)/r.width*c.width,y:(ev.clientY-r.top)/r.height*c.height};}
 function brushRadius(){return Number($("#brushSize").value)/2*(state.editor.canvas.width/state.editor.canvas.getBoundingClientRect().width);}
 function paintLine(a,b){const dist=Math.hypot(b.x-a.x,b.y-a.y),step=Math.max(2,brushRadius()*.25),n=Math.max(1,Math.ceil(dist/step));for(let i=1;i<=n;i++)paintAt({x:a.x+(b.x-a.x)*i/n,y:a.y+(b.y-a.y)*i/n});}
-function paintAt(p){const e=state.editor,r=brushRadius(),ctx=e.ctx;ctx.save();if(e.mode==="erase"){ctx.globalCompositeOperation="destination-out";ctx.fillStyle="#000";ctx.beginPath();ctx.arc(p.x,p.y,r,0,Math.PI*2);ctx.fill();}else{ctx.globalCompositeOperation="source-over";ctx.beginPath();ctx.arc(p.x,p.y,r,0,Math.PI*2);ctx.clip();const temp=document.createElement("canvas");temp.width=e.canvas.width;temp.height=e.canvas.height;temp.getContext("2d").putImageData(e.originalData,0,0);ctx.drawImage(temp,0,0);}ctx.restore();}
+function paintAt(p){
+  const e=state.editor,r=brushRadius(),ctx=e.ctx;
+  const softness=Math.max(0,Math.min(1,Number($("#brushSoftness")?.value||0)/100));
+  const inner=Math.max(0.12,1-softness)*r;
+  ctx.save();
+  if(e.mode==="erase"){
+    const stamp=ctx.createRadialGradient(p.x,p.y,inner,p.x,p.y,r);
+    stamp.addColorStop(0,"rgba(0,0,0,1)");
+    stamp.addColorStop(1,"rgba(0,0,0,0)");
+    ctx.globalCompositeOperation="destination-out";
+    ctx.fillStyle=softness<0.04?"#000":stamp;
+    ctx.beginPath();ctx.arc(p.x,p.y,r,0,Math.PI*2);ctx.fill();
+  }else{
+    const layer=document.createElement("canvas");
+    layer.width=e.canvas.width;layer.height=e.canvas.height;
+    const layerCtx=layer.getContext("2d");
+    layerCtx.putImageData(e.originalData,0,0);
+    const stamp=layerCtx.createRadialGradient(p.x,p.y,inner,p.x,p.y,r);
+    stamp.addColorStop(0,"rgba(0,0,0,1)");
+    stamp.addColorStop(1,"rgba(0,0,0,0)");
+    layerCtx.globalCompositeOperation="destination-in";
+    layerCtx.fillStyle=softness<0.04?"#000":stamp;
+    layerCtx.beginPath();layerCtx.arc(p.x,p.y,r,0,Math.PI*2);layerCtx.fill();
+    ctx.globalCompositeOperation="source-over";
+    ctx.drawImage(layer,0,0);
+  }
+  ctx.restore();
+}
+function invertEditorCutout(){
+  const e=state.editor;if(!e)return;
+  const current=e.ctx.getImageData(0,0,e.canvas.width,e.canvas.height);
+  const src=e.originalData.data,dst=current.data;
+  for(let i=0;i<dst.length;i+=4){
+    const next=255-dst[i+3];
+    if(next>dst[i+3]){
+      dst[i]=src[i];dst[i+1]=src[i+1];dst[i+2]=src[i+2];
+    }
+    dst[i+3]=next;
+  }
+  e.ctx.putImageData(current,0,0);
+  pushHistory();
+  toast("Cutout inverted. Restore paints the original back.");
+}
 
 function assistedTap(p){
   const e=state.editor,w=e.canvas.width,h=e.canvas.height;
@@ -1316,7 +1391,7 @@ function undo(){const e=state.editor;if(e.history.length<=1)return;const cur=e.h
 function redo(){const e=state.editor;if(!e.redo.length)return;const img=e.redo.pop();e.history.push(img);e.ctx.putImageData(img,0,0);updateEditorUI();}
 function moveEditorCursor(ev){
   const stage=$(".editor-stage").getBoundingClientRect();
-  const assisted=$("#assistToggle").checked;
+  const assisted=editorIsAssisted();
   const el=assisted?$("#assistTarget"):$("#brushCursor");
   const other=assisted?$("#brushCursor"):$("#assistTarget");
   other.classList.remove("show");
@@ -1493,8 +1568,8 @@ const tutorialSteps=[
   },
   {
     title:"Refine a cutout",
-    text:"Press Edit cutout on any finished photo. AI Assist analyses only the area under the circular target, so one tap clears leftover background without eating into the subject.",
-    points:["Pick Small, Medium or Large with the Target slider.","Undo and Redo cover every correction."],
+    text:"Press Edit cutout. Remove leftover background or Restore missing fabric from the faded original — the same two modes PhotoRoom uses.",
+    points:["Assisted taps only the circle. Manual paints with a soft brush.","Turn on Show original to see what was deleted, then Restore it."],
     visual:tutorialArt.refine
   },
   {
@@ -1794,7 +1869,13 @@ $("#shadowBlur").oninput=e=>applyScopedShadow("blur",Number(e.target.value));
 $("#shadowY").oninput=e=>applyScopedShadow("offsetY",Number(e.target.value));
 $("#eraseTool").onclick=()=>{if(state.editor){state.editor.mode="erase";updateEditorUI();}};
 $("#restoreTool").onclick=()=>{if(state.editor){state.editor.mode="restore";updateEditorUI();}};
-$("#assistToggle").onchange=updateEditorUI;
+$("#assistModeBtn").onclick=()=>{if(state.editor){state.editor.assisted=true;updateEditorUI();}};
+$("#manualModeBtn").onclick=()=>{if(state.editor){state.editor.assisted=false;updateEditorUI();}};
+$("#showOriginalToggle").onchange=updateEditorUI;
+$("#invertCutout").onclick=invertEditorCutout;
+document.querySelectorAll(".stage-swatch").forEach(btn=>{
+  btn.onclick=()=>setEditorStage(btn.dataset.stage);
+});
 $("#assistSize").oninput=()=>{$("#assistSizeLabel").textContent=assistSizeLabel();updateAssistTargetSize();};
 $("#undoEdit").onclick=undo;$("#redoEdit").onclick=redo;$("#smartRecover").onclick=smartRecover;$("#applyEdit").onclick=applyEditor;$("#closeEditor").onclick=closeEditor;$("#cutoutModal").onclick=e=>{if(e.target.id==="cutoutModal")closeEditor();};
 $("#zoomOutEditor").onclick=()=>setEditorZoom((state.editor?.viewScale||1)/1.25);$("#zoomInEditor").onclick=()=>setEditorZoom((state.editor?.viewScale||1)*1.25);$("#fitEditor").onclick=()=>setEditorZoom(1);

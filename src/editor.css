@@ -58,7 +58,28 @@
     linear-gradient(45deg,transparent 75%,#1b1b20 75%) 12px -12px/24px 24px,
     linear-gradient(-45deg,transparent 75%,#1b1b20 75%) -12px 0/24px 24px,#101014
 }
-#editorCanvas{display:block;touch-action:none;cursor:none;max-width:none;max-height:none;width:auto;height:auto;transform-origin:center;will-change:transform,width,height;box-shadow:0 0 0 1px rgba(255,255,255,.12);object-fit:contain}
+.editor-stack{position:relative;display:grid;place-items:center}
+.editor-ghost,#editorCanvas{
+  grid-area:1/1;display:block;max-width:none;max-height:none;width:auto;height:auto;
+  transform-origin:center;will-change:transform,width,height;object-fit:contain
+}
+.editor-ghost{pointer-events:none;opacity:0;z-index:0}
+.editor-stage.show-original .editor-ghost{opacity:.36}
+#editorCanvas{position:relative;z-index:1;touch-action:none;cursor:none;box-shadow:0 0 0 1px rgba(255,255,255,.12)}
+.editor-mode-group .tool{min-width:86px}
+.editor-stage-swatches{display:flex;align-items:center;gap:6px}
+.stage-swatch{
+  width:18px;height:18px;padding:0;border-radius:50%;
+  border:1px solid rgba(255,255,255,.22);background:#222
+}
+.stage-swatch.checker{
+  background:
+    linear-gradient(45deg,#3a3a42 25%,transparent 25%) 0 0/8px 8px,
+    linear-gradient(-45deg,#3a3a42 25%,transparent 25%) 0 4px/8px 8px,
+    linear-gradient(45deg,transparent 75%,#3a3a42 75%) 4px -4px/8px 8px,
+    linear-gradient(-45deg,transparent 75%,#3a3a42 75%) -4px 0/8px 8px,#1a1a20
+}
+.stage-swatch.active{box-shadow:0 0 0 2px #765fff}
 .brush-cursor{
   position:absolute;border:1.5px solid white;border-radius:50%;pointer-events:none;display:none;z-index:10;
   box-shadow:0 0 0 1px rgba(0,0,0,.7),0 0 10px rgba(0,0,0,.45)
