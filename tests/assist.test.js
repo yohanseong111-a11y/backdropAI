@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { computeAssistSelection, applyAssistSelection } from "../src/assist.js";
+import { computeAssistSelection, applyAssistSelection, colourFamily } from "../src/assist.js";
 import { SCENE, buildScene, buildCoarseAlpha, isSubject } from "./fixtures/scene.js";
 import { buildTwoToneJacket, buildTwoToneCoarseAlpha, buildShadedNavyCollar } from "./fixtures/jacket.js";
 import { regionStats } from "./fixtures/scene.js";
@@ -216,6 +216,87 @@ test("repeated taps keep working and never eat the subject colour", () => {
   }
   assert.equal(subjectLost, 0, "consecutive corrections must not corrupt the subject");
   assert.ok(editor.pixels[(150 * editor.width + 80) * 4 + 3] < 40, "the gap should be cleared by now");
+});
+
+test("restore tap on one leftover green patch does not restore the other", () => {
+  const width = 160;
+  const height = 120;
+  const rgb = new Uint8ClampedArray(width * height * 4);
+  const alpha = new Uint8Array(width * height);
+  const left = { x0: 6, x1: 36, y0: 6, y1: 36 };
+  const right = { x0: 124, x1: 154, y0: 6, y1: 36 };
+  const body = { x0: 50, x1: 110, y0: 40, y1: 110 };
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      const o = i * 4;
+      const inLeft = x >= left.x0 && x < left.x1 && y >= left.y0 && y < left.y1;
+      const inRight = x >= right.x0 && x < right.x1 && y >= right.y0 && y < right.y1;
+      const inBody = x >= body.x0 && x < body.x1 && y >= body.y0 && y < body.y1;
+      if (inBody) {
+        rgb[o] = 10;
+        rgb[o + 1] = 168;
+        rgb[o + 2] = 226;
+        alpha[i] = 255;
+      } else if (inLeft || inRight) {
+        rgb[o] = 36;
+        rgb[o + 1] = 112;
+        rgb[o + 2] = 42;
+        alpha[i] = 0;
+      } else {
+        rgb[o] = 20;
+        rgb[o + 1] = 24;
+        rgb[o + 2] = 48;
+        alpha[i] = 255;
+      }
+      rgb[o + 3] = 255;
+    }
+  }
+  const pixels = new Uint8ClampedArray(rgb);
+  for (let i = 0; i < alpha.length; i++) pixels[i * 4 + 3] = alpha[i];
+
+  const selection = computeAssistSelection({
+    rgb,
+    alpha,
+    width,
+    height,
+    x: 20,
+    y: 20,
+    radius: 12,
+    mode: "restore"
+  });
+  assert.ok(selection);
+  applyAssistSelection(pixels, rgb, width, selection, "restore");
+  const restored = new Uint8Array(width * height);
+  for (let i = 0; i < restored.length; i++) restored[i] = pixels[i * 4 + 3];
+  assert.ok(regionStats(restored, width, left).share > 0.9, "the tapped green patch must come back");
+  assert.ok(regionStats(restored, width, right).share < 0.08, "the other green patch must stay gone");
+});
+
+test("erase tap on the jacket does not take the leftover green with it", () => {
+  const scene = buildTwoToneJacket();
+  const { rgb, width, height, body } = scene;
+  const alpha = new Uint8Array(width * height).fill(255);
+  const pixels = new Uint8ClampedArray(rgb);
+  assert.equal(colourFamily(10, 168, 226), "cyan");
+  assert.equal(colourFamily(36, 112, 42), "green");
+
+  const selection = computeAssistSelection({
+    rgb,
+    alpha,
+    width,
+    height,
+    x: Math.round((body.x0 + body.x1) / 2),
+    y: Math.round((body.y0 + body.y1) / 2),
+    radius: 14,
+    mode: "erase"
+  });
+  assert.ok(selection);
+  applyAssistSelection(pixels, rgb, width, selection, "erase");
+
+  const jacket = (Math.round((body.y0 + body.y1) / 2) * width + Math.round((body.x0 + body.x1) / 2)) * 4 + 3;
+  assert.ok(pixels[jacket] < 40, "the tapped jacket patch must go");
+  assert.ok(pixels[(8 * width + 8) * 4 + 3] > 200, "green carpet must stay when the jacket is erased");
 });
 
 test("a target with nothing to change reports back instead of guessing", () => {
