@@ -20,8 +20,11 @@ test("the model download step verifies what it fetched before publishing it", ()
   assert.match(prepare, /model_fp16\.onnx/);
   // Downloads land on a .part file, are hashed, and are only promoted on a match.
   assert.match(prepare, /createHash\("sha256"\)/);
-  assert.match(prepare, /if\(actual!==model\.sha256\)/);
+  assert.match(prepare, /if\(actual!==expectedHash\)/);
   assert.match(prepare, /await rename\(partial,target\)/);
+  // Hugging Face resets mid-download on GitHub-hosted runners; retry before failing CI.
+  assert.match(prepare, /const downloadAttempts=4/);
+  assert.match(prepare, /async function downloadVerified/);
 });
 
 test("the worker only loads models the deployment actually ships", () => {
