@@ -5,12 +5,12 @@ import { readFile } from "node:fs/promises";
 const css = await readFile(new URL("../src/editor.css", import.meta.url), "utf8");
 const main = await readFile(new URL("../src/main.js", import.meta.url), "utf8");
 
-test("the processing scan moves one way on the compositor, never bouncing on `top`", () => {
-  assert.match(css, /animation:scanTrackSweep 1\.35s linear infinite;/);
-  assert.doesNotMatch(css, /scanTrackSweep[^;]*alternate/);
+test("the processing scan travels down then up on the compositor, never off-screen", () => {
+  assert.match(css, /animation:scanTrackSweep 1\.4s linear infinite;/);
   assert.doesNotMatch(css, /@keyframes scanSweepFast/);
-  assert.match(css, /from\{transform:translate3d\(0,-100%,0\)\}/);
-  assert.match(css, /to\{transform:translate3d\(0,100%,0\)\}/);
+  assert.match(css, /0%,100%\{transform:translate3d\(0,-100%,0\)\}/);
+  assert.match(css, /50%\{transform:translate3d\(0,0,0\)\}/);
+  assert.doesNotMatch(css, /translate3d\(0,100%,0\)/);
 });
 
 test("the reveal wipe uses a transforming track instead of animating `top`", () => {

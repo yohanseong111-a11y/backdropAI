@@ -8,14 +8,16 @@
     "build": "node scripts/prepare-models.mjs && vite build",
     "preview": "vite preview",
     "lint": "node --check src/main.js && node --check src/removal-worker.js && node --check src/refine-worker.js && node --check src/mask-safety.js && node --check src/mask-refine.js && node --check src/mask-recover.js && node --check src/assist.js",
-    "test": "node --test"
+    "test": "node --test",
+    "verify:cutout": "node scripts/verify-cutout.mjs"
   },
   "dependencies": {
+    "@huggingface/transformers": "3.7.1",
     "jszip": "3.10.1",
-    "onnxruntime-web": "1.21.0",
-    "@huggingface/transformers": "3.7.1"
+    "onnxruntime-web": "1.21.0"
   },
   "devDependencies": {
+    "puppeteer-core": "23.11.1",
     "vite": "^7.1.0"
   },
   "overrides": {

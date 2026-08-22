@@ -1,5 +1,5 @@
-const CACHE = "backshotai-shell-v57";
-const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png"];
+const CACHE = "backshotai-shell-v58";
+const SHELL = ["./manifest.webmanifest", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).catch(()=>{}));
@@ -21,11 +21,21 @@ self.addEventListener("fetch", event => {
     event.respondWith(fetch(event.request));
     return;
   }
+
+  // HTML and hashed bundles must always come from the network. Caching them
+  // was why a merged fix could still look like the old app.
+  const live=event.request.mode==="navigate"||url.pathname.endsWith(".html")||url.pathname.endsWith("/")||url.pathname.includes("/assets/");
+  if(live){
+    event.respondWith(fetch(event.request,{cache:"reload"}).catch(async()=>{
+      if(event.request.mode==="navigate")return caches.match("./index.html")||Response.error();
+      return Response.error();
+    }));
+    return;
+  }
+
   event.respondWith(
     fetch(event.request)
       .then(response=>{
-        // Transformers.js maintains its own model cache. Avoid storing a
-        // second 44/88 MB copy in the service-worker shell cache.
         const isModel=url.pathname.includes("/models/");
         if(response.ok&&!isModel){
           const copy=response.clone();
@@ -36,9 +46,6 @@ self.addEventListener("fetch", event => {
       .catch(async()=>{
         const cached=await caches.match(event.request);
         if(cached)return cached;
-        // An HTML fallback is valid only for page navigation. Returning HTML
-        // for a missing script, worker, WASM file or image causes MIME errors.
-        if(event.request.mode==="navigate")return caches.match("./index.html");
         return Response.error();
       })
   );

@@ -129,7 +129,9 @@
 .processing-original{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block;z-index:1}
 
 .photo-card{position:relative;transition:border-color .15s ease,box-shadow .15s ease,transform .15s ease}
-.photo-card,.preview-wrap,.preview-canvas{contain:paint}.preview-canvas{transform:translateZ(0);backface-visibility:hidden}
+.photo-card{contain:layout style}
+.preview-wrap{isolation:isolate}
+.preview-canvas{transform:translateZ(0);backface-visibility:hidden}
 .photo-card.selected{border-color:rgba(132,111,255,.9);box-shadow:0 0 0 2px rgba(132,111,255,.18),0 16px 40px rgba(0,0,0,.2)}
 .photo-card.selected .preview-wrap{outline:1px solid rgba(151,132,255,.45);outline-offset:-1px}
 .select-chip{position:absolute;right:10px;top:10px;z-index:12;width:27px;height:27px;padding:0;border-radius:50%;border:1px solid rgba(255,255,255,.42);background:rgba(9,9,12,.6);backdrop-filter:blur(8px);font-size:14px;display:grid;place-items:center}
@@ -176,24 +178,26 @@ fieldset{border:0;padding:0;margin:0;min-width:0}fieldset:disabled{opacity:.42}.
 
 .gallery{touch-action:pan-y}.gallery.drag-select-active{cursor:crosshair}.drag-select-box{backdrop-filter:brightness(1.06)}
 
-/* One-way compositor scan: the track translates, never `top`, and never bounces. */
+/* Up-and-down compositor scan. The track is the full card and the line sits
+   on its bottom edge. -100% puts that line at the top of the photo; 0% puts
+   it at the bottom. Never travel to +100% — that hid the line off-screen. */
 .scan-track{
   position:absolute;inset:0;z-index:7;pointer-events:none;
-  will-change:transform;transform:translate3d(0,-100%,0);
-  animation:scanTrackSweep 1.35s linear infinite;
+  transform:translate3d(0,-100%,0);
+  animation:scanTrackSweep 1.4s linear infinite;
 }
 .scan-track .scan-line{
-  position:absolute;left:-3%;right:-3%;top:100%;height:2px;
-  background:linear-gradient(90deg,transparent 0%,rgba(181,169,255,.6) 13%,#fff 50%,rgba(181,169,255,.6) 87%,transparent 100%);
-  box-shadow:0 0 8px rgba(255,255,255,.82),0 0 20px rgba(130,108,255,.8)
+  position:absolute;left:-4%;right:-4%;top:100%;height:4px;
+  background:linear-gradient(90deg,transparent 0%,rgba(181,169,255,.85) 12%,#fff 50%,rgba(181,169,255,.85) 88%,transparent 100%);
+  box-shadow:0 0 12px rgba(255,255,255,.95),0 0 28px rgba(130,108,255,1)
 }
 .scan-track .scan-glow{
-  position:absolute;left:0;right:0;top:82%;height:18%;
-  background:linear-gradient(180deg,transparent,rgba(119,97,255,.20));opacity:.8
+  position:absolute;left:0;right:0;top:62%;height:38%;
+  background:linear-gradient(180deg,transparent,rgba(119,97,255,.34));opacity:.95
 }
 @keyframes scanTrackSweep{
-  from{transform:translate3d(0,-100%,0)}
-  to{transform:translate3d(0,100%,0)}
+  0%,100%{transform:translate3d(0,-100%,0)}
+  50%{transform:translate3d(0,0,0)}
 }
 @media (prefers-reduced-motion:reduce){
   .scan-track,.reveal-track,.reveal-cutout{animation:none}
