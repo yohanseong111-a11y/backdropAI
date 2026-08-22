@@ -342,6 +342,9 @@ export function buildLocalColourModels(rgb, alpha, width, height, options = {}) 
 
   const foregroundBins = Array.from({ length: cells }, () => new Map());
   const backgroundBins = Array.from({ length: cells }, () => new Map());
+  const borderBackground = options.onlyBorderBackground === false
+    ? null
+    : borderConnectedLowAlpha(alpha, width, height, backgroundLevel);
 
   for (let y = 0; y < height; y += stride) {
     const row = Math.min(cellsY - 1, (y / cellSize) | 0);
@@ -350,7 +353,9 @@ export function buildLocalColourModels(rgb, alpha, width, height, options = {}) 
       const a = alpha[i];
       let bins = null;
       if (a >= foregroundLevel) bins = foregroundBins[row * cellsX + Math.min(cellsX - 1, (x / cellSize) | 0)];
-      else if (a <= backgroundLevel) bins = backgroundBins[row * cellsX + Math.min(cellsX - 1, (x / cellSize) | 0)];
+      else if (a <= backgroundLevel && (!borderBackground || borderBackground[i])) {
+        bins = backgroundBins[row * cellsX + Math.min(cellsX - 1, (x / cellSize) | 0)];
+      }
       if (!bins) continue;
       const o = i * 4;
       const key = ((rgb[o] >> 4) << 8) | ((rgb[o + 1] >> 4) << 4) | (rgb[o + 2] >> 4);
@@ -470,12 +475,89 @@ export function colourDistanceMaps(rgb, models, width, height) {
 }
 
 /**
+ * Transparency that actually touches the photo border.
+ *
+ * Interior holes — zipper hardware, specular shine, a wrinkle the model dropped —
+ * are not background. Treating them as seeds is what punched rectangular chunks
+ * out of garments: the hole sampled the fabric as "background", then reclaim ate
+ * every neighbouring cell of the same colour.
+ */
+export function borderConnectedLowAlpha(alpha, width, height, level = 16) {
+  const total = width * height;
+  const out = new Uint8Array(total);
+  const queue = new Int32Array(total);
+  let head = 0;
+  let tail = 0;
+  const push = index => {
+    if (index < 0 || index >= total || out[index] || alpha[index] > level) return;
+    out[index] = 1;
+    queue[tail++] = index;
+  };
+  for (let x = 0; x < width; x++) {
+    push(x);
+    push((height - 1) * width + x);
+  }
+  for (let y = 0; y < height; y++) {
+    push(y * width);
+    push(y * width + width - 1);
+  }
+  while (head < tail) {
+    const i = queue[head++];
+    const x = i % width;
+    if (x > 0) push(i - 1);
+    if (x < width - 1) push(i + 1);
+    if (i >= width) push(i - width);
+    if (i < total - width) push(i + width);
+  }
+  return out;
+}
+
+/**
+ * Put back solid interior pixels that the guided filter faded. Edge band only —
+ * the gap between two legs stays eligible for later colour-guided reclaim.
+ */
+export function restoreGuidedInterior(original, guided, width, height, edgeBand = 8) {
+  const total = width * height;
+  const out = new Uint8Array(guided);
+  const distance = new Int32Array(total).fill(-1);
+  const queue = new Int32Array(total);
+  let head = 0;
+  let tail = 0;
+  for (let i = 0; i < total; i++) {
+    if (original[i] > 16) continue;
+    distance[i] = 0;
+    queue[tail++] = i;
+  }
+  while (head < tail) {
+    const i = queue[head++];
+    const d = distance[i];
+    if (d >= edgeBand) continue;
+    const x = i % width;
+    const add = index => {
+      if (index < 0 || index >= total || distance[index] >= 0) return;
+      distance[index] = d + 1;
+      queue[tail++] = index;
+    };
+    if (x > 0) add(i - 1);
+    if (x < width - 1) add(i + 1);
+    if (i >= width) add(i - width);
+    if (i < total - width) add(i + width);
+  }
+  for (let i = 0; i < total; i++) {
+    if (original[i] < 240 || guided[i] >= 128) continue;
+    if (distance[i] < 0 || distance[i] > edgeBand) out[i] = original[i];
+  }
+  return out;
+}
+
+/**
  * Grow the already-transparent region into pixels the mask kept but that clearly
  * belong to the background: leftover halo, fragments beside the subject and the
  * gaps a small mask filled in (between legs, between an arm and the body).
  *
- * Growth is connected — it always starts from proven background — and is stopped by
- * real image edges, so it cannot tunnel through the subject outline.
+ * Growth is connected — it always starts from *border-connected* background — and
+ * is stopped by real image edges, so it cannot tunnel through the subject outline
+ * from a hole the model punched in a zipper or highlight.
  */
 export function reclaimConnectedBackground(alpha, distances, edges, width, height, options = {}) {
   const total = width * height;
@@ -483,18 +565,22 @@ export function reclaimConnectedBackground(alpha, distances, edges, width, heigh
   const separation = options.separation ?? 1.3;
   const edgeLimit = options.edgeLimit ?? 0.3;
   const seedLevel = options.seedLevel ?? 16;
+  const protectLevel = options.protectLevel ?? 220;
+  const protectSeparation = options.protectSeparation ?? 1.2;
+  const original = options.original || alpha;
   const { toForeground, toBackground, backgroundTrust } = distances;
 
   const out = new Uint8Array(alpha);
   const queue = new Int32Array(total);
   const seen = new Uint8Array(total);
+  const seeds = borderConnectedLowAlpha(alpha, width, height, seedLevel);
   let head = 0;
   let tail = 0;
   let removed = 0;
   let evidenceSum = 0;
 
   for (let i = 0; i < total; i++) {
-    if (alpha[i] <= seedLevel) {
+    if (seeds[i]) {
       seen[i] = 1;
       queue[tail++] = i;
     }
@@ -509,6 +595,13 @@ export function reclaimConnectedBackground(alpha, distances, edges, width, heigh
     // The pixel has to look clearly more like background than like the subject.
     if (toForeground[index] < background * separation) return;
     if (edges[index] > edgeLimit) return;
+    // Solid garment pixels stay unless they look more like the backdrop than
+    // like the subject. This is what stops a cyan jacket disappearing into a
+    // green carpet just because the model nicked the zipper.
+    if (
+      original[index] >= protectLevel &&
+      toForeground[index] <= background * protectSeparation
+    ) return;
     out[index] = 0;
     removed++;
     evidenceSum += toForeground[index] - background;
@@ -798,6 +891,25 @@ export function shapeSurvived(before, after, width, height, limits = {}) {
   );
 }
 
+/**
+ * Solid garment pixels that still look like the subject must survive. Halo and
+ * filled-in gaps look like the backdrop, so those are allowed to go.
+ */
+export function solidSubjectSurvived(before, after, distances, limits = {}) {
+  const level = limits.level ?? 220;
+  const minKeep = limits.minKeep ?? 0.97;
+  const { toForeground, toBackground } = distances;
+  let solid = 0;
+  let kept = 0;
+  for (let i = 0; i < before.length; i++) {
+    if (before[i] < level) continue;
+    if (toForeground[i] > toBackground[i] * 1.15) continue;
+    solid++;
+    if (after[i] >= 128) kept++;
+  }
+  return !solid || kept / solid >= minKeep;
+}
+
 const identityBreathe = () => Promise.resolve();
 
 /**
@@ -838,7 +950,7 @@ export async function refineForegroundAlpha({ rgb, alpha, width, height, options
     guidedAlpha[i] = value < 6 ? 0 : value > 249 ? 255 : value;
   }
   if (shapeSurvived(current, guidedAlpha, width, height, { minArea: 0.86, minSpan: 0.9 })) {
-    current = guidedAlpha;
+    current = restoreGuidedInterior(current, guidedAlpha, width, height, options.guideInteriorBand ?? 8);
     report.guided = true;
   }
   await breathe();
@@ -847,8 +959,18 @@ export async function refineForegroundAlpha({ rgb, alpha, width, height, options
   const distances = colourDistanceMaps(rgb, models, width, height);
   await breathe();
 
+  // Close zipper / highlight holes *before* reclaim so they cannot be mistaken
+  // for background and then grow into missing chunks of the garment.
+  const holes = fillSubjectHoles(current, distances, width, height, options.holes);
+  current = holes.alpha;
+  report.filled = holes.filled;
+  await breathe();
+
   const beforeReclaim = current;
-  const reclaim = reclaimConnectedBackground(current, distances, edges, width, height, options.reclaim);
+  const reclaim = reclaimConnectedBackground(current, distances, edges, width, height, {
+    original: beforeReclaim,
+    ...options.reclaim
+  });
   report.evidence = Math.round(reclaim.evidence);
   if (
     reclaim.removed &&
@@ -856,16 +978,17 @@ export async function refineForegroundAlpha({ rgb, alpha, width, height, options
     shapeSurvived(beforeReclaim, reclaim.alpha, width, height, {
       minArea: options.reclaimMinArea ?? 0.4,
       minSpan: options.reclaimMinSpan ?? 0.8
-    })
+    }) &&
+    solidSubjectSurvived(beforeReclaim, reclaim.alpha, distances, options.solid)
   ) {
     current = reclaim.alpha;
     report.reclaimed = reclaim.removed;
   }
   await breathe();
 
-  const holes = fillSubjectHoles(current, distances, width, height, options.holes);
-  current = holes.alpha;
-  report.filled = holes.filled;
+  const afterHoles = fillSubjectHoles(current, distances, width, height, options.holes);
+  current = afterHoles.alpha;
+  report.filled += afterHoles.filled;
 
   current = removeTinyForegroundIslands(current, width, height);
   await breathe();
@@ -878,10 +1001,13 @@ export async function refineForegroundAlpha({ rgb, alpha, width, height, options
   current = featherAlphaBand(current, width, height, options.feather);
   await breathe();
 
-  if (!shapeSurvived(alpha, current, width, height, {
-    minArea: options.finalMinArea ?? 0.5,
-    minSpan: options.finalMinSpan ?? 0.72
-  })) {
+  if (
+    !shapeSurvived(alpha, current, width, height, {
+      minArea: options.finalMinArea ?? 0.5,
+      minSpan: options.finalMinSpan ?? 0.72
+    }) ||
+    !solidSubjectSurvived(alpha, current, distances, options.solid)
+  ) {
     report.rolledBack = true;
     return { alpha: removeTinyForegroundIslands(alpha, width, height), report };
   }

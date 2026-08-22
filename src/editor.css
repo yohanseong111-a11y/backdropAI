@@ -21,19 +21,6 @@
   content:"";position:absolute;inset:0;pointer-events:none;
   background:linear-gradient(180deg,rgba(118,95,255,.04),transparent 25%,transparent 75%,rgba(118,95,255,.04))
 }
-.scan-line{
-  position:absolute;left:0;right:0;height:2px;top:0;z-index:5;
-  background:linear-gradient(90deg,transparent,#b6a9ff 15%,#fff 50%,#b6a9ff 85%,transparent);
-  box-shadow:0 0 14px rgba(151,130,255,.9);
-  animation:scanSweep 1.55s cubic-bezier(.45,0,.55,1) infinite alternate
-}
-.scan-glow{
-  position:absolute;left:0;right:0;height:22%;top:0;z-index:4;pointer-events:none;
-  background:linear-gradient(180deg,rgba(125,105,255,.20),rgba(125,105,255,0));
-  animation:scanSweepGlow 1.55s cubic-bezier(.45,0,.55,1) infinite alternate
-}
-@keyframes scanSweep{from{top:2%}to{top:98%}}
-@keyframes scanSweepGlow{from{top:0}to{top:78%}}
 
 /* cutout editor */
 .modal{
@@ -89,8 +76,9 @@
   .quality-row{align-items:flex-start;flex-direction:column}.quality-row select{width:100%}
 }
 
-/* final scan reveal: processed cutout replaces original behind the moving line */
-.preview-wrap.revealing { position: relative; overflow: hidden; }
+/* Reveal: cutout wipes in top-to-bottom once. The line rides a transforming track
+   so layout never recalculates `top` on every frame. */
+.preview-wrap.revealing { position: relative; overflow: hidden; isolation:isolate; }
 .reveal-original,
 .reveal-cutout {
   position:absolute; inset:0; width:100%; height:100%; object-fit:contain; display:block;
@@ -98,35 +86,26 @@
 .reveal-original { z-index:1; }
 .reveal-cutout {
   z-index:2;
-  animation: cutoutRevealDown .78s cubic-bezier(.3,.7,.2,1) forwards;
   clip-path: inset(0 0 100% 0);
+  animation: cutoutRevealDown .9s cubic-bezier(.22,.68,.18,1) forwards;
+}
+.reveal-track{
+  position:absolute;inset:0;z-index:6;pointer-events:none;
+  transform:translate3d(0,-100%,0);
+  animation:revealTrack .9s cubic-bezier(.22,.68,.18,1) forwards;
 }
 .reveal-scan-line {
-  position:absolute; left:-3%; width:106%; height:3px; top:0; z-index:6;
+  position:absolute; left:-3%; right:-3%; top:100%; height:2px;
   border-radius:999px;
   background:linear-gradient(90deg,transparent 0%,rgba(174,160,255,.45) 11%,#fff 50%,rgba(174,160,255,.45) 89%,transparent 100%);
   box-shadow:0 0 9px rgba(255,255,255,.8),0 0 22px rgba(132,111,255,.8);
-  animation: revealLineDown .78s cubic-bezier(.3,.7,.2,1) forwards;
 }
 @keyframes cutoutRevealDown { from { clip-path: inset(0 0 100% 0); } to { clip-path: inset(0 0 0 0); } }
-@keyframes revealLineDown { from { top:0%; } to { top:calc(100% - 3px); } }
-
-/* thinner, cleaner scanner while inference is running */
-.scan-line {
-  height:1.5px;
-  animation-duration:.92s;
-  box-shadow:0 0 8px rgba(255,255,255,.7),0 0 18px rgba(132,111,255,.68);
-}
-.scan-glow { height:14%; animation-duration:.92s; opacity:.55; }
+@keyframes revealTrack { from { transform:translate3d(0,-100%,0); } to { transform:translate3d(0,0,0); } }
 .status.revealing { background:rgba(81,65,184,.92); }
 
 /* vNext: selection, background preview, filters and smoother scanner */
 .processing-original{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block;z-index:1}
-.preview-wrap.scanning .scan-line,.preview-wrap.scanning .scan-glow{will-change:transform,top;transform:translateZ(0);backface-visibility:hidden}
-.preview-wrap.scanning .scan-line{z-index:7;animation:scanSweepFast .86s linear infinite alternate}
-.preview-wrap.scanning .scan-glow{z-index:6;animation:scanGlowFast .86s linear infinite alternate}
-@keyframes scanSweepFast{0%{top:1%}100%{top:98%}}
-@keyframes scanGlowFast{0%{top:-8%}100%{top:84%}}
 
 .photo-card{position:relative;transition:border-color .15s ease,box-shadow .15s ease,transform .15s ease}
 .photo-card,.preview-wrap,.preview-canvas{contain:paint}.preview-canvas{transform:translateZ(0);backface-visibility:hidden}
@@ -142,10 +121,7 @@ fieldset{border:0;padding:0;margin:0;min-width:0}fieldset:disabled{opacity:.42}.
 .background-preview{margin-top:10px;padding:9px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.07);border-radius:13px;display:grid;grid-template-columns:60px 1fr 30px;align-items:center;gap:10px}
 .background-preview img{width:60px;height:48px;object-fit:cover;border-radius:9px;background:#08080a}.background-preview>div{min-width:0;display:flex;flex-direction:column;gap:3px}.background-preview strong{font-size:11px}.background-preview span{font-size:9px;color:#777780;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.icon-btn.mini{width:30px;height:30px;font-size:17px;border-radius:9px}
 
-/* reveal is the real processed result, exposed exactly behind the scan line */
-.preview-wrap.revealing{isolation:isolate}
-.reveal-cutout{will-change:clip-path;animation-duration:.72s}
-.reveal-scan-line{will-change:top;animation-duration:.72s;height:2px}
+.reveal-cutout{will-change:clip-path}
 
 @media(max-width:700px){
   .select-chip{width:25px;height:25px;right:8px;top:8px}
@@ -179,12 +155,29 @@ fieldset{border:0;padding:0;margin:0;min-width:0}fieldset:disabled{opacity:.42}.
 
 .gallery{touch-action:pan-y}.gallery.drag-select-active{cursor:crosshair}.drag-select-box{backdrop-filter:brightness(1.06)}
 
-/* Compositor-driven scanner: the full-height track moves, instead of animating top on the line itself. */
-.scan-track{position:absolute;inset:0;z-index:7;pointer-events:none;will-change:transform;transform:translate3d(0,-100%,0);animation:scanTrackSweep .82s cubic-bezier(.42,0,.58,1) infinite alternate}
-.scan-track .scan-line{position:absolute;left:-3%;right:-3%;top:100%;height:2px;animation:none;background:linear-gradient(90deg,transparent 0%,rgba(181,169,255,.6) 13%,#fff 50%,rgba(181,169,255,.6) 87%,transparent 100%);box-shadow:0 0 8px rgba(255,255,255,.82),0 0 20px rgba(130,108,255,.8)}
-.scan-track .scan-glow{position:absolute;left:0;right:0;top:82%;height:18%;animation:none;background:linear-gradient(180deg,transparent,rgba(119,97,255,.20));opacity:.8}
-@keyframes scanTrackSweep{from{transform:translate3d(0,-100%,0)}to{transform:translate3d(0,0,0)}}
-.preview-wrap.scanning .scan-line,.preview-wrap.scanning .scan-glow{animation:none!important;transform:none!important}
+/* One-way compositor scan: the track translates, never `top`, and never bounces. */
+.scan-track{
+  position:absolute;inset:0;z-index:7;pointer-events:none;
+  will-change:transform;transform:translate3d(0,-100%,0);
+  animation:scanTrackSweep 1.35s linear infinite;
+}
+.scan-track .scan-line{
+  position:absolute;left:-3%;right:-3%;top:100%;height:2px;
+  background:linear-gradient(90deg,transparent 0%,rgba(181,169,255,.6) 13%,#fff 50%,rgba(181,169,255,.6) 87%,transparent 100%);
+  box-shadow:0 0 8px rgba(255,255,255,.82),0 0 20px rgba(130,108,255,.8)
+}
+.scan-track .scan-glow{
+  position:absolute;left:0;right:0;top:82%;height:18%;
+  background:linear-gradient(180deg,transparent,rgba(119,97,255,.20));opacity:.8
+}
+@keyframes scanTrackSweep{
+  from{transform:translate3d(0,-100%,0)}
+  to{transform:translate3d(0,100%,0)}
+}
+@media (prefers-reduced-motion:reduce){
+  .scan-track,.reveal-track,.reveal-cutout{animation:none}
+  .reveal-cutout{clip-path:none}
+}
 
 /* Two-column workspace: each column scrolls on its own, and once a column reaches
    an end the gesture continues into the page (overscroll chaining for touch,

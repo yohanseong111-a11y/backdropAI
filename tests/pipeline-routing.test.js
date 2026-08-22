@@ -16,6 +16,7 @@ test("segmentation is the primary route and the colour flood is only a fallback"
 test("every cutout goes through the same refinement before it is composited", () => {
   const apply = section("async function applyDualMaskToFile", "function warmBackshotEngine");
   assert.match(apply, /resampleAlpha\(rawAlpha,maskWidth,maskHeight/);
+  assert.match(apply, /refineAlphaOffMainThread/);
   assert.match(apply, /refineForegroundAlpha\(/);
   assert.match(apply, /globalCompositeOperation="destination-in"/);
   assert.match(apply, /imageSmoothingQuality="high"/);

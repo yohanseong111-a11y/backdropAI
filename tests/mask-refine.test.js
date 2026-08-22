@@ -17,7 +17,10 @@ import {
   alphaBounds,
   largestComponentBounds,
   shapeSurvived,
-  refineForegroundAlpha
+  refineForegroundAlpha,
+  borderConnectedLowAlpha,
+  restoreGuidedInterior,
+  solidSubjectSurvived
 } from "../src/mask-refine.js";
 import {
   SCENE,
@@ -27,6 +30,11 @@ import {
   subjectRetention,
   backgroundLeftover
 } from "./fixtures/scene.js";
+import {
+  JACKET,
+  buildJacketScene,
+  buildJacketCoarseAlpha
+} from "./fixtures/jacket.js";
 
 test("box mean averages the requested window and clamps at the borders", () => {
   const width = 4;
@@ -106,6 +114,42 @@ test("local colour models report how far away their evidence came from", () => {
   assert.ok(toBackground[gapIndex] < toForeground[gapIndex], "the gap must look like background");
   assert.ok(toForeground[legIndex] < toBackground[legIndex], "a leg must look like the subject");
   assert.ok(backgroundTrust[gapIndex] > 0 && backgroundTrust[gapIndex] <= 1);
+});
+
+test("interior holes are not treated as proven background", () => {
+  const width = 12;
+  const height = 12;
+  const total = width * height;
+  const alpha = new Uint8Array(total).fill(255);
+  // A hole in the middle of the garment, the way a zipper nick arrives.
+  alpha[6 * width + 6] = 0;
+  const connected = borderConnectedLowAlpha(alpha, width, height);
+  assert.equal(connected[6 * width + 6], 0);
+  assert.equal(connected[0], 0);
+
+  const distances = {
+    toForeground: new Float32Array(total).fill(200),
+    toBackground: new Float32Array(total).fill(5),
+    backgroundTrust: new Float32Array(total).fill(1)
+  };
+  const edges = new Float32Array(total);
+  const grown = reclaimConnectedBackground(alpha, distances, edges, width, height);
+  assert.equal(grown.removed, 0, "a hole inside the subject must not seed reclaim");
+  assert.equal(grown.alpha[6 * width + 6], 0);
+  assert.equal(grown.alpha[6 * width + 5], 255);
+});
+
+test("guided-filter restoration keeps solid interior pixels", () => {
+  const width = 10;
+  const height = 10;
+  const original = new Uint8Array(width * height).fill(255);
+  const guided = new Uint8Array(original);
+  for (let x = 0; x < width; x++) original[x] = 0;
+  guided[5 * width + 5] = 0;
+  guided[1 * width + 5] = 0;
+  const restored = restoreGuidedInterior(original, guided, width, height, 3);
+  assert.equal(restored[5 * width + 5], 255);
+  assert.equal(restored[1 * width + 5], 0, "pixels on the silhouette stay eligible for later reclaim");
 });
 
 test("background reclaim only grows from proven background", () => {
@@ -295,6 +339,36 @@ test("refinement keeps the subject when the mask is already correct", async () =
   const { alpha } = await refineForegroundAlpha({ rgb, alpha: exact, width, height });
   assert.ok(subjectRetention(alpha, truth) > 0.97, "a correct mask must not be eroded");
   assert.ok(backgroundLeftover(alpha, truth) < 0.02, "a correct mask must not grow");
+});
+
+test("a jacket with zipper holes is repaired instead of eaten", async () => {
+  const { rgb, truth, width, height } = buildJacketScene();
+  const coarse = buildJacketCoarseAlpha();
+  const holeBefore = regionStats(coarse, width, JACKET.holeA).share;
+  assert.equal(holeBefore, 0, "the fixture must start with a rectangular bite in the jacket");
+
+  const { alpha } = await refineForegroundAlpha({ rgb, alpha: coarse, width, height });
+  const retained = subjectRetention(alpha, truth);
+  const leftover = backgroundLeftover(alpha, truth);
+  const holeAfter = regionStats(alpha, width, JACKET.holeA).share;
+  const nickAfter = regionStats(alpha, width, JACKET.holeB).share;
+
+  assert.ok(holeAfter > 0.9, `the rectangular bite must close, still ${(holeAfter * 100).toFixed(1)}% missing`);
+  assert.ok(nickAfter > 0.9, `the zipper nick must close, still ${(nickAfter * 100).toFixed(1)}% missing`);
+  assert.ok(retained > 0.96, `the jacket must survive, retained ${retained}`);
+  assert.ok(leftover < 0.08, `the carpet must go, leftover ${leftover}`);
+});
+
+test("solid subject survival ignores pixels that look like the backdrop", () => {
+  const before = Uint8Array.from([255, 255, 255, 255]);
+  const after = Uint8Array.from([255, 0, 255, 255]);
+  const distances = {
+    toForeground: Float32Array.from([4, 180, 4, 4]),
+    toBackground: Float32Array.from([180, 4, 180, 180])
+  };
+  assert.equal(solidSubjectSurvived(before, after, distances, { minKeep: 0.97 }), true);
+  const eaten = Uint8Array.from([0, 0, 255, 0]);
+  assert.equal(solidSubjectSurvived(before, eaten, distances, { minKeep: 0.97 }), false);
 });
 
 test("refinement never returns an empty cutout", async () => {

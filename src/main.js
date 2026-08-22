@@ -305,7 +305,7 @@ function renderGallery() {
         ${item.status === "processing" ? `<img class="processing-original" src="${item.originalURL}" alt="" /><div class="scan-track"><div class="scan-glow"></div><div class="scan-line"></div></div>` : item.status === "revealing" ? `
           <img class="reveal-original" src="${item.originalURL}" alt="" />
           <img class="reveal-cutout" src="${item.cutoutURL}" alt="" />
-          <div class="reveal-scan-line"></div>
+          <div class="reveal-track"><div class="reveal-scan-line"></div></div>
         ` : `<canvas class="preview-canvas" data-index="${index}"></canvas>`}
         <button class="select-chip" data-select="${item.id}" type="button">${state.selected.has(item.id) ? "✓" : ""}</button>
         <div class="status ${item.status}" title="${item.error ? escapeHtml(item.error) : ""}">${statusText(item)}</div>
@@ -668,9 +668,66 @@ function debugMaskStage(label,alpha,w,h){
 }
 
 function breathe(){
-  // Long typed-array passes must not starve the scan animation or the mobile
-  // browser watchdog.
-  return new Promise(resolve=>setTimeout(resolve,0));
+  // Yield a real frame so the scan line can keep moving. setTimeout(0) alone
+  // still lets a long refine pass freeze the compositor.
+  return new Promise(resolve=>requestAnimationFrame(()=>setTimeout(resolve,0)));
+}
+
+let refineWorker=null;
+let refineSeq=0;
+const refinePending=new Map();
+
+function getRefineWorker(){
+  if(refineWorker)return refineWorker;
+  refineWorker=new Worker(new URL("./refine-worker.js",import.meta.url),{type:"module"});
+  refineWorker.onmessage=e=>{
+    const msg=e.data||{};
+    const job=refinePending.get(msg.id);
+    if(!job)return;
+    refinePending.delete(msg.id);
+    if(msg.type==="done")job.resolve({alpha:new Uint8Array(msg.alphaBuffer),report:msg.report||{}});
+    else job.reject(new Error(msg.error||"Mask refinement failed."));
+  };
+  refineWorker.onerror=e=>{
+    const reason=e?.message?`Mask refinement worker crashed: ${e.message}`:"Mask refinement worker crashed.";
+    for(const [id,job] of refinePending){job.reject(new Error(reason));refinePending.delete(id);}
+    try{refineWorker.terminate();}catch{}
+    refineWorker=null;
+  };
+  return refineWorker;
+}
+
+function refineAlphaOffMainThread({rgb,alpha,width,height,options}){
+  return new Promise((resolve,reject)=>{
+    let worker;
+    try{worker=getRefineWorker();}
+    catch(error){reject(error);return;}
+    const id=++refineSeq;
+    const rgbCopy=Uint8ClampedArray.from(rgb);
+    const alphaCopy=Uint8Array.from(alpha);
+    const timeout=setTimeout(()=>{
+      refinePending.delete(id);
+      reject(new Error("Mask refinement timed out."));
+    },120000);
+    refinePending.set(id,{
+      resolve:result=>{clearTimeout(timeout);resolve(result);},
+      reject:error=>{clearTimeout(timeout);reject(error);}
+    });
+    try{
+      worker.postMessage({
+        id,
+        rgbBuffer:rgbCopy.buffer,
+        alphaBuffer:alphaCopy.buffer,
+        width,
+        height,
+        options
+      },[rgbCopy.buffer,alphaCopy.buffer]);
+    }catch(error){
+      clearTimeout(timeout);
+      refinePending.delete(id);
+      reject(error);
+    }
+  });
 }
 
 function alphaToMaskCanvas(alpha,width,height){
@@ -778,14 +835,21 @@ async function applyDualMaskToFile(file,primaryBuffer,safetyBuffer,maskWidth,mas
     work.height
   );
 
-  const {alpha:refined,report}=await refineForegroundAlpha({
+  let refined;
+  let report;
+  const refineInput={
     rgb:workRGB,
     alpha:guard,
     width:work.width,
     height:work.height,
-    options:{reclaim:profile==="fast"?{backgroundTolerance:54,separation:1.4}:undefined},
-    breathe
-  });
+    options:{reclaim:profile==="fast"?{backgroundTolerance:54,separation:1.4}:undefined}
+  };
+  try{
+    ({alpha:refined,report}=await refineAlphaOffMainThread(refineInput));
+  }catch(error){
+    console.warn("Mask refinement worker unavailable; refining on the page",error);
+    ({alpha:refined,report}=await refineForegroundAlpha({...refineInput,breathe}));
+  }
   debugMaskStage("03-refined",refined,work.width,work.height);
   if(new URLSearchParams(location.search).has("debugMasks")){
     document.documentElement.dataset.refineReport=JSON.stringify(report);
@@ -959,7 +1023,7 @@ async function removeOne(item,queueTotal){
 
     // Let the compositor-driven wipe finish before replacing its DOM. Cutting
     // this short caused the final frame to flash in larger batches.
-    await new Promise(resolve=>setTimeout(resolve,740));
+    await new Promise(resolve=>setTimeout(resolve,920));
 
     item.status="done";
     item.error=null;
