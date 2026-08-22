@@ -8,7 +8,8 @@ import {
   recoverDeletedSubject,
   cornerBackgroundSeed,
   restoreNonBackgroundPanels,
-  looksLikeBackdropColour
+  looksLikeBackdropColour,
+  looksLikeSecondaryGarment
 } from "../src/mask-recover.js";
 import {readPng} from "./helpers/png.js";
 import { refineForegroundAlpha } from "../src/mask-refine.js";
@@ -23,6 +24,7 @@ import {
   buildTwoToneJacket,
   buildTwoToneCoarseAlpha,
   buildWrinkledTwoToneJacket,
+  buildJacketOnGrassAndWhiteRug,
   isJacket
 } from "./fixtures/jacket.js";
 import { regionStats, subjectRetention, backgroundLeftover } from "./fixtures/scene.js";
@@ -198,6 +200,25 @@ test("the real jacket close-up keeps navy shoulders and drops the green carpet",
   assert.ok(refinedScore.navy > 0.78, `refined navy ${refinedScore.navy}`);
   assert.ok(refinedScore.carpet < 0.18, `refined carpet ${refinedScore.carpet}`);
   assert.ok(refinedScore.cyan > 0.95, `refined cyan ${refinedScore.cyan}`);
+});
+
+test("a white rug touching the sleeve is not restored with the navy yoke", async () => {
+  const scene = buildJacketOnGrassAndWhiteRug();
+  const { rgb, truth, width, height, collar, rug } = scene;
+  const coarse = buildTwoToneCoarseAlpha(scene);
+  assert.equal(looksLikeSecondaryGarment(20, 28, 58), true, "navy is a garment panel");
+  assert.equal(looksLikeSecondaryGarment(214, 210, 204), false, "white pile is not a garment panel");
+  assert.equal(looksLikeBackdropColour(214, 210, 204, cornerBackgroundSeed(rgb, width, height), 42), true);
+
+  const recovered = recoverDeletedSubject(rgb, coarse, width, height);
+  assert.ok(regionStats(recovered.alpha, width, collar).share > 0.85, "navy yoke must still come back");
+  assert.ok(regionStats(recovered.alpha, width, rug).share < 0.08, "the letter rug must stay gone");
+
+  const { alpha } = await refineForegroundAlpha({ rgb, alpha: coarse, width, height });
+  assert.ok(regionStats(alpha, width, collar).share > 0.85, "refine must keep navy");
+  assert.ok(regionStats(alpha, width, rug).share < 0.1, `rug leftover ${regionStats(alpha, width, rug).share}`);
+  assert.ok(subjectRetention(alpha, truth) > 0.9);
+  assert.ok(backgroundLeftover(alpha, truth) < 0.12);
 });
 
 test("a jacket bite that reaches the frame is repaired by the full refine pass", async () => {

@@ -283,6 +283,56 @@ export function buildWrinkledTwoToneJacket() {
   return { rgb, truth, width, height, body, collar };
 }
 
+/**
+ * Outdoor fail: navy yoke next to a white letter-rug that touches the sleeve.
+ * The unbounded non-green grow painted that rug back with the shoulders.
+ */
+export function buildJacketOnGrassAndWhiteRug() {
+  const width = 160;
+  const height = 200;
+  const rgb = new Uint8ClampedArray(width * height * 4);
+  const truth = new Uint8Array(width * height);
+  const random = mulberry32(44);
+  const body = { x0: 28, x1: 118, y0: 78, y1: 184 };
+  const collar = { x0: 34, x1: 112, y0: 16, y1: 78 };
+  const rug = { x0: 118, x1: 156, y0: 40, y1: 150 };
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      const o = i * 4;
+      const inBody = x >= body.x0 && x < body.x1 && y >= body.y0 && y < body.y1;
+      const inCollar = x >= collar.x0 && x < collar.x1 && y >= collar.y0 && y < collar.y1;
+      const inRug = x >= rug.x0 && x < rug.x1 && y >= rug.y0 && y < rug.y1;
+      if (inBody || inCollar) {
+        truth[i] = 1;
+        const shade = random() * 12 - 6;
+        if (inCollar) {
+          rgb[o] = 20 + shade * 0.4;
+          rgb[o + 1] = 28 + shade * 0.4;
+          rgb[o + 2] = 58 + shade * 0.5;
+        } else {
+          rgb[o] = 10 + shade * 0.2;
+          rgb[o + 1] = 168 + shade;
+          rgb[o + 2] = 226 + shade;
+        }
+      } else if (inRug) {
+        const pile = random() * 16 - 4;
+        rgb[o] = 214 + pile;
+        rgb[o + 1] = 210 + pile;
+        rgb[o + 2] = 204 + pile * 0.6;
+      } else {
+        const pile = random() * 22 - 11;
+        rgb[o] = 36 + pile;
+        rgb[o + 1] = 112 + pile;
+        rgb[o + 2] = 42 + pile * 0.6;
+      }
+      rgb[o + 3] = 255;
+    }
+  }
+  return { rgb, truth, width, height, body, collar, rug };
+}
+
 export function buildTwoToneCoarseAlpha(scene) {
   const { width, height, body, collar } = scene;
   const alpha = new Uint8Array(width * height);
