@@ -175,6 +175,62 @@ export function buildLitJacketShadowWipe(scene) {
   return alpha;
 }
 
+/**
+ * The live photo: cyan body + navy collar/yoke on green carpet. RMBG keeps
+ * the bright body and deletes the dark panel as if it were the backdrop.
+ */
+export function buildTwoToneJacket() {
+  const width = 160;
+  const height = 200;
+  const rgb = new Uint8ClampedArray(width * height * 4);
+  const truth = new Uint8Array(width * height);
+  const random = mulberry32(22);
+  const body = { x0: 30, x1: 130, y0: 78, y1: 186 };
+  const collar = { x0: 38, x1: 122, y0: 18, y1: 78 };
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      const o = i * 4;
+      const inBody = x >= body.x0 && x < body.x1 && y >= body.y0 && y < body.y1;
+      const inCollar = x >= collar.x0 && x < collar.x1 && y >= collar.y0 && y < collar.y1;
+      if (inBody || inCollar) {
+        truth[i] = 1;
+        const shade = random() * 10 - 5;
+        if (inCollar) {
+          rgb[o] = 18 + shade * 0.3;
+          rgb[o + 1] = 22 + shade * 0.3;
+          rgb[o + 2] = 48 + shade * 0.4;
+        } else {
+          rgb[o] = 10 + shade * 0.2;
+          rgb[o + 1] = 168 + shade;
+          rgb[o + 2] = 226 + shade;
+        }
+      } else {
+        const pile = random() * 22 - 11;
+        rgb[o] = 36 + pile;
+        rgb[o + 1] = 112 + pile;
+        rgb[o + 2] = 42 + pile * 0.6;
+      }
+      rgb[o + 3] = 255;
+    }
+  }
+  return { rgb, truth, width, height, body, collar };
+}
+
+export function buildTwoToneCoarseAlpha(scene) {
+  const { width, height, body, collar } = scene;
+  const alpha = new Uint8Array(width * height);
+  for (let y = body.y0; y < body.y1; y++) {
+    for (let x = body.x0; x < body.x1; x++) alpha[y * width + x] = 255;
+  }
+  // Model deleted the navy collar completely.
+  for (let y = collar.y0; y < collar.y1; y++) {
+    for (let x = collar.x0; x < collar.x1; x++) alpha[y * width + x] = 0;
+  }
+  return alpha;
+}
+
 export function buildFullBleedCoarseAlpha(scene) {
   const { width, height, hole, carpet } = scene;
   const alpha = new Uint8Array(width * height).fill(255);

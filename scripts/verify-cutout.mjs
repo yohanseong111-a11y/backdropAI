@@ -88,8 +88,8 @@ await page.click("#removeAllBtn");
 await page.waitForSelector(".preview-wrap.scanning");
 
 const scan=await page.evaluate(async()=>{
-  const track=document.querySelector(".scan-track");
-  if(!track)return {ok:false,reason:"no scan-track"};
+  const track=document.querySelector(".scan-beam");
+  if(!track)return {ok:false,reason:"no scan-beam"};
   const read=()=>{
     const style=getComputedStyle(track);
     const matrix=new DOMMatrixReadOnly(style.transform);
@@ -119,8 +119,9 @@ const quality=await page.evaluate(async()=>{
   const ctx=canvas.getContext("2d");
   const {width,height}=canvas;
   const data=ctx.getImageData(0,0,width,height).data;
-  const jacket={x0:Math.round(width*0.22),x1:Math.round(width*0.78),y0:Math.round(height*0.28),y1:Math.round(height*0.82)};
-  const carpet={x0:2,x1:Math.round(width*0.12),y0:2,y1:Math.round(height*0.18)};
+  const jacket={x0:Math.round(width*0.22),x1:Math.round(width*0.78),y0:Math.round(height*0.32),y1:Math.round(height*0.82)};
+  const collar={x0:Math.round(width*0.28),x1:Math.round(width*0.72),y0:Math.round(height*0.16),y1:Math.round(height*0.27)};
+  const carpet={x0:2,x1:Math.round(width*0.12),y0:2,y1:Math.round(height*0.12)};
   const score=(box)=>{
     let kept=0,count=0;
     for(let y=box.y0;y<box.y1;y+=2){
@@ -132,8 +133,9 @@ const quality=await page.evaluate(async()=>{
     return count?kept/count:0;
   };
   const jacketKept=score(jacket);
+  const collarKept=score(collar);
   const carpetKept=score(carpet);
-  return {ok:jacketKept>0.88&&carpetKept<0.2,jacketKept,carpetKept,width,height};
+  return {ok:jacketKept>0.88&&collarKept>0.75&&carpetKept<0.2,jacketKept,collarKept,carpetKept,width,height};
 });
 
 await page.screenshot({path:"/tmp/backshot-verify.png",fullPage:true});

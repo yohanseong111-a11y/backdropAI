@@ -310,6 +310,89 @@ export function restoreSubjectColouredGaps(rgb, alpha, width, height, options = 
   return { alpha: out, restored };
 }
 
+/**
+ * Restore neighbouring garment panels the model deleted because they are a
+ * different colour from the kept fabric (cyan body, navy collar).
+ *
+ * Each transparent blob that touches the subject is scored. Backdrop-coloured
+ * or frame-sized blobs stay gone; a compact navy yoke comes back.
+ */
+export function restoreNonBackgroundPanels(rgb, alpha, width, height, options = {}) {
+  const total = width * height;
+  const subjectLevel = options.subjectLevel ?? 220;
+  const emptyLevel = options.emptyLevel ?? 80;
+  const bgLimit = options.backgroundLimit ?? 42;
+  const panelTolerance = options.panelTolerance ?? 38;
+  const maxShare = options.maxShare ?? 0.4;
+  const seed = options.seed || cornerBackgroundSeed(rgb, width, height);
+  const flood = options.flood || cornerBackgroundFlood(rgb, width, height);
+  const out = new Uint8Array(alpha);
+  const visited = new Uint8Array(total);
+  const queue = new Int32Array(total);
+  let restored = 0;
+
+  const touchesSubject = index => {
+    const x = index % width;
+    if (x > 0 && alpha[index - 1] >= subjectLevel) return true;
+    if (x < width - 1 && alpha[index + 1] >= subjectLevel) return true;
+    if (index >= width && alpha[index - width] >= subjectLevel) return true;
+    if (index < total - width && alpha[index + width] >= subjectLevel) return true;
+    return false;
+  };
+
+  const backdropScore = (r, g, b, index) => {
+    if (flood.confident && flood.subject && flood.subject[index] === 0) return 1;
+    if (!seed) return 0;
+    return colourDistance([r, g, b], seed.colour) < bgLimit ? 1 : 0;
+  };
+
+  for (let start = 0; start < total; start++) {
+    if (visited[start] || alpha[start] > emptyLevel) continue;
+    let head = 0;
+    let tail = 0;
+    visited[start] = 1;
+    queue[tail++] = start;
+    const pixels = [];
+    let r = 0, g = 0, b = 0;
+    let backdropHits = 0;
+    let nextToSubject = false;
+    while (head < tail) {
+      const i = queue[head++];
+      pixels.push(i);
+      const o = i * 4;
+      r += rgb[o];
+      g += rgb[o + 1];
+      b += rgb[o + 2];
+      backdropHits += backdropScore(rgb[o], rgb[o + 1], rgb[o + 2], i);
+      if (!nextToSubject && touchesSubject(i)) nextToSubject = true;
+      const x = i % width;
+      const add = index => {
+        if (index < 0 || index >= total || visited[index] || alpha[index] > emptyLevel) return;
+        const no = index * 4;
+        if (colourDistance([rgb[no], rgb[no + 1], rgb[no + 2]], [rgb[o], rgb[o + 1], rgb[o + 2]]) > panelTolerance) return;
+        visited[index] = 1;
+        queue[tail++] = index;
+      };
+      if (x > 0) add(i - 1);
+      if (x < width - 1) add(i + 1);
+      if (i >= width) add(i - width);
+      if (i < total - width) add(i + width);
+    }
+    if (!nextToSubject) continue;
+    if (pixels.length > total * maxShare) continue;
+    const mean = [r / pixels.length, g / pixels.length, b / pixels.length];
+    if (seed && colourDistance(mean, seed.colour) < bgLimit) continue;
+    if (backdropHits / pixels.length > 0.45) continue;
+    for (const i of pixels) {
+      if (out[i] >= subjectLevel) continue;
+      out[i] = 255;
+      restored++;
+    }
+  }
+
+  return { alpha: out, restored };
+}
+
 function unionSubject(alpha, extra) {
   if (!extra) return { alpha, added: 0 };
   const out = new Uint8Array(alpha);
@@ -342,10 +425,17 @@ export function recoverDeletedSubject(rgb, alpha, width, height) {
     added = merged.added;
   }
   const gaps = restoreSubjectColouredGaps(rgb, current, width, height);
+  current = gaps.alpha;
+  added += gaps.restored;
+  // A two-tone jacket (cyan body, navy collar) is two colours. The first
+  // pass only grows shades of the colour the model kept. This second pass
+  // grows from that fabric into neighbouring panels that are clearly not
+  // the backdrop — the navy yoke the model treated as carpet.
+  const panels = restoreNonBackgroundPanels(rgb, current, width, height, { flood });
   return {
-    alpha: gaps.alpha,
+    alpha: panels.alpha,
     inverted,
-    restored: gaps.restored + added,
+    restored: added + panels.restored,
     cornerFlood: flood.confident && (inverted || interiorOpaque < 0.45)
   };
 }

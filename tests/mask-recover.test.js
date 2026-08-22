@@ -6,7 +6,8 @@ import {
   maskLooksInverted,
   restoreSubjectColouredGaps,
   recoverDeletedSubject,
-  cornerBackgroundSeed
+  cornerBackgroundSeed,
+  restoreNonBackgroundPanels
 } from "../src/mask-recover.js";
 import { refineForegroundAlpha } from "../src/mask-refine.js";
 import {
@@ -17,6 +18,8 @@ import {
   buildFullBleedCoarseAlpha,
   buildLitJacketScene,
   buildLitJacketShadowWipe,
+  buildTwoToneJacket,
+  buildTwoToneCoarseAlpha,
   isJacket
 } from "./fixtures/jacket.js";
 import { regionStats, subjectRetention, backgroundLeftover } from "./fixtures/scene.js";
@@ -107,6 +110,21 @@ test("a shadowed jacket side that the model deleted still comes back", async () 
 
   const { alpha } = await refineForegroundAlpha({ rgb, alpha: coarse, width, height });
   assert.ok(regionStats(alpha, width, shadow).share > 0.9, "refine must keep the shadowed fabric");
+  assert.ok(subjectRetention(alpha, truth) > 0.94, `jacket retained ${subjectRetention(alpha, truth)}`);
+  assert.ok(backgroundLeftover(alpha, truth) < 0.1, `carpet leftover ${backgroundLeftover(alpha, truth)}`);
+});
+
+test("a navy collar deleted next to a cyan body is restored, carpet stays gone", async () => {
+  const scene = buildTwoToneJacket();
+  const { rgb, truth, width, height, collar } = scene;
+  const coarse = buildTwoToneCoarseAlpha(scene);
+  assert.equal(regionStats(coarse, width, collar).share, 0, "the fixture starts with the navy panel gone");
+
+  const panels = restoreNonBackgroundPanels(rgb, coarse, width, height);
+  assert.ok(regionStats(panels.alpha, width, collar).share > 0.9, "the navy panel must come back as its own colour");
+
+  const { alpha } = await refineForegroundAlpha({ rgb, alpha: coarse, width, height });
+  assert.ok(regionStats(alpha, width, collar).share > 0.9, "refine must keep the navy collar");
   assert.ok(subjectRetention(alpha, truth) > 0.94, `jacket retained ${subjectRetention(alpha, truth)}`);
   assert.ok(backgroundLeftover(alpha, truth) < 0.1, `carpet leftover ${backgroundLeftover(alpha, truth)}`);
 });

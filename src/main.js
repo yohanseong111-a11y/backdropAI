@@ -185,10 +185,10 @@ app.innerHTML = `
         <button id="assistModeBtn" class="tool active" type="button">Assisted</button>
         <button id="manualModeBtn" class="tool" type="button">Manual</button>
       </div>
-      <label id="assistSizeRow" class="brush-row">Target <input id="assistSize" type="range" min="14" max="150" step="1" value="46" /><span id="assistSizeLabel" class="range-value">Medium</span></label>
+      <label id="assistSizeRow" class="brush-row">Picker <input id="assistSize" type="range" min="14" max="150" step="1" value="46" /><span id="assistSizeLabel" class="range-value">Medium</span></label>
       <label id="brushSizeRow" class="brush-row hidden">Size <input id="brushSize" type="range" min="8" max="180" value="54" /></label>
       <label id="brushSoftRow" class="brush-row hidden">Softness <input id="brushSoftness" type="range" min="0" max="100" value="35" /></label>
-      <label class="smart-toggle"><input id="showOriginalToggle" type="checkbox" checked /> Show original</label>
+      <label class="smart-toggle"><input id="showOriginalToggle" type="checkbox" checked /> Show original + removed</label>
       <div class="editor-stage-swatches" aria-label="Editor background">
         <button type="button" class="stage-swatch checker active" data-stage="checker" title="Checkerboard"></button>
         <button type="button" class="stage-swatch" data-stage="#111114" title="Dark" style="background:#111114"></button>
@@ -208,6 +208,7 @@ app.innerHTML = `
     <div class="editor-stage">
       <div class="editor-stack">
         <canvas id="editorGhost" class="editor-ghost"></canvas>
+        <canvas id="editorVeil" class="editor-veil"></canvas>
         <canvas id="editorCanvas"></canvas>
       </div>
       <div id="assistTarget" class="assist-target"><span class="assist-target-dot"></span></div>
@@ -317,7 +318,7 @@ function renderGallery() {
   gallery.innerHTML = state.items.map((item,index)=>`
     <article class="photo-card ${state.selected.has(item.id) ? "selected" : ""}" data-card="${item.id}">
       <div class="preview-wrap ${item.status === "processing" ? "scanning" : ""} ${item.status === "revealing" ? "revealing" : ""}">
-        ${item.status === "processing" ? `<img class="processing-original" src="${item.originalURL}" alt="" /><div class="scan-track"><div class="scan-glow"></div><div class="scan-line"></div></div>` : item.status === "revealing" ? `
+        ${item.status === "processing" ? `<img class="processing-original" src="${item.originalURL}" alt="" /><div class="scan-overlay"><div class="scan-beam"><span class="scan-line"></span></div></div>` : item.status === "revealing" ? `
           <img class="reveal-original" src="${item.originalURL}" alt="" />
           <img class="reveal-cutout" src="${item.cutoutURL}" alt="" />
           <div class="reveal-track"><div class="reveal-scan-line"></div></div>
@@ -1013,6 +1014,7 @@ async function removeOne(item,queueTotal){
   item.error=null;
   renderGallery();
   await nextFrame();
+  const scanStarted=performance.now();
 
   try{
     let blob;
@@ -1032,6 +1034,9 @@ async function removeOne(item,queueTotal){
     item.cutoutBlob=blob;
     if(item.cutoutURL)URL.revokeObjectURL(item.cutoutURL);
     item.cutoutURL=URL.createObjectURL(blob);
+
+    const scanLeft=Math.max(0,1400-(performance.now()-scanStarted));
+    if(scanLeft)await new Promise(resolve=>setTimeout(resolve,scanLeft));
 
     item.status="revealing";
     renderGallery();
@@ -1222,7 +1227,10 @@ async function openEditor(id){
   const ghost=$("#editorGhost");
   ghost.width=canvas.width;ghost.height=canvas.height;
   ghost.getContext("2d").drawImage(original,0,0,canvas.width,canvas.height);
-  state.editor={item,original,canvas,ghost,ctx,originalData:octx.getImageData(0,0,canvas.width,canvas.height),mode:"erase",assisted:true,history:[ctx.getImageData(0,0,canvas.width,canvas.height)],redo:[],drawing:false,last:null,viewScale:1,fitScale:1,panX:0,panY:0,pointers:new Map(),pinch:null};
+  const veil=$("#editorVeil");
+  veil.width=canvas.width;veil.height=canvas.height;
+  state.editor={item,original,canvas,ghost,veil,ctx,originalData:octx.getImageData(0,0,canvas.width,canvas.height),mode:"erase",assisted:true,history:[ctx.getImageData(0,0,canvas.width,canvas.height)],redo:[],drawing:false,last:null,viewScale:1,fitScale:1,panX:0,panY:0,pointers:new Map(),pinch:null};
+  paintEditorRemovedVeil();
   $("#cutoutModal").classList.remove("hidden");
   $("#showOriginalToggle").checked=true;
   setEditorStage("checker");
@@ -1244,6 +1252,26 @@ function updateEditorTransform(){
   const transform=`translate3d(${e.panX}px,${e.panY}px,0)`;
   e.canvas.style.width=width;e.canvas.style.height=height;e.canvas.style.transform=transform;
   if(e.ghost){e.ghost.style.width=width;e.ghost.style.height=height;e.ghost.style.transform=transform;}
+  if(e.veil){e.veil.style.width=width;e.veil.style.height=height;e.veil.style.transform=transform;}
+}
+function paintEditorRemovedVeil(){
+  const e=state.editor;if(!e?.veil)return;
+  const w=e.canvas.width,h=e.canvas.height;
+  const vctx=e.veil.getContext("2d");
+  vctx.clearRect(0,0,w,h);
+  const size=Math.max(10,Math.round(Math.min(w,h)/42));
+  for(let y=0;y<h;y+=size){
+    for(let x=0;x<w;x+=size){
+      vctx.fillStyle=((x/size+y/size)|0)%2?"rgba(22,22,28,.62)":"rgba(78,78,90,.62)";
+      vctx.fillRect(x,y,size,size);
+    }
+  }
+  const cutout=e.ctx.getImageData(0,0,w,h);
+  const mask=vctx.getImageData(0,0,w,h);
+  for(let i=0;i<cutout.data.length;i+=4){
+    mask.data[i+3]=Math.round(mask.data[i+3]*((255-cutout.data[i+3])/255));
+  }
+  vctx.putImageData(mask,0,0);
 }
 function setEditorZoom(next){
   const e=state.editor;if(!e)return;
@@ -1265,7 +1293,7 @@ function updateEditorUI(){
   $("#assistSizeLabel").textContent=assistSizeLabel();
   $(".editor-stage")?.classList.toggle("show-original",$("#showOriginalToggle").checked);
   $("#editorHint").textContent=assisted
-    ? `Assisted: tap leftover ${e.mode==="erase"?"background":"missing fabric"}. Only the circle is analysed, like PhotoRoom Guided.`
+    ? `Assisted: tap a colour to ${e.mode==="erase"?"remove":"restore"} that whole chunk, like PhotoRoom.`
     : e.mode==="erase"?"Manual: paint over leftover background. Softness feathers the edge.":"Manual: paint the faded original back onto the cutout.";
   $("#undoEdit").disabled=e.history.length<=1;
   $("#redoEdit").disabled=!e.redo.length;
@@ -1382,13 +1410,14 @@ function assistedTap(p){
   }
 
   e.ctx.putImageData(current,0,0);
+  paintEditorRemovedVeil();
   pushHistory();
   pulseAssistTarget();
-  toast(e.mode==="erase"?"Removed the targeted area." : "Restored the targeted area.");
+  toast(e.mode==="erase"?"Removed that colour." : "Restored that colour.");
 }
-function pushHistory(){const e=state.editor;e.history.push(e.ctx.getImageData(0,0,e.canvas.width,e.canvas.height));if(e.history.length>18)e.history.shift();e.redo=[];updateEditorUI();}
-function undo(){const e=state.editor;if(e.history.length<=1)return;const cur=e.history.pop();e.redo.push(cur);e.ctx.putImageData(e.history[e.history.length-1],0,0);updateEditorUI();}
-function redo(){const e=state.editor;if(!e.redo.length)return;const img=e.redo.pop();e.history.push(img);e.ctx.putImageData(img,0,0);updateEditorUI();}
+function pushHistory(){const e=state.editor;e.history.push(e.ctx.getImageData(0,0,e.canvas.width,e.canvas.height));if(e.history.length>18)e.history.shift();e.redo=[];paintEditorRemovedVeil();updateEditorUI();}
+function undo(){const e=state.editor;if(e.history.length<=1)return;const cur=e.history.pop();e.redo.push(cur);e.ctx.putImageData(e.history[e.history.length-1],0,0);paintEditorRemovedVeil();updateEditorUI();}
+function redo(){const e=state.editor;if(!e.redo.length)return;const img=e.redo.pop();e.history.push(img);e.ctx.putImageData(img,0,0);paintEditorRemovedVeil();updateEditorUI();}
 function moveEditorCursor(ev){
   const stage=$(".editor-stage").getBoundingClientRect();
   const assisted=editorIsAssisted();
@@ -1568,8 +1597,8 @@ const tutorialSteps=[
   },
   {
     title:"Refine a cutout",
-    text:"Press Edit cutout. Remove leftover background or Restore missing fabric from the faded original — the same two modes PhotoRoom uses.",
-    points:["Assisted taps only the circle. Manual paints with a soft brush.","Turn on Show original to see what was deleted, then Restore it."],
+    text:"Press Edit cutout. The original photo stays visible and removed areas are shaded with checkers. Remove leftover background or Restore a missing colour chunk — the same two modes PhotoRoom uses.",
+    points:["Assisted: tap a colour to change that whole chunk. Manual paints with a soft brush.","Show original + removed keeps the deleted fabric visible under the checkers."],
     visual:tutorialArt.refine
   },
   {
@@ -1882,7 +1911,7 @@ $("#zoomOutEditor").onclick=()=>setEditorZoom((state.editor?.viewScale||1)/1.25)
 let installPrompt=null;window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();installPrompt=e;$("#installBtn").classList.remove("hidden");});$("#installBtn").onclick=async()=>{if(!installPrompt){toast("On iPhone: Safari → Share → Add to Home Screen");return;}installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;$("#installBtn").classList.add("hidden");};
 window.addEventListener("resize",()=>{if(state.editor)requestAnimationFrame(fitEditorCanvasToStage);});
 if("serviceWorker" in navigator)window.addEventListener("load",()=>{
-  navigator.serviceWorker.register("./sw.js?v=58").then(reg=>reg.update()).catch(console.warn);
+  navigator.serviceWorker.register("./sw.js?v=59").then(reg=>reg.update()).catch(console.warn);
 });
 
 

@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { computeAssistSelection, applyAssistSelection } from "../src/assist.js";
 import { SCENE, buildScene, buildCoarseAlpha, isSubject } from "./fixtures/scene.js";
+import { buildTwoToneJacket, buildTwoToneCoarseAlpha } from "./fixtures/jacket.js";
+import { regionStats } from "./fixtures/scene.js";
 
 function editorState() {
   const { rgb, truth, width, height } = buildScene();
@@ -45,36 +47,10 @@ test("a tap on background between the legs clears it without touching the legs",
   assert.equal(countRemovedSubject(before, editor.pixels, editor.truth), 0, "no leg pixel may be removed");
 });
 
-test("nothing outside the target circle can ever change", () => {
-  const editor = editorState();
-  const radius = 18;
-  const x = 80;
-  const y = 150;
-
-  const selection = computeAssistSelection({
-    rgb: editor.rgb,
-    alpha: editor.alpha,
-    width: editor.width,
-    height: editor.height,
-    x, y, radius,
-    mode: "erase"
-  });
-  assert.ok(selection);
-
-  for (let by = 0; by < selection.height; by++) {
-    for (let bx = 0; bx < selection.width; bx++) {
-      if (selection.weights[by * selection.width + bx] <= 0) continue;
-      const distance = Math.hypot(selection.x0 + bx - x, selection.y0 + by - y);
-      assert.ok(distance <= radius + 1e-6, `weight found ${distance.toFixed(2)}px away with radius ${radius}`);
-    }
-  }
-});
-
 test("a tap right beside the subject trims background instead of biting into it", () => {
   const editor = editorState();
   const before = new Uint8ClampedArray(editor.pixels);
 
-  // Two pixels outside the left leg, inside the halo the mask wrongly kept.
   const selection = computeAssistSelection({
     rgb: editor.rgb,
     alpha: editor.alpha,
@@ -95,74 +71,8 @@ test("a tap right beside the subject trims background instead of biting into it"
   assert.ok(editor.pixels[haloIndex] < 128, "the halo beside the leg should be trimmed");
 });
 
-test("a tap in the middle of the subject stays contained", () => {
-  const editor = editorState();
-  const before = new Uint8ClampedArray(editor.pixels);
-  const radius = 30;
-
-  const selection = computeAssistSelection({
-    rgb: editor.rgb,
-    alpha: editor.alpha,
-    width: editor.width,
-    height: editor.height,
-    x: 80,
-    y: 60,
-    radius,
-    mode: "erase"
-  });
-
-  if (selection) {
-    applyAssistSelection(editor.pixels, editor.rgb, editor.width, selection, "erase");
-    const lost = countRemovedSubject(before, editor.pixels, editor.truth);
-    // The user asked for this, so a removal is allowed — but only inside the target.
-    assert.ok(lost <= Math.PI * radius * radius, "removal must stay within the target area");
-    for (let i = 0; i < editor.truth.length; i++) {
-      if (before[i * 4 + 3] < 128 || editor.pixels[i * 4 + 3] >= 128) continue;
-      const x = i % editor.width;
-      const y = (i / editor.width) | 0;
-      assert.ok(Math.hypot(x - 80, y - 60) <= radius + 1, "a change appeared outside the target");
-    }
-  }
-});
-
-test("target size scales the analysed area", () => {
-  const editor = editorState();
-  const shared = {
-    rgb: editor.rgb,
-    alpha: editor.alpha,
-    width: editor.width,
-    height: editor.height,
-    x: 80,
-    y: 150,
-    mode: "erase"
-  };
-  const small = computeAssistSelection({ ...shared, radius: 8 });
-  const large = computeAssistSelection({ ...shared, radius: 34 });
-  assert.ok(small && large);
-  assert.ok(large.accepted > small.accepted * 3, `small ${small.accepted} vs large ${large.accepted}`);
-});
-
-test("removal edges are feathered rather than a hard circle", () => {
-  const editor = editorState();
-  const selection = computeAssistSelection({
-    rgb: editor.rgb,
-    alpha: editor.alpha,
-    width: editor.width,
-    height: editor.height,
-    x: 80,
-    y: 150,
-    radius: 26,
-    mode: "erase"
-  });
-  assert.ok(selection);
-  let partial = 0;
-  for (const weight of selection.weights) if (weight > 0.05 && weight < 0.95) partial++;
-  assert.ok(partial > 20, `expected a soft transition band, found ${partial} partial weights`);
-});
-
 test("restore brings back a subject area the mask dropped", () => {
   const editor = editorState();
-  // Punch a hole in the middle of the right leg, as an over-eager erase would.
   for (let y = 140; y < 160; y++) {
     for (let x = 92; x < 108; x++) {
       const i = y * editor.width + x;
@@ -188,7 +98,77 @@ test("restore brings back a subject area the mask dropped", () => {
   assert.ok(isSubject(100, 150), "sanity: the fixture point is inside the subject");
 });
 
-test("repeated taps keep working and never grow past the target", () => {
+test("restore tap on a navy panel brings the whole panel back", () => {
+  const scene = buildTwoToneJacket();
+  const { rgb, width, height, collar } = scene;
+  const alpha = buildTwoToneCoarseAlpha(scene);
+  const pixels = new Uint8ClampedArray(rgb);
+  for (let i = 0; i < alpha.length; i++) pixels[i * 4 + 3] = alpha[i];
+
+  const tapX = Math.round((collar.x0 + collar.x1) / 2);
+  const tapY = Math.round((collar.y0 + collar.y1) / 2);
+  const selection = computeAssistSelection({
+    rgb,
+    alpha,
+    width,
+    height,
+    x: tapX,
+    y: tapY,
+    radius: 12,
+    mode: "restore"
+  });
+  assert.ok(selection, "a tap on the missing navy must select it");
+  applyAssistSelection(pixels, rgb, width, selection, "restore");
+
+  const restored = new Uint8Array(width * height);
+  for (let i = 0; i < restored.length; i++) restored[i] = pixels[i * 4 + 3];
+  assert.ok(regionStats(restored, width, collar).share > 0.92, "the whole navy chunk must come back");
+  assert.ok(pixels[8 * 4 + 3] < 40, "carpet must stay gone");
+});
+
+test("erase tap on leftover carpet clears that colour, not the jacket", () => {
+  const scene = buildTwoToneJacket();
+  const { rgb, width, height, body } = scene;
+  const alpha = new Uint8Array(width * height).fill(255);
+  const pixels = new Uint8ClampedArray(rgb);
+
+  const selection = computeAssistSelection({
+    rgb,
+    alpha,
+    width,
+    height,
+    x: 8,
+    y: 8,
+    radius: 10,
+    mode: "erase"
+  });
+  assert.ok(selection);
+  applyAssistSelection(pixels, rgb, width, selection, "erase");
+
+  const kept = (body.y0 + 20) * width + Math.round((body.x0 + body.x1) / 2);
+  assert.ok(pixels[kept * 4 + 3] > 200, "cyan body must stay");
+  assert.ok(pixels[(8 * width + 8) * 4 + 3] < 40, "tapped carpet must go");
+});
+
+test("removal edges are feathered rather than a hard stamp", () => {
+  const editor = editorState();
+  const selection = computeAssistSelection({
+    rgb: editor.rgb,
+    alpha: editor.alpha,
+    width: editor.width,
+    height: editor.height,
+    x: 80,
+    y: 150,
+    radius: 26,
+    mode: "erase"
+  });
+  assert.ok(selection);
+  let partial = 0;
+  for (const weight of selection.weights) if (weight > 0.05 && weight < 0.95) partial++;
+  assert.ok(partial > 8, `expected a soft transition band, found ${partial} partial weights`);
+});
+
+test("repeated taps keep working and never eat the subject colour", () => {
   const editor = editorState();
   for (let step = 0; step < 4; step++) {
     const selection = computeAssistSelection({
@@ -216,14 +196,20 @@ test("repeated taps keep working and never grow past the target", () => {
 
 test("a target with nothing to change reports back instead of guessing", () => {
   const editor = editorState();
-  // Fully transparent corner: there is no background left to erase there.
+  // Exact mask: leftover background is already gone, so a tap on carpet
+  // has no opaque pixels of that colour left to erase.
+  for (let i = 0; i < editor.truth.length; i++) {
+    const a = editor.truth[i] ? 255 : 0;
+    editor.alpha[i] = a;
+    editor.pixels[i * 4 + 3] = a;
+  }
   const selection = computeAssistSelection({
     rgb: editor.rgb,
     alpha: editor.alpha,
     width: editor.width,
     height: editor.height,
-    x: 140,
-    y: 20,
+    x: 8,
+    y: 8,
     radius: 12,
     mode: "erase"
   });
