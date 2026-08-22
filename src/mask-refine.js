@@ -12,7 +12,7 @@
  * deleting it, and the orchestrator rolls a stage back when the subject shrinks.
  */
 
-import { recoverDeletedSubject, restoreSubjectColouredGaps } from "./mask-recover.js";
+import { recoverDeletedSubject, restoreSubjectColouredGaps, restoreNonBackgroundPanels, cornerBackgroundSeed } from "./mask-recover.js";
 
 const UNKNOWN_DISTANCE = 999;
 
@@ -570,6 +570,8 @@ export function reclaimConnectedBackground(alpha, distances, edges, width, heigh
   const protectLevel = options.protectLevel ?? 220;
   const protectSeparation = options.protectSeparation ?? 1.2;
   const original = options.original || alpha;
+  const backdrop = options.backdropColour || null;
+  const backdropLimit = options.backdropLimit ?? 50;
   const { toForeground, toBackground, backgroundTrust } = distances;
 
   const out = new Uint8Array(alpha);
@@ -597,6 +599,17 @@ export function reclaimConnectedBackground(alpha, distances, edges, width, heigh
     // The pixel has to look clearly more like background than like the subject.
     if (toForeground[index] < background * separation) return;
     if (edges[index] > edgeLimit) return;
+    // Only the known backdrop may be reclaimed. Navy fabric is dark, but it is
+    // not green carpet — without this the collar is deleted with the floor.
+    if (backdrop && options.rgb) {
+      const o = index * 4;
+      const toBackdrop = Math.hypot(
+        options.rgb[o] - backdrop[0],
+        options.rgb[o + 1] - backdrop[1],
+        options.rgb[o + 2] - backdrop[2]
+      );
+      if (toBackdrop > backdropLimit) return;
+    }
     // Solid garment pixels stay unless they look more like the backdrop than
     // like the subject. This is what stops a cyan jacket disappearing into a
     // green carpet just because the model nicked the zipper.
@@ -974,8 +987,11 @@ export async function refineForegroundAlpha({ rgb, alpha, width, height, options
   await breathe();
 
   const beforeReclaim = current;
+  const backdropSeed = cornerBackgroundSeed(rgb, width, height);
   const reclaim = reclaimConnectedBackground(current, distances, edges, width, height, {
     original: beforeReclaim,
+    rgb,
+    backdropColour: backdropSeed?.colour || null,
     ...options.reclaim
   });
   report.evidence = Math.round(reclaim.evidence);
@@ -1009,6 +1025,9 @@ export async function refineForegroundAlpha({ rgb, alpha, width, height, options
   const lastGaps = restoreSubjectColouredGaps(rgb, current, width, height);
   current = lastGaps.alpha;
   report.recoloured += lastGaps.restored;
+  const lastPanels = restoreNonBackgroundPanels(rgb, current, width, height);
+  current = lastPanels.alpha;
+  report.recoloured += lastPanels.restored;
   await breathe();
 
   if (

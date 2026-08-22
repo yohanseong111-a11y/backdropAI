@@ -320,7 +320,7 @@ export function restoreSubjectColouredGaps(rgb, alpha, width, height, options = 
 export function restoreNonBackgroundPanels(rgb, alpha, width, height, options = {}) {
   const total = width * height;
   const subjectLevel = options.subjectLevel ?? 220;
-  const emptyLevel = options.emptyLevel ?? 80;
+  const emptyLevel = options.emptyLevel ?? 200;
   const bgLimit = options.backgroundLimit ?? 42;
   const panelTolerance = options.panelTolerance ?? 38;
   const maxShare = options.maxShare ?? 0.4;
@@ -340,8 +340,7 @@ export function restoreNonBackgroundPanels(rgb, alpha, width, height, options = 
     return false;
   };
 
-  const backdropScore = (r, g, b, index) => {
-    if (flood.confident && flood.subject && flood.subject[index] === 0) return 1;
+  const backdropScore = (r, g, b) => {
     if (!seed) return 0;
     return colourDistance([r, g, b], seed.colour) < bgLimit ? 1 : 0;
   };
@@ -363,7 +362,7 @@ export function restoreNonBackgroundPanels(rgb, alpha, width, height, options = 
       r += rgb[o];
       g += rgb[o + 1];
       b += rgb[o + 2];
-      backdropHits += backdropScore(rgb[o], rgb[o + 1], rgb[o + 2], i);
+      backdropHits += backdropScore(rgb[o], rgb[o + 1], rgb[o + 2]);
       if (!nextToSubject && touchesSubject(i)) nextToSubject = true;
       const x = i % width;
       const add = index => {

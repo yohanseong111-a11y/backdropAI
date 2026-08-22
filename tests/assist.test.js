@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { computeAssistSelection, applyAssistSelection } from "../src/assist.js";
 import { SCENE, buildScene, buildCoarseAlpha, isSubject } from "./fixtures/scene.js";
-import { buildTwoToneJacket, buildTwoToneCoarseAlpha } from "./fixtures/jacket.js";
+import { buildTwoToneJacket, buildTwoToneCoarseAlpha, buildShadedNavyCollar } from "./fixtures/jacket.js";
 import { regionStats } from "./fixtures/scene.js";
 
 function editorState() {
@@ -126,6 +126,30 @@ test("restore tap on a navy panel brings the whole panel back", () => {
   assert.ok(pixels[8 * 4 + 3] < 40, "carpet must stay gone");
 });
 
+test("one tap restores a shaded navy panel that used to need many clicks", () => {
+  const scene = buildShadedNavyCollar(buildTwoToneJacket());
+  const { rgb, width, height, collar } = scene;
+  const alpha = buildTwoToneCoarseAlpha(scene);
+  const pixels = new Uint8ClampedArray(rgb);
+  for (let i = 0; i < alpha.length; i++) pixels[i * 4 + 3] = alpha[i];
+
+  const selection = computeAssistSelection({
+    rgb,
+    alpha,
+    width,
+    height,
+    x: collar.x0 + 6,
+    y: Math.round((collar.y0 + collar.y1) / 2),
+    radius: 10,
+    mode: "restore"
+  });
+  assert.ok(selection);
+  applyAssistSelection(pixels, rgb, width, selection, "restore");
+  const restored = new Uint8Array(width * height);
+  for (let i = 0; i < restored.length; i++) restored[i] = pixels[i * 4 + 3];
+  assert.ok(regionStats(restored, width, collar).share > 0.95, "one tap must take the whole shaded navy chunk");
+});
+
 test("erase tap on leftover carpet clears that colour, not the jacket", () => {
   const scene = buildTwoToneJacket();
   const { rgb, width, height, body } = scene;
@@ -150,7 +174,7 @@ test("erase tap on leftover carpet clears that colour, not the jacket", () => {
   assert.ok(pixels[(8 * width + 8) * 4 + 3] < 40, "tapped carpet must go");
 });
 
-test("removal edges are feathered rather than a hard stamp", () => {
+test("a colour chunk is selected solidly, not as a faded circle", () => {
   const editor = editorState();
   const selection = computeAssistSelection({
     rgb: editor.rgb,
@@ -163,9 +187,9 @@ test("removal edges are feathered rather than a hard stamp", () => {
     mode: "erase"
   });
   assert.ok(selection);
-  let partial = 0;
-  for (const weight of selection.weights) if (weight > 0.05 && weight < 0.95) partial++;
-  assert.ok(partial > 8, `expected a soft transition band, found ${partial} partial weights`);
+  let solid = 0;
+  for (const weight of selection.weights) if (weight >= 1) solid++;
+  assert.ok(solid > 80, `the gap chunk must be a solid selection, got ${solid} pixels`);
 });
 
 test("repeated taps keep working and never eat the subject colour", () => {

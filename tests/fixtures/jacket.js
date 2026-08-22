@@ -218,6 +218,24 @@ export function buildTwoToneJacket() {
   return { rgb, truth, width, height, body, collar };
 }
 
+/**
+ * Same two-tone jacket, but the navy panel has a lighting falloff so a single
+ * global colour threshold cannot cover it — the Assist bug that needed six taps.
+ */
+export function buildShadedNavyCollar(scene) {
+  const { rgb, collar, width } = scene;
+  for (let y = collar.y0; y < collar.y1; y++) {
+    for (let x = collar.x0; x < collar.x1; x++) {
+      const o = (y * width + x) * 4;
+      const t = (x - collar.x0) / Math.max(1, collar.x1 - collar.x0);
+      rgb[o] = 10 + t * 28;
+      rgb[o + 1] = 12 + t * 30;
+      rgb[o + 2] = 28 + t * 70;
+    }
+  }
+  return scene;
+}
+
 export function buildTwoToneCoarseAlpha(scene) {
   const { width, height, body, collar } = scene;
   const alpha = new Uint8Array(width * height);

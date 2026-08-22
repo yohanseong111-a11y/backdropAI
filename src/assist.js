@@ -10,43 +10,6 @@
  * Erase only removes pixels of that chunk that are still in the cutout.
  */
 
-import { guidedFilterColour } from "./mask-refine.js";
-
-function boxBlurWeights(weights, width, height, radius) {
-  if (radius < 1) return weights;
-  const horizontal = new Float32Array(weights.length);
-  const span = radius * 2 + 1;
-  for (let y = 0; y < height; y++) {
-    const row = y * width;
-    for (let x = 0; x < width; x++) {
-      let sum = 0;
-      let count = 0;
-      for (let ox = -radius; ox <= radius; ox++) {
-        const nx = x + ox;
-        if (nx < 0 || nx >= width) continue;
-        sum += weights[row + nx];
-        count++;
-      }
-      horizontal[row + x] = sum / (count || span);
-    }
-  }
-  const out = new Float32Array(weights.length);
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      let sum = 0;
-      let count = 0;
-      for (let oy = -radius; oy <= radius; oy++) {
-        const ny = y + oy;
-        if (ny < 0 || ny >= height) continue;
-        sum += horizontal[ny * width + x];
-        count++;
-      }
-      out[y * width + x] = sum / (count || span);
-    }
-  }
-  return out;
-}
-
 function colourDistance(r, g, b, r2, g2, b2) {
   return Math.hypot(r - r2, g - g2, b - b2);
 }
@@ -107,7 +70,8 @@ export function computeAssistSelection({ rgb, alpha, width, height, x, y, radius
   const seed = sampleSeedColour(rgb, width, height, centreX, centreY, targetRadius, options);
   if (!seed) return null;
 
-  const tolerance = options.maxTolerance ?? 46;
+  const seedLimit = options.maxTolerance ?? 48;
+  const stepLimit = options.stepLimit ?? 32;
   const total = width * height;
   const inChunk = new Uint8Array(total);
   const queue = new Int32Array(total);
@@ -120,7 +84,7 @@ export function computeAssistSelection({ rgb, alpha, width, height, x, y, radius
       if ((px - centreX) * (px - centreX) + (py - centreY) * (py - centreY) > seedRadius * seedRadius) continue;
       const i = py * width + px;
       const o = i * 4;
-      if (colourDistance(rgb[o], rgb[o + 1], rgb[o + 2], seed.r, seed.g, seed.b) > tolerance) continue;
+      if (colourDistance(rgb[o], rgb[o + 1], rgb[o + 2], seed.r, seed.g, seed.b) > Math.max(seedLimit, 56)) continue;
       if (inChunk[i]) continue;
       inChunk[i] = 1;
       queue[tail++] = i;
@@ -131,10 +95,15 @@ export function computeAssistSelection({ rgb, alpha, width, height, x, y, radius
   while (head < tail) {
     const i = queue[head++];
     const cx = i % width;
+    const fo = i * 4;
     const consider = index => {
       if (index < 0 || index >= total || inChunk[index]) return;
       const o = index * 4;
-      if (colourDistance(rgb[o], rgb[o + 1], rgb[o + 2], seed.r, seed.g, seed.b) > tolerance) return;
+      const toSeed = colourDistance(rgb[o], rgb[o + 1], rgb[o + 2], seed.r, seed.g, seed.b);
+      const toNeighbor = colourDistance(rgb[o], rgb[o + 1], rgb[o + 2], rgb[fo], rgb[fo + 1], rgb[fo + 2]);
+      // Neighbour walk covers lighting on one panel. A loose global threshold
+      // is how denim leaked into concrete; keep that gate tight.
+      if (toNeighbor > stepLimit && toSeed > seedLimit) return;
       inChunk[index] = 1;
       queue[tail++] = index;
     };
@@ -170,30 +139,15 @@ export function computeAssistSelection({ rgb, alpha, width, height, x, y, radius
   const boxWidth = x1 - x0 + 1;
   const boxHeight = y1 - y0 + 1;
   const weights = new Float32Array(boxWidth * boxHeight);
-  const channels = {
-    r: new Float32Array(boxWidth * boxHeight),
-    g: new Float32Array(boxWidth * boxHeight),
-    b: new Float32Array(boxWidth * boxHeight)
-  };
   for (let by = 0; by < boxHeight; by++) {
     for (let bx = 0; bx < boxWidth; bx++) {
-      const i = by * boxWidth + bx;
       const src = (y0 + by) * width + x0 + bx;
-      const o = src * 4;
-      channels.r[i] = rgb[o] / 255;
-      channels.g[i] = rgb[o + 1] / 255;
-      channels.b[i] = rgb[o + 2] / 255;
-      weights[i] = changeable[src] ? 1 : 0;
+      weights[by * boxWidth + bx] = changeable[src] ? 1 : 0;
     }
   }
 
-  const blurRadius = Math.max(1, Math.round(Math.min(boxWidth, boxHeight) * 0.012) || 1);
-  let smoothed = boxBlurWeights(weights, boxWidth, boxHeight, blurRadius);
-  smoothed = guidedFilterColour(channels, smoothed, boxWidth, boxHeight, Math.max(2, blurRadius * 2), options.guideEps ?? 4e-4);
-  for (let i = 0; i < smoothed.length; i++) {
-    const value = smoothed[i];
-    smoothed[i] = value < 0.04 ? 0 : Math.min(1, value);
-  }
+  // Hard chunk, no guided shrink and no rim that eats the neighbouring colour.
+  const smoothed = weights;
 
   return {
     x0,
@@ -225,14 +179,12 @@ export function applyAssistSelection(pixels, originalPixels, width, selection, m
           pixels[o + 3] = next;
           changed++;
         }
-      } else {
-        const target = Math.round(originalPixels[o + 3] * weight);
-        if (target > pixels[o + 3]) {
-          const mix = weight;
-          pixels[o] = Math.round(pixels[o] * (1 - mix) + originalPixels[o] * mix);
-          pixels[o + 1] = Math.round(pixels[o + 1] * (1 - mix) + originalPixels[o + 1] * mix);
-          pixels[o + 2] = Math.round(pixels[o + 2] * (1 - mix) + originalPixels[o + 2] * mix);
-          pixels[o + 3] = Math.max(pixels[o + 3], target);
+      } else if (weight >= 0.5) {
+        pixels[o] = originalPixels[o];
+        pixels[o + 1] = originalPixels[o + 1];
+        pixels[o + 2] = originalPixels[o + 2];
+        if (pixels[o + 3] < 255) {
+          pixels[o + 3] = 255;
           changed++;
         }
       }
