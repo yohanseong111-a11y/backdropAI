@@ -1293,7 +1293,7 @@ function updateEditorUI(){
   $("#assistSizeLabel").textContent=assistSizeLabel();
   $(".editor-stage")?.classList.toggle("show-original",$("#showOriginalToggle").checked);
   $("#editorHint").textContent=assisted
-    ? `Assisted: tap a colour to ${e.mode==="erase"?"remove":"restore"} that whole chunk, like PhotoRoom.`
+    ? `Assisted: tap to ${e.mode==="erase"?"remove":"restore"} only the patch under the target.`
     : e.mode==="erase"?"Manual: paint over leftover background. Softness feathers the edge.":"Manual: paint the faded original back onto the cutout.";
   $("#undoEdit").disabled=e.history.length<=1;
   $("#redoEdit").disabled=!e.redo.length;
@@ -1413,7 +1413,7 @@ function assistedTap(p){
   paintEditorRemovedVeil();
   pushHistory();
   pulseAssistTarget();
-  toast(e.mode==="erase"?"Removed that colour." : "Restored that colour.");
+  toast(e.mode==="erase"?"Removed that patch." : "Restored that patch.");
 }
 function pushHistory(){const e=state.editor;e.history.push(e.ctx.getImageData(0,0,e.canvas.width,e.canvas.height));if(e.history.length>18)e.history.shift();e.redo=[];paintEditorRemovedVeil();updateEditorUI();}
 function undo(){const e=state.editor;if(e.history.length<=1)return;const cur=e.history.pop();e.redo.push(cur);e.ctx.putImageData(e.history[e.history.length-1],0,0);paintEditorRemovedVeil();updateEditorUI();}
@@ -1911,7 +1911,7 @@ $("#zoomOutEditor").onclick=()=>setEditorZoom((state.editor?.viewScale||1)/1.25)
 let installPrompt=null;window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();installPrompt=e;$("#installBtn").classList.remove("hidden");});$("#installBtn").onclick=async()=>{if(!installPrompt){toast("On iPhone: Safari → Share → Add to Home Screen");return;}installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;$("#installBtn").classList.add("hidden");};
 window.addEventListener("resize",()=>{if(state.editor)requestAnimationFrame(fitEditorCanvasToStage);});
 if("serviceWorker" in navigator)window.addEventListener("load",()=>{
-  navigator.serviceWorker.register("./sw.js?v=62").then(reg=>reg.update()).catch(console.warn);
+  navigator.serviceWorker.register("./sw.js?v=63").then(reg=>reg.update()).catch(console.warn);
 });
 
 

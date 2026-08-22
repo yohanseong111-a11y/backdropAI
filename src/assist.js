@@ -1,17 +1,28 @@
 /*
  * Target-guided cutout correction ("AI Assist").
  *
- * A tap selects the whole connected colour chunk under the target — the navy
- * collar, the leftover carpet — the way PhotoRoom does. The visible circle is
- * only the picker: it decides which colour you meant. Growth then follows that
- * colour across the photo and stops at a different colour.
- *
- * Restore only paints missing pixels of that chunk back from the original.
- * Erase only removes pixels of that chunk that are still in the cutout.
+ * The circle only picks which colour you meant. Growth then fills the one
+ * connected patch under the tap — the leftover green you clicked, or the
+ * navy panel you clicked — and stops at a different colour. Two green
+ * corners stay two patches. Erasing the jacket must not take the carpet.
  */
+
+import { isGreenDominant, looksLikeBrightNeutral, looksLikeSecondaryGarment } from "./mask-recover.js";
 
 function colourDistance(r, g, b, r2, g2, b2) {
   return Math.hypot(r - r2, g - g2, b - b2);
+}
+
+export function colourFamily(r, g, b) {
+  if (isGreenDominant(r, g, b) || (g - Math.max(r, b) > 16 && g >= 50)) return "green";
+  if (looksLikeBrightNeutral(r, g, b)) return "white";
+  if (b > r + 30 && g > r + 8 && b > 80) return "cyan";
+  if (looksLikeSecondaryGarment(r, g, b)) return "navy";
+  return "other";
+}
+
+function isBackdropFamily(family) {
+  return family === "green" || family === "white";
 }
 
 function sampleSeedColour(rgb, width, height, cx, cy, radius, options) {
@@ -59,6 +70,10 @@ function sampleSeedColour(rgb, width, height, cx, cy, radius, options) {
   return { r: seedR / seedCount, g: seedG / seedCount, b: seedB / seedCount };
 }
 
+function canChange(alpha, index, mode) {
+  return mode === "erase" ? alpha[index] > 40 : alpha[index] < 220;
+}
+
 /**
  * @returns {null | {x0:number, y0:number, width:number, height:number,
  *                   weights:Float32Array, accepted:number, coverage:number}}
@@ -70,7 +85,7 @@ export function computeAssistSelection({ rgb, alpha, width, height, x, y, radius
   const seed = sampleSeedColour(rgb, width, height, centreX, centreY, targetRadius, options);
   if (!seed) return null;
 
-  const seedLimit = options.maxTolerance ?? 48;
+  const family = colourFamily(seed.r, seed.g, seed.b);
   const stepLimit = options.stepLimit ?? 32;
   const total = width * height;
   const inChunk = new Uint8Array(total);
@@ -78,13 +93,16 @@ export function computeAssistSelection({ rgb, alpha, width, height, x, y, radius
   let head = 0;
   let tail = 0;
 
-  const seedRadius = Math.max(1.5, targetRadius * (options.seedShare ?? 0.45));
-  for (let py = Math.max(0, centreY - Math.ceil(seedRadius)); py <= Math.min(height - 1, centreY + Math.ceil(seedRadius)); py++) {
-    for (let px = Math.max(0, centreX - Math.ceil(seedRadius)); px <= Math.min(width - 1, centreX + Math.ceil(seedRadius)); px++) {
-      if ((px - centreX) * (px - centreX) + (py - centreY) * (py - centreY) > seedRadius * seedRadius) continue;
+  // Only the tap starts the flood. The circle must not seed both leftover
+  // green corners at once.
+  const startRadius = Math.max(1.5, Math.min(4, targetRadius * 0.2));
+  for (let py = Math.max(0, centreY - 4); py <= Math.min(height - 1, centreY + 4); py++) {
+    for (let px = Math.max(0, centreX - 4); px <= Math.min(width - 1, centreX + 4); px++) {
+      if ((px - centreX) * (px - centreX) + (py - centreY) * (py - centreY) > startRadius * startRadius) continue;
       const i = py * width + px;
+      if (!canChange(alpha, i, mode)) continue;
       const o = i * 4;
-      if (colourDistance(rgb[o], rgb[o + 1], rgb[o + 2], seed.r, seed.g, seed.b) > Math.max(seedLimit, 56)) continue;
+      if (colourFamily(rgb[o], rgb[o + 1], rgb[o + 2]) !== family) continue;
       if (inChunk[i]) continue;
       inChunk[i] = 1;
       queue[tail++] = i;
@@ -92,25 +110,34 @@ export function computeAssistSelection({ rgb, alpha, width, height, x, y, radius
   }
   if (!tail) return null;
 
+  const maxReach = isBackdropFamily(family)
+    ? Math.max(40, Math.round(Math.min(width, height) * (options.backdropReach ?? 0.28)))
+    : Infinity;
+
   while (head < tail) {
     const i = queue[head++];
     const cx = i % width;
+    const cy = (i / width) | 0;
     const fo = i * 4;
     const consider = index => {
       if (index < 0 || index >= total || inChunk[index]) return;
+      if (!canChange(alpha, index, mode)) return;
       const o = index * 4;
-      const toSeed = colourDistance(rgb[o], rgb[o + 1], rgb[o + 2], seed.r, seed.g, seed.b);
+      if (colourFamily(rgb[o], rgb[o + 1], rgb[o + 2]) !== family) return;
       const toNeighbor = colourDistance(rgb[o], rgb[o + 1], rgb[o + 2], rgb[fo], rgb[fo + 1], rgb[fo + 2]);
-      // Neighbour walk covers lighting on one panel. A loose global threshold
-      // is how denim leaked into concrete; keep that gate tight.
-      if (toNeighbor > stepLimit && toSeed > seedLimit) return;
+      if (toNeighbor > stepLimit) return;
+      if (maxReach !== Infinity) {
+        const nx = index % width;
+        const ny = (index / width) | 0;
+        if (Math.hypot(nx - centreX, ny - centreY) > maxReach) return;
+      }
       inChunk[index] = 1;
       queue[tail++] = index;
     };
     if (cx > 0) consider(i - 1);
     if (cx < width - 1) consider(i + 1);
-    if (i >= width) consider(i - width);
-    if (i < total - width) consider(i + width);
+    if (cy > 0) consider(i - width);
+    if (cy < height - 1) consider(i + width);
   }
 
   let minX = width, maxX = -1, minY = height, maxY = -1;
@@ -118,8 +145,6 @@ export function computeAssistSelection({ rgb, alpha, width, height, x, y, radius
   const changeable = new Uint8Array(total);
   for (let i = 0; i < total; i++) {
     if (!inChunk[i]) continue;
-    const canChange = mode === "erase" ? alpha[i] > 40 : alpha[i] < 220;
-    if (!canChange) continue;
     changeable[i] = 1;
     accepted++;
     const px = i % width;
@@ -146,15 +171,12 @@ export function computeAssistSelection({ rgb, alpha, width, height, x, y, radius
     }
   }
 
-  // Hard chunk, no guided shrink and no rim that eats the neighbouring colour.
-  const smoothed = weights;
-
   return {
     x0,
     y0,
     width: boxWidth,
     height: boxHeight,
-    weights: smoothed,
+    weights,
     accepted,
     coverage: accepted / Math.max(1, tail)
   };
