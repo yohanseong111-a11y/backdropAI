@@ -1195,7 +1195,7 @@ async function renderAllPreviews(){
       await drawComposite(buffer,item,{width:Math.round(w),height:Math.round(w*ratio)});
       if(generation!==previewRenderGeneration||!canvas.isConnected)return;
       if(canvas.width!==buffer.width)canvas.width=buffer.width;if(canvas.height!==buffer.height)canvas.height=buffer.height;
-      const ctx=canvas.getContext("2d");ctx.clearRect(0,0,canvas.width,canvas.height);ctx.drawImage(buffer,0,0);
+      const ctx=canvas.getContext("2d",{willReadFrequently:true});ctx.clearRect(0,0,canvas.width,canvas.height);ctx.drawImage(buffer,0,0);
     }catch(error){console.warn("Preview render skipped",error);}
   }));
 }
