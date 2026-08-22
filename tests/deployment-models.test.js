@@ -35,11 +35,12 @@ test("the worker only loads models the deployment actually ships", () => {
   assert.doesNotMatch(worker, /loadPrimary/);
 });
 
-test("heavy GPU and preload paths are gated away from constrained devices", () => {
+test("the engine warms the quantized graph immediately and keeps WebGPU gated", () => {
   assert.match(worker, /memory>=8&&cores>=8/);
-  assert.match(main, /connection\?\.saveData/);
-  assert.match(main, /memory>0&&memory<6/);
-  assert.match(main, /if\(!constrained\)/);
+  assert.match(worker, /dtype:"q8"/);
+  assert.doesNotMatch(worker, /dtype:"fp16"/);
+  assert.match(main, /warmBackshotEngine\(\);/);
+  assert.doesNotMatch(main, /if\(!constrained\)/);
 });
 
 test("inference resolution scales with the device and the chosen profile", () => {

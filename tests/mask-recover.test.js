@@ -9,7 +9,9 @@ import {
   cornerBackgroundSeed,
   restoreNonBackgroundPanels,
   looksLikeBackdropColour,
-  looksLikeSecondaryGarment
+  looksLikeSecondaryGarment,
+  looksLikeGround,
+  dropLeftoverBackdropIslands
 } from "../src/mask-recover.js";
 import {readPng} from "./helpers/png.js";
 import { refineForegroundAlpha } from "../src/mask-refine.js";
@@ -25,6 +27,8 @@ import {
   buildTwoToneCoarseAlpha,
   buildWrinkledTwoToneJacket,
   buildJacketOnGrassAndWhiteRug,
+  buildJacketWithTanLeftovers,
+  buildTanLeftoverAlpha,
   isJacket
 } from "./fixtures/jacket.js";
 import { regionStats, subjectRetention, backgroundLeftover } from "./fixtures/scene.js";
@@ -217,6 +221,36 @@ test("a white rug touching the sleeve is not restored with the navy yoke", async
   const { alpha } = await refineForegroundAlpha({ rgb, alpha: coarse, width, height });
   assert.ok(regionStats(alpha, width, collar).share > 0.85, "refine must keep navy");
   assert.ok(regionStats(alpha, width, rug).share < 0.1, `rug leftover ${regionStats(alpha, width, rug).share}`);
+  assert.ok(subjectRetention(alpha, truth) > 0.9);
+  assert.ok(backgroundLeftover(alpha, truth) < 0.12);
+});
+
+test("tan leftover ground is backdrop, not navy fabric", () => {
+  assert.equal(looksLikeGround(176, 164, 146), true);
+  assert.equal(looksLikeGround(168, 166, 162), true);
+  assert.equal(looksLikeGround(42, 56, 71), false);
+  assert.equal(looksLikeGround(10, 168, 226), false);
+  assert.equal(looksLikeSecondaryGarment(176, 164, 146), false);
+});
+
+test("isolated tan leftover islands around the jacket are dropped", async () => {
+  const scene = buildJacketWithTanLeftovers();
+  const { rgb, truth, width, height, left, right, collar } = scene;
+  const coarse = buildTanLeftoverAlpha(scene);
+  assert.ok(regionStats(coarse, width, left).share > 0.9, "the fixture starts with leftover tan");
+
+  const dropped = dropLeftoverBackdropIslands(rgb, coarse, width, height);
+  assert.ok(regionStats(dropped.alpha, width, left).share < 0.08, "left tan island must go");
+  assert.ok(regionStats(dropped.alpha, width, right).share < 0.08, "right tan island must go");
+
+  const recovered = recoverDeletedSubject(rgb, coarse, width, height);
+  assert.ok(regionStats(recovered.alpha, width, collar).share > 0.85, "navy yoke must still come back");
+  assert.ok(regionStats(recovered.alpha, width, left).share < 0.08, "recovery must drop leftover tan");
+
+  const { alpha } = await refineForegroundAlpha({ rgb, alpha: coarse, width, height });
+  assert.ok(regionStats(alpha, width, left).share < 0.08, "refine must drop leftover tan");
+  assert.ok(regionStats(alpha, width, right).share < 0.08);
+  assert.ok(regionStats(alpha, width, collar).share > 0.85, "refine must keep navy");
   assert.ok(subjectRetention(alpha, truth) > 0.9);
   assert.ok(backgroundLeftover(alpha, truth) < 0.12);
 });

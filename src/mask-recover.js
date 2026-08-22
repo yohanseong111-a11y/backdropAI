@@ -79,6 +79,29 @@ export function looksLikeBrightNeutral(r, g, b) {
 }
 
 /**
+ * Dusty tan / grey leftover ground that is not green pile and not navy.
+ * The outdoor jacket shots left these islands around the hem and sleeves.
+ */
+export function looksLikeGround(r, g, b) {
+  if (isGreenDominant(r, g, b, { lead: 12, minG: 36 })) return false;
+  if (looksLikeBrightNeutral(r, g, b)) return true;
+  const y = luma(r, g, b);
+  const sat = Math.max(r, g, b) - Math.min(r, g, b);
+  // Navy / charcoal stays with the jacket. Leftover dirt is lighter and flatter.
+  if (y < 90 && b >= r + 4) return false;
+  if (y >= 110 && sat < 72 && b + 6 < Math.max(r, g)) return true;
+  if (y >= 118 && sat < 52) return true;
+  if (
+    y >= 96 &&
+    sat < 38 &&
+    Math.abs(r - g) < 16 &&
+    Math.abs(g - b) < 16 &&
+    Math.abs(r - b) < 18
+  ) return true;
+  return false;
+}
+
+/**
  * Navy / charcoal garment the model often deletes next to cyan. Not green
  * pile, not a white rug, not grey dirt.
  */
@@ -96,7 +119,7 @@ export function looksLikeSecondaryGarment(r, g, b) {
  * blend of green pile and navy fabric, so navy sits ~30–40 from that mean.
  */
 export function looksLikeBackdropColour(r, g, b, seed, bgLimit = 42) {
-  if (looksLikeBrightNeutral(r, g, b)) return true;
+  if (looksLikeGround(r, g, b)) return true;
   const greenLead = g - Math.max(r, b);
   if (seedLooksGreen(seed)) {
     const dist = colourDistance([r, g, b], seed.colour);
@@ -281,7 +304,7 @@ export function cornerBackgroundFlood(rgb, width, height, options = {}) {
     if (index < 0 || index >= total || background[index]) return;
     const o = index * 4;
     const pixel = [rgb[o], rgb[o + 1], rgb[o + 2]];
-    if (looksLikeBrightNeutral(pixel[0], pixel[1], pixel[2])) {
+    if (looksLikeGround(pixel[0], pixel[1], pixel[2])) {
       background[index] = 1;
       queue[tail++] = index;
       return;
@@ -320,7 +343,7 @@ export function cornerBackgroundFlood(rgb, width, height, options = {}) {
     const o = i * 4;
     // A letter rug is not green, so the old flood called it "subject" and
     // unioned it back whenever the model had deleted the navy yoke.
-    subject[i] = looksLikeBrightNeutral(rgb[o], rgb[o + 1], rgb[o + 2]) ? 0 : 255;
+    subject[i] = looksLikeGround(rgb[o], rgb[o + 1], rgb[o + 2]) ? 0 : 255;
   }
   return { subject, confident: true, ratio };
 }
@@ -578,10 +601,82 @@ export function recoverDeletedSubject(rgb, alpha, width, height) {
   // grows from that fabric into neighbouring panels that are clearly not
   // the backdrop — the navy yoke the model treated as carpet.
   const panels = restoreNonBackgroundPanels(rgb, current, width, height, { flood });
+  const leftovers = dropLeftoverBackdropIslands(rgb, panels.alpha, width, height);
   return {
-    alpha: panels.alpha,
+    alpha: leftovers.alpha,
     inverted,
     restored: added + panels.restored,
+    dropped: leftovers.removed,
     cornerFlood: flood.confident && (inverted || interiorOpaque < 0.45)
   };
+}
+
+function looksLikeGarmentColour(r, g, b) {
+  if (looksLikeGround(r, g, b) || looksLikeBrightNeutral(r, g, b) || isGreenDominant(r, g, b, { lead: 12, minG: 36 })) {
+    return false;
+  }
+  if (looksLikeSecondaryGarment(r, g, b)) return true;
+  return b > r + 30 && g > r + 8 && b > 80;
+}
+
+/**
+ * Isolated tan / grey / rug patches the model left around the hem. They are
+ * not connected to the jacket, so reclaim never reaches them. Drop any
+ * opaque island that is mostly backdrop and not mostly garment.
+ */
+export function dropLeftoverBackdropIslands(rgb, alpha, width, height, options = {}) {
+  const total = width * height;
+  const level = options.level ?? 48;
+  const seed = options.seed || cornerBackgroundSeed(rgb, width, height);
+  const visited = new Uint8Array(total);
+  const queue = new Int32Array(total);
+  const out = new Uint8Array(alpha);
+  const components = [];
+
+  for (let start = 0; start < total; start++) {
+    if (visited[start] || alpha[start] < level) continue;
+    let head = 0;
+    let tail = 0;
+    queue[tail++] = start;
+    visited[start] = 1;
+    const pixels = [];
+    let backdrop = 0;
+    let garment = 0;
+    while (head < tail) {
+      const i = queue[head++];
+      pixels.push(i);
+      const o = i * 4;
+      const r = rgb[o], g = rgb[o + 1], b = rgb[o + 2];
+      if (looksLikeBackdropColour(r, g, b, seed, 50) || looksLikeGround(r, g, b)) backdrop++;
+      if (looksLikeGarmentColour(r, g, b)) garment++;
+      const x = i % width;
+      const add = index => {
+        if (index < 0 || index >= total || visited[index] || alpha[index] < level) return;
+        visited[index] = 1;
+        queue[tail++] = index;
+      };
+      if (x > 0) add(i - 1);
+      if (x < width - 1) add(i + 1);
+      if (i >= width) add(i - width);
+      if (i < total - width) add(i + width);
+    }
+    components.push({ pixels, area: pixels.length, backdrop, garment });
+  }
+
+  if (components.length < 2) return { alpha: out, removed: 0 };
+  components.sort((a, b) => b.area - a.area);
+  let removed = 0;
+  for (let index = 1; index < components.length; index++) {
+    const component = components[index];
+    const backdropShare = component.backdrop / component.area;
+    const garmentShare = component.garment / component.area;
+    if (garmentShare >= 0.35) continue;
+    if (backdropShare < 0.4) continue;
+    if (backdropShare < 0.55 && garmentShare >= 0.12) continue;
+    for (const i of component.pixels) {
+      out[i] = 0;
+      removed++;
+    }
+  }
+  return { alpha: out, removed };
 }

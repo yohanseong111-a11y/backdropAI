@@ -213,9 +213,10 @@ app.innerHTML = `
       </div>
       <div id="assistTarget" class="assist-target"><span class="assist-target-dot"></span></div>
       <div id="brushCursor" class="brush-cursor"></div>
+      <div id="editorLoupe" class="editor-loupe" hidden><canvas id="loupeCanvas" width="144" height="144"></canvas></div>
     </div>
     <div class="editor-foot">
-      <span id="editorHint">Assisted: place the target on leftover background and tap once.</span>
+      <span id="editorHint">Assisted: drag over leftover background to remove that whole section.</span>
       <button id="applyEdit" class="primary compact">Apply cutout</button>
     </div>
   </div>
@@ -318,7 +319,7 @@ function renderGallery() {
   gallery.innerHTML = state.items.map((item,index)=>`
     <article class="photo-card ${state.selected.has(item.id) ? "selected" : ""}" data-card="${item.id}">
       <div class="preview-wrap ${item.status === "processing" ? "scanning" : ""} ${item.status === "revealing" ? "revealing" : ""}">
-        ${item.status === "processing" ? `<img class="processing-original" src="${item.originalURL}" alt="" /><div class="scan-overlay"><div class="scan-beam"><span class="scan-line"></span></div></div>` : item.status === "revealing" ? `
+        ${item.status === "processing" ? `<img class="processing-original" src="${item.originalURL}" alt="" /><div class="scan-overlay"><div class="scan-travel"><span class="scan-bar"></span></div></div>` : item.status === "revealing" ? `
           <img class="reveal-original" src="${item.originalURL}" alt="" />
           <img class="reveal-cutout" src="${item.cutoutURL}" alt="" />
           <div class="reveal-track"><div class="reveal-scan-line"></div></div>
@@ -1293,7 +1294,7 @@ function updateEditorUI(){
   $("#assistSizeLabel").textContent=assistSizeLabel();
   $(".editor-stage")?.classList.toggle("show-original",$("#showOriginalToggle").checked);
   $("#editorHint").textContent=assisted
-    ? `Assisted: tap to ${e.mode==="erase"?"remove":"restore"} only the patch under the target.`
+    ? `Assisted: drag to ${e.mode==="erase"?"remove":"restore"} the whole section under the target.`
     : e.mode==="erase"?"Manual: paint over leftover background. Softness feathers the edge.":"Manual: paint the faded original back onto the cutout.";
   $("#undoEdit").disabled=e.history.length<=1;
   $("#redoEdit").disabled=!e.redo.length;
@@ -1320,15 +1321,36 @@ function setupEditorEvents(){
     if(e.pointers.size===2){const pts=[...e.pointers.values()];e.drawing=false;e.pinch={distance:Math.hypot(pts[1].x-pts[0].x,pts[1].y-pts[0].y),scale:e.viewScale,midX:(pts[0].x+pts[1].x)/2,midY:(pts[0].y+pts[1].y)/2,panX:e.panX,panY:e.panY};return;}
     if(ev.button===1||ev.altKey){e.panning={x:ev.clientX,y:ev.clientY,panX:e.panX,panY:e.panY};return;}
     moveEditorCursor(ev);
-    const p=pointFor(ev,c);if(editorIsAssisted()){assistedTap(p);return;}e.drawing=true;e.last=p;paintAt(p);
+    const p=pointFor(ev,c);
+    if(editorIsAssisted()){
+      e.assistDrag=true;e.assistDirty=false;
+      if(assistedPaint(p,{live:true}))e.assistDirty=true;
+      return;
+    }
+    e.drawing=true;e.last=p;paintAt(p);scheduleEditorVeil();
   };
   c.onpointermove=ev=>{
     moveEditorCursor(ev);if(e.pointers.has(ev.pointerId))e.pointers.set(ev.pointerId,{x:ev.clientX,y:ev.clientY});
     if(e.pointers.size===2&&e.pinch){const pts=[...e.pointers.values()],distance=Math.hypot(pts[1].x-pts[0].x,pts[1].y-pts[0].y),midX=(pts[0].x+pts[1].x)/2,midY=(pts[0].y+pts[1].y)/2;e.viewScale=Math.max(1,Math.min(8,e.pinch.scale*distance/Math.max(1,e.pinch.distance)));e.panX=e.pinch.panX+midX-e.pinch.midX;e.panY=e.pinch.panY+midY-e.pinch.midY;updateEditorTransform();return;}
     if(e.panning){e.panX=e.panning.panX+ev.clientX-e.panning.x;e.panY=e.panning.panY+ev.clientY-e.panning.y;updateEditorTransform();return;}
-    if(!e.drawing||editorIsAssisted())return;const p=pointFor(ev,c);paintLine(e.last,p);e.last=p;
+    const p=pointFor(ev,c);
+    if(e.assistDrag){
+      if(assistedPaint(p,{live:true}))e.assistDirty=true;
+      return;
+    }
+    if(!e.drawing)return;
+    paintLine(e.last,p);e.last=p;scheduleEditorVeil();
   };
-  const finish=ev=>{e.pointers.delete(ev.pointerId);e.pinch=null;e.panning=null;if(e.drawing){e.drawing=false;pushHistory();}};
+  const finish=ev=>{
+    e.pointers.delete(ev.pointerId);e.pinch=null;e.panning=null;
+    if(e.assistDrag){
+      e.assistDrag=false;
+      if(e.assistDirty){pushHistory();pulseAssistTarget();toast(e.mode==="erase"?"Removed that section.":"Restored that section.");}
+      e.assistDirty=false;
+      return;
+    }
+    if(e.drawing){e.drawing=false;pushHistory();}
+  };
   c.onpointerup=finish;c.onpointercancel=finish;c.onpointerleave=hideEditorCursor;c.onpointerenter=ev=>moveEditorCursor(ev);
 }
 function pointFor(ev,c){const r=c.getBoundingClientRect();return{x:(ev.clientX-r.left)/r.width*c.width,y:(ev.clientY-r.top)/r.height*c.height};}
@@ -1362,6 +1384,13 @@ function paintAt(p){
   }
   ctx.restore();
 }
+function scheduleEditorVeil(){
+  const e=state.editor;if(!e||e.veilRaf)return;
+  e.veilRaf=requestAnimationFrame(()=>{
+    e.veilRaf=0;
+    paintEditorRemovedVeil();
+  });
+}
 function invertEditorCutout(){
   const e=state.editor;if(!e)return;
   const current=e.ctx.getImageData(0,0,e.canvas.width,e.canvas.height);
@@ -1378,13 +1407,12 @@ function invertEditorCutout(){
   toast("Cutout inverted. Restore paints the original back.");
 }
 
-function assistedTap(p){
+function assistedPaint(p,{live=false}={}){
   const e=state.editor,w=e.canvas.width,h=e.canvas.height;
   const current=e.ctx.getImageData(0,0,w,h);
   const alpha=new Uint8Array(w*h);
   for(let i=0;i<alpha.length;i++)alpha[i]=current.data[i*4+3];
 
-  const radius=assistRadiusInImagePixels();
   const selection=computeAssistSelection({
     rgb:e.originalData.data,
     alpha,
@@ -1392,28 +1420,33 @@ function assistedTap(p){
     height:h,
     x:p.x,
     y:p.y,
-    radius,
+    radius:assistRadiusInImagePixels(),
     mode:e.mode
   });
 
   if(!selection){
-    toast(e.mode==="erase"
-      ? "Nothing to remove there. Move the target onto the leftover background."
-      : "Nothing to restore there. Move the target onto the missing area.");
-    return;
+    if(!live){
+      toast(e.mode==="erase"
+        ? "Nothing to remove there. Move the target onto the leftover background."
+        : "Nothing to restore there. Move the target onto the missing area.");
+    }
+    return false;
   }
 
   const changed=applyAssistSelection(current.data,e.originalData.data,w,selection,e.mode);
   if(!changed){
-    toast(e.mode==="erase"?"That area is already removed.":"That area is already part of the cutout.");
-    return;
+    if(!live)toast(e.mode==="erase"?"That area is already removed.":"That area is already part of the cutout.");
+    return false;
   }
 
   e.ctx.putImageData(current,0,0);
-  paintEditorRemovedVeil();
-  pushHistory();
-  pulseAssistTarget();
-  toast(e.mode==="erase"?"Removed that patch." : "Restored that patch.");
+  scheduleEditorVeil();
+  if(!live){
+    pushHistory();
+    pulseAssistTarget();
+    toast(e.mode==="erase"?"Removed that section.":"Restored that section.");
+  }
+  return true;
 }
 function pushHistory(){const e=state.editor;e.history.push(e.ctx.getImageData(0,0,e.canvas.width,e.canvas.height));if(e.history.length>18)e.history.shift();e.redo=[];paintEditorRemovedVeil();updateEditorUI();}
 function undo(){const e=state.editor;if(e.history.length<=1)return;const cur=e.history.pop();e.redo.push(cur);e.ctx.putImageData(e.history[e.history.length-1],0,0);paintEditorRemovedVeil();updateEditorUI();}
@@ -1430,10 +1463,51 @@ function moveEditorCursor(ev){
   el.style.height=`${size}px`;
   el.style.left=`${ev.clientX-stage.left-size/2}px`;
   el.style.top=`${ev.clientY-stage.top-size/2}px`;
+  updateEditorLoupe(ev,size);
 }
 function hideEditorCursor(){
   $("#brushCursor").classList.remove("show");
   $("#assistTarget").classList.remove("show");
+  hideEditorLoupe();
+}
+function hideEditorLoupe(){
+  const loupe=$("#editorLoupe");
+  if(loupe)loupe.hidden=true;
+}
+function updateEditorLoupe(ev,cursorSize){
+  const e=state.editor,loupe=$("#editorLoupe"),canvas=$("#loupeCanvas");
+  if(!e||!loupe||!canvas)return;
+  const stage=$(".editor-stage");
+  const stageRect=stage.getBoundingClientRect();
+  const box=144,zoom=3.2,src=box/zoom;
+  const p=pointFor(ev,e.canvas);
+  const ctx=canvas.getContext("2d");
+  ctx.imageSmoothingEnabled=false;
+  const cell=12;
+  for(let y=0;y<box;y+=cell){
+    for(let x=0;x<box;x+=cell){
+      ctx.fillStyle=((x/cell+y/cell)|0)%2?"#1a1a22":"#2c2c36";
+      ctx.fillRect(x,y,cell,cell);
+    }
+  }
+  ctx.save();
+  ctx.scale(zoom,zoom);
+  const sx=p.x-src/2,sy=p.y-src/2;
+  ctx.globalAlpha=0.38;
+  if(e.ghost)ctx.drawImage(e.ghost,sx,sy,src,src,0,0,src,src);
+  ctx.globalAlpha=1;
+  ctx.drawImage(e.canvas,sx,sy,src,src,0,0,src,src);
+  ctx.restore();
+  const gap=16;
+  let left=ev.clientX-stageRect.left+cursorSize/2+gap;
+  let top=ev.clientY-stageRect.top-box/2;
+  if(left+box>stageRect.width-10)left=ev.clientX-stageRect.left-cursorSize/2-gap-box;
+  if(left<8)left=8;
+  if(top<8)top=8;
+  if(top+box>stageRect.height-8)top=stageRect.height-box-8;
+  loupe.hidden=false;
+  loupe.style.left=`${left}px`;
+  loupe.style.top=`${top}px`;
 }
 function pulseAssistTarget(){
   const target=$("#assistTarget");
@@ -1598,7 +1672,7 @@ const tutorialSteps=[
   {
     title:"Refine a cutout",
     text:"Press Edit cutout. The original photo stays visible and removed areas are shaded with checkers. Remove leftover background or Restore a missing colour chunk — the same two modes PhotoRoom uses.",
-    points:["Assisted: tap a colour to change that whole chunk. Manual paints with a soft brush.","Show original + removed keeps the deleted fabric visible under the checkers."],
+    points:["Assisted: drag a colour to change that whole section. A magnifier sits next to the cursor. Manual paints live with a soft brush.","Show original + removed keeps the deleted fabric visible under the checkers."],
     visual:tutorialArt.refine
   },
   {
@@ -1911,7 +1985,7 @@ $("#zoomOutEditor").onclick=()=>setEditorZoom((state.editor?.viewScale||1)/1.25)
 let installPrompt=null;window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();installPrompt=e;$("#installBtn").classList.remove("hidden");});$("#installBtn").onclick=async()=>{if(!installPrompt){toast("On iPhone: Safari → Share → Add to Home Screen");return;}installPrompt.prompt();await installPrompt.userChoice;installPrompt=null;$("#installBtn").classList.add("hidden");};
 window.addEventListener("resize",()=>{if(state.editor)requestAnimationFrame(fitEditorCanvasToStage);});
 if("serviceWorker" in navigator)window.addEventListener("load",()=>{
-  navigator.serviceWorker.register("./sw.js?v=64").then(reg=>reg.update()).catch(console.warn);
+  navigator.serviceWorker.register("./sw.js?v=65").then(reg=>reg.update()).catch(console.warn);
 });
 
 
@@ -1946,17 +2020,8 @@ document.addEventListener("keydown",e=>{
   if(!$("#helpModal").classList.contains("hidden"))closeHelp();
 });
 
-// Preload only where the device/network has comfortable headroom. Constrained
-// devices load on demand so merely opening a shared link cannot crash the tab.
-const connection=navigator.connection||navigator.mozConnection||navigator.webkitConnection;
-const memory=Number(navigator.deviceMemory||0),cores=Number(navigator.hardwareConcurrency||0);
-const constrained=IS_MOBILE||(memory>0&&memory<6)||(cores>0&&cores<6)||connection?.saveData||/2g/.test(connection?.effectiveType||"");
-if(!constrained){
-  if("requestIdleCallback" in window)requestIdleCallback(()=>warmBackshotEngine(),{timeout:1800});
-  else setTimeout(()=>warmBackshotEngine(),1200);
-}else{
-  const status=$("#engineStatus");if(status)status.textContent="Ready on Remove";
-}
+// Start the quantized model immediately so the first Remove is not a long wait.
+warmBackshotEngine();
 
 
 window.addEventListener("error",event=>{
