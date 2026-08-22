@@ -67,6 +67,8 @@ const jacket=await page.evaluate(async()=>{
   ctx.fillRect(348,200,24,620);
   ctx.fillStyle="rgb(200,200,204)";
   ctx.fillRect(354,430,12,40);
+  ctx.fillStyle="rgb(214,210,204)";
+  ctx.fillRect(620,180,100,420);
   const blob=await new Promise(resolve=>canvas.toBlob(resolve,"image/png"));
   return {width,height,buffer:Array.from(new Uint8Array(await blob.arrayBuffer()))};
 });

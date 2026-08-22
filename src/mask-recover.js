@@ -65,12 +65,38 @@ export function seedLooksGreen(seed) {
   return isGreenDominant(seed.colour[0], seed.colour[1], seed.colour[2], { lead: 8, minG: 36 });
 }
 
+function luma(r, g, b) {
+  return 0.299 * r + 0.587 * g + 0.114 * b;
+}
+
+/**
+ * White / cream fleece and letter rugs. The last navy restore treated every
+ * non-green pixel as jacket, so this pile got painted back around the sleeves.
+ */
+export function looksLikeBrightNeutral(r, g, b) {
+  const sat = Math.max(r, g, b) - Math.min(r, g, b);
+  return luma(r, g, b) >= 168 && sat < 58;
+}
+
+/**
+ * Navy / charcoal garment the model often deletes next to cyan. Not green
+ * pile, not a white rug, not grey dirt.
+ */
+export function looksLikeSecondaryGarment(r, g, b) {
+  if (isGreenDominant(r, g, b, { lead: 12, minG: 36 })) return false;
+  if (looksLikeBrightNeutral(r, g, b)) return false;
+  const y = luma(r, g, b);
+  if (y < 48) return true;
+  return y <= 145 && b >= r + 4;
+}
+
 /**
  * True backdrop pixels for the jacket-on-carpet photos. Euclidean distance to
  * a corner seed is not enough: on a full-bleed close-up the seed is often a
  * blend of green pile and navy fabric, so navy sits ~30–40 from that mean.
  */
 export function looksLikeBackdropColour(r, g, b, seed, bgLimit = 42) {
+  if (looksLikeBrightNeutral(r, g, b)) return true;
   const greenLead = g - Math.max(r, b);
   if (seedLooksGreen(seed)) {
     const dist = colourDistance([r, g, b], seed.colour);
@@ -255,6 +281,11 @@ export function cornerBackgroundFlood(rgb, width, height, options = {}) {
     if (index < 0 || index >= total || background[index]) return;
     const o = index * 4;
     const pixel = [rgb[o], rgb[o + 1], rgb[o + 2]];
+    if (looksLikeBrightNeutral(pixel[0], pixel[1], pixel[2])) {
+      background[index] = 1;
+      queue[tail++] = index;
+      return;
+    }
     if (colourDistance(pixel, seed.colour) > tolerance) return;
     if (!looksLikeBackdropColour(pixel[0], pixel[1], pixel[2], seed, Math.min(tolerance, 56))) return;
     background[index] = 1;
@@ -281,7 +312,16 @@ export function cornerBackgroundFlood(rgb, width, height, options = {}) {
   const ratio = bgCount / total;
   if (ratio < 0.04 || ratio > 0.72) return { subject: null, confident: false };
   const subject = new Uint8Array(total);
-  for (let i = 0; i < total; i++) subject[i] = background[i] ? 0 : 255;
+  for (let i = 0; i < total; i++) {
+    if (background[i]) {
+      subject[i] = 0;
+      continue;
+    }
+    const o = i * 4;
+    // A letter rug is not green, so the old flood called it "subject" and
+    // unioned it back whenever the model had deleted the navy yoke.
+    subject[i] = looksLikeBrightNeutral(rgb[o], rgb[o + 1], rgb[o + 2]) ? 0 : 255;
+  }
   return { subject, confident: true, ratio };
 }
 
@@ -383,11 +423,10 @@ export function restoreSubjectColouredGaps(rgb, alpha, width, height, options = 
  * Restore neighbouring garment panels the model deleted because they are a
  * different colour from the kept fabric (cyan body, navy collar).
  *
- * When the backdrop colour is known, grow from the kept subject into any
- * adjacent empty pixel that is *not* that backdrop. Cyan→navy is a huge
- * colour jump, so a same-shade walk never enters the yoke. Blobs that only
- * restore panels already touching cyan also miss wrinkled navy that was
- * split into many shade islands.
+ * When the backdrop colour is known, grow from the kept subject into
+ * neighbouring navy / charcoal. Cyan→navy is a huge colour jump, so a
+ * same-shade walk never enters the yoke. Growing into *every* non-green
+ * pixel also painted white rugs and leftover ground back onto the cutout.
  *
  * Without a seed, keep the conservative colour-blob path so a jeans-on-
  * concrete gap is not painted back in.
@@ -421,6 +460,7 @@ export function restoreNonBackgroundPanels(rgb, alpha, width, height, options = 
       if (alpha[index] > emptyLevel) return;
       const o = index * 4;
       if (isBackdrop(rgb[o], rgb[o + 1], rgb[o + 2])) return;
+      if (!looksLikeSecondaryGarment(rgb[o], rgb[o + 1], rgb[o + 2])) return;
       out[index] = 255;
       restored++;
       queue[tail++] = index;
