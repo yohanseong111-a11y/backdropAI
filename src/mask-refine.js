@@ -12,7 +12,7 @@
  * deleting it, and the orchestrator rolls a stage back when the subject shrinks.
  */
 
-import { recoverDeletedSubject, restoreSubjectColouredGaps, restoreNonBackgroundPanels, cornerBackgroundSeed } from "./mask-recover.js";
+import { recoverDeletedSubject, restoreSubjectColouredGaps, restoreNonBackgroundPanels, cornerBackgroundSeed, looksLikeBackdropColour } from "./mask-recover.js";
 
 const UNKNOWN_DISTANCE = 999;
 
@@ -601,14 +601,13 @@ export function reclaimConnectedBackground(alpha, distances, edges, width, heigh
     if (edges[index] > edgeLimit) return;
     // Only the known backdrop may be reclaimed. Navy fabric is dark, but it is
     // not green carpet — without this the collar is deleted with the floor.
+    // A full-bleed close-up contaminates the corner mean with navy, so a plain
+    // Euclidean check would still delete the yoke.
     if (backdrop && options.rgb) {
       const o = index * 4;
-      const toBackdrop = Math.hypot(
-        options.rgb[o] - backdrop[0],
-        options.rgb[o + 1] - backdrop[1],
-        options.rgb[o + 2] - backdrop[2]
-      );
-      if (toBackdrop > backdropLimit) return;
+      if (!looksLikeBackdropColour(options.rgb[o], options.rgb[o + 1], options.rgb[o + 2], { colour: backdrop }, backdropLimit)) {
+        return;
+      }
     }
     // Solid garment pixels stay unless they look more like the backdrop than
     // like the subject. This is what stops a cyan jacket disappearing into a

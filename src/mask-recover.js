@@ -50,6 +50,67 @@ function colourDistance(a, b) {
   return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 }
 
+/**
+ * Green shag / grass / moss: G clearly leads. Navy, charcoal and cyan do not.
+ * Used so a mixed corner (carpet + navy yoke) cannot mark the jacket as floor.
+ */
+export function isGreenDominant(r, g, b, options = {}) {
+  const lead = options.lead ?? 10;
+  const minG = options.minG ?? 40;
+  return g >= minG && g > r + lead && g > b + Math.max(6, lead - 2);
+}
+
+export function seedLooksGreen(seed) {
+  if (!seed?.colour) return false;
+  return isGreenDominant(seed.colour[0], seed.colour[1], seed.colour[2], { lead: 8, minG: 36 });
+}
+
+/**
+ * True backdrop pixels for the jacket-on-carpet photos. Euclidean distance to
+ * a corner seed is not enough: on a full-bleed close-up the seed is often a
+ * blend of green pile and navy fabric, so navy sits ~30–40 from that mean.
+ */
+export function looksLikeBackdropColour(r, g, b, seed, bgLimit = 42) {
+  const greenLead = g - Math.max(r, b);
+  if (seedLooksGreen(seed)) {
+    const dist = colourDistance([r, g, b], seed.colour);
+    return (dist < bgLimit && greenLead > 8 && g >= 36) || (greenLead > 16 && g >= 50);
+  }
+  if (seed?.colour) return colourDistance([r, g, b], seed.colour) < bgLimit;
+  return isGreenDominant(r, g, b, { lead: 16, minG: 50 });
+}
+
+function meanGreenDominantCorners(rgb, width, height, patch) {
+  const boxes = [
+    [0, 0],
+    [width - patch, 0],
+    [0, height - patch],
+    [width - patch, height - patch]
+  ];
+  let r = 0, g = 0, b = 0, n = 0, corners = 0;
+  for (const [x0, y0] of boxes) {
+    let cr = 0, cg = 0, cb = 0, cn = 0;
+    for (let y = y0; y < Math.min(height, y0 + patch); y++) {
+      for (let x = x0; x < Math.min(width, x0 + patch); x++) {
+        const o = (y * width + x) * 4;
+        if (!isGreenDominant(rgb[o], rgb[o + 1], rgb[o + 2])) continue;
+        cr += rgb[o];
+        cg += rgb[o + 1];
+        cb += rgb[o + 2];
+        cn++;
+      }
+    }
+    if (cn < patch * patch * 0.12) continue;
+    r += cr;
+    g += cg;
+    b += cb;
+    n += cn;
+    corners++;
+  }
+  if (!n || corners < 2) return null;
+  return { colour: [r / n, g / n, b / n], corners };
+}
+
 function meanPatch(rgb, x0, y0, size, width, height) {
   let r = 0, g = 0, b = 0, n = 0;
   for (let y = y0; y < Math.min(height, y0 + size); y++) {
@@ -136,12 +197,6 @@ function distinctBackgroundClusters(rgb, alpha, width, height, foreground, empty
  */
 export function cornerBackgroundSeed(rgb, width, height) {
   const patch = Math.max(6, Math.round(Math.min(width, height) * 0.06));
-  const corners = [
-    meanPatch(rgb, 0, 0, patch, width, height),
-    meanPatch(rgb, width - patch, 0, patch, width, height),
-    meanPatch(rgb, 0, height - patch, patch, width, height),
-    meanPatch(rgb, width - patch, height - patch, patch, width, height)
-  ];
   const center = meanPatch(
     rgb,
     Math.round(width * 0.35),
@@ -150,6 +205,18 @@ export function cornerBackgroundSeed(rgb, width, height) {
     width,
     height
   );
+  // Full-bleed jackets put navy in the same corner patch as carpet. Prefer the
+  // green pile those corners still contain, not the muddy navy+green mean.
+  const green = meanGreenDominantCorners(rgb, width, height, patch);
+  if (green && colourDistance(green.colour, center) >= 30) {
+    return { colour: green.colour, separation: colourDistance(green.colour, center) };
+  }
+  const corners = [
+    meanPatch(rgb, 0, 0, patch, width, height),
+    meanPatch(rgb, width - patch, 0, patch, width, height),
+    meanPatch(rgb, 0, height - patch, patch, width, height),
+    meanPatch(rgb, width - patch, height - patch, patch, width, height)
+  ];
 
   let best = null;
   let bestScore = 0;
@@ -187,7 +254,9 @@ export function cornerBackgroundFlood(rgb, width, height, options = {}) {
   const consider = index => {
     if (index < 0 || index >= total || background[index]) return;
     const o = index * 4;
-    if (colourDistance([rgb[o], rgb[o + 1], rgb[o + 2]], seed.colour) > tolerance) return;
+    const pixel = [rgb[o], rgb[o + 1], rgb[o + 2]];
+    if (colourDistance(pixel, seed.colour) > tolerance) return;
+    if (!looksLikeBackdropColour(pixel[0], pixel[1], pixel[2], seed, Math.min(tolerance, 56))) return;
     background[index] = 1;
     queue[tail++] = index;
   };
@@ -285,7 +354,7 @@ export function restoreSubjectColouredGaps(rgb, alpha, width, height, options = 
       const parentSubject = nearestDistance(foreground, fromPixel[0], fromPixel[1], fromPixel[2]) <= maxDistance;
       if (!parentRestored && !parentSubject) return;
     }
-    if (seed && colourDistance(pixel, seed.colour) < 36) return;
+    if (looksLikeBackdropColour(pixel[0], pixel[1], pixel[2], seed, 36)) return;
     // A deleted shadow is transparent, so it used to be learned as "background"
     // and then this walk refused to enter it. When the step is a local shade
     // change, trust the neighbour and only reject the known backdrop colour.
@@ -314,8 +383,14 @@ export function restoreSubjectColouredGaps(rgb, alpha, width, height, options = 
  * Restore neighbouring garment panels the model deleted because they are a
  * different colour from the kept fabric (cyan body, navy collar).
  *
- * Each transparent blob that touches the subject is scored. Backdrop-coloured
- * or frame-sized blobs stay gone; a compact navy yoke comes back.
+ * When the backdrop colour is known, grow from the kept subject into any
+ * adjacent empty pixel that is *not* that backdrop. Cyan→navy is a huge
+ * colour jump, so a same-shade walk never enters the yoke. Blobs that only
+ * restore panels already touching cyan also miss wrinkled navy that was
+ * split into many shade islands.
+ *
+ * Without a seed, keep the conservative colour-blob path so a jeans-on-
+ * concrete gap is not painted back in.
  */
 export function restoreNonBackgroundPanels(rgb, alpha, width, height, options = {}) {
   const total = width * height;
@@ -325,12 +400,43 @@ export function restoreNonBackgroundPanels(rgb, alpha, width, height, options = 
   const panelTolerance = options.panelTolerance ?? 38;
   const maxShare = options.maxShare ?? 0.4;
   const seed = options.seed || cornerBackgroundSeed(rgb, width, height);
-  const flood = options.flood || cornerBackgroundFlood(rgb, width, height);
   const out = new Uint8Array(alpha);
-  const visited = new Uint8Array(total);
   const queue = new Int32Array(total);
   let restored = 0;
 
+  const isBackdrop = (r, g, b) => looksLikeBackdropColour(r, g, b, seed, bgLimit);
+
+  if (seed) {
+    const seen = new Uint8Array(total);
+    let head = 0;
+    let tail = 0;
+    for (let i = 0; i < total; i++) {
+      if (alpha[i] < subjectLevel) continue;
+      seen[i] = 1;
+      queue[tail++] = i;
+    }
+    const consider = index => {
+      if (index < 0 || index >= total || seen[index]) return;
+      seen[index] = 1;
+      if (alpha[index] > emptyLevel) return;
+      const o = index * 4;
+      if (isBackdrop(rgb[o], rgb[o + 1], rgb[o + 2])) return;
+      out[index] = 255;
+      restored++;
+      queue[tail++] = index;
+    };
+    while (head < tail) {
+      const i = queue[head++];
+      const x = i % width;
+      if (x > 0) consider(i - 1);
+      if (x < width - 1) consider(i + 1);
+      if (i >= width) consider(i - width);
+      if (i < total - width) consider(i + width);
+    }
+    return { alpha: out, restored };
+  }
+
+  const visited = new Uint8Array(total);
   const touchesSubject = index => {
     const x = index % width;
     if (x > 0 && alpha[index - 1] >= subjectLevel) return true;
@@ -340,20 +446,19 @@ export function restoreNonBackgroundPanels(rgb, alpha, width, height, options = 
     return false;
   };
 
-  const backdropScore = (r, g, b) => {
-    if (!seed) return 0;
-    return colourDistance([r, g, b], seed.colour) < bgLimit ? 1 : 0;
-  };
-
   for (let start = 0; start < total; start++) {
     if (visited[start] || alpha[start] > emptyLevel) continue;
+    const so = start * 4;
+    if (isBackdrop(rgb[so], rgb[so + 1], rgb[so + 2])) {
+      visited[start] = 1;
+      continue;
+    }
     let head = 0;
     let tail = 0;
     visited[start] = 1;
     queue[tail++] = start;
     const pixels = [];
     let r = 0, g = 0, b = 0;
-    let backdropHits = 0;
     let nextToSubject = false;
     while (head < tail) {
       const i = queue[head++];
@@ -362,12 +467,15 @@ export function restoreNonBackgroundPanels(rgb, alpha, width, height, options = 
       r += rgb[o];
       g += rgb[o + 1];
       b += rgb[o + 2];
-      backdropHits += backdropScore(rgb[o], rgb[o + 1], rgb[o + 2]);
       if (!nextToSubject && touchesSubject(i)) nextToSubject = true;
       const x = i % width;
       const add = index => {
         if (index < 0 || index >= total || visited[index] || alpha[index] > emptyLevel) return;
         const no = index * 4;
+        if (isBackdrop(rgb[no], rgb[no + 1], rgb[no + 2])) {
+          visited[index] = 1;
+          return;
+        }
         if (colourDistance([rgb[no], rgb[no + 1], rgb[no + 2]], [rgb[o], rgb[o + 1], rgb[o + 2]]) > panelTolerance) return;
         visited[index] = 1;
         queue[tail++] = index;
@@ -380,8 +488,7 @@ export function restoreNonBackgroundPanels(rgb, alpha, width, height, options = 
     if (!nextToSubject) continue;
     if (pixels.length > total * maxShare) continue;
     const mean = [r / pixels.length, g / pixels.length, b / pixels.length];
-    if (seed && colourDistance(mean, seed.colour) < bgLimit) continue;
-    if (backdropHits / pixels.length > 0.45) continue;
+    if (isBackdrop(mean[0], mean[1], mean[2])) continue;
     for (const i of pixels) {
       if (out[i] >= subjectLevel) continue;
       out[i] = 255;

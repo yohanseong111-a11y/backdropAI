@@ -236,6 +236,53 @@ export function buildShadedNavyCollar(scene) {
   return scene;
 }
 
+/**
+ * Closer to the live close-up: wrinkled navy that touches the frame, sitting
+ * next to dark green pile. A single global colour threshold cannot tell the
+ * muddy corner mean from the yoke, which is why the real photo lost its
+ * shoulders.
+ */
+export function buildWrinkledTwoToneJacket() {
+  const width = 160;
+  const height = 200;
+  const rgb = new Uint8ClampedArray(width * height * 4);
+  const truth = new Uint8Array(width * height);
+  const random = mulberry32(91);
+  const body = { x0: 22, x1: 138, y0: 86, y1: 190 };
+  const collar = { x0: 0, x1: 160, y0: 18, y1: 86 };
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      const o = i * 4;
+      const inBody = x >= body.x0 && x < body.x1 && y >= body.y0 && y < body.y1;
+      const inCollar = x >= collar.x0 && x < collar.x1 && y >= collar.y0 && y < collar.y1;
+      if (inBody || inCollar) {
+        truth[i] = 1;
+        if (inCollar) {
+          const wrinkle = ((x * 17 + y * 13) % 23) - 11;
+          const shade = random() * 36 - 18 + wrinkle;
+          rgb[o] = Math.max(8, Math.min(90, 38 + shade * 0.7));
+          rgb[o + 1] = Math.max(10, Math.min(95, 52 + shade * 0.55));
+          rgb[o + 2] = Math.max(20, Math.min(120, 72 + shade * 0.8));
+        } else {
+          const shade = random() * 10 - 5;
+          rgb[o] = 10 + shade * 0.2;
+          rgb[o + 1] = 168 + shade;
+          rgb[o + 2] = 226 + shade;
+        }
+      } else {
+        const pile = random() * 28 - 14;
+        rgb[o] = 36 + pile * 0.4;
+        rgb[o + 1] = 108 + pile;
+        rgb[o + 2] = 48 + pile * 0.35;
+      }
+      rgb[o + 3] = 255;
+    }
+  }
+  return { rgb, truth, width, height, body, collar };
+}
+
 export function buildTwoToneCoarseAlpha(scene) {
   const { width, height, body, collar } = scene;
   const alpha = new Uint8Array(width * height);
